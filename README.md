@@ -10,7 +10,7 @@ runs the contract VM, and enforces SVF.
   - `node.py` — the standalone single file
   - the same code split into modules (for example `main.py`,
     `P2P.py`, `svf.py`)
-- `docs/` — the documentation:
+- Documentation lives in the [Munex-docs](https://github.com/Munex-coin/Munex-docs) repository:
   - `consensus.md` — the consensus rules (Proof of Spatial Work)
   - `SVF.md` — the SVF verification layer in full
 
@@ -22,7 +22,7 @@ every 50 seconds only when an eligible miner exists, and the winning
 miner must sign the block — a node never seals a block alone. The
 block reward is 1 MCX; the hard cap is 5,045,958 MCX; the reward
 halves every 2,522,880 blocks. SVF is always on. See
-`docs/consensus.md` and `docs/SVF.md` for the full rules.
+[consensus.md](https://github.com/Munex-coin/Munex-docs/blob/main/consensus.md) and [SVF.md](https://github.com/Munex-coin/Munex-docs/blob/main/SVF.md) for the full rules.
 
 ## Running a node
 
