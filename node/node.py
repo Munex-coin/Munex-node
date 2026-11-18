@@ -18081,7 +18081,7 @@ class MicroCoreNode:
                         if _hid not in _reorg_htlc_ids:
                             _reorg_htlc_ids.append(_hid)
                 except Exception as e:
-                    logger.warning(f"[Reorg] HTLC inverse failed for block {block.get('id','?')}: {e}")
+                    logger.warning(f"[Reorg] HTLC inverse failed for block {common_height}: {e}")
             elif tx_type == 'token_burn' and from_w:
                 token_addr = tx.get('token_address')
                 if token_addr:
