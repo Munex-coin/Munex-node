@@ -1859,7 +1859,7 @@ class VMExecutionEngine:
                 return (False, b'')
             try:
                 profile = svf.svf_parse_profile(profile_bytes)
-            except svf_keys.SVFReject:
+            except svf.SVFReject:
                 return (False, b'')
             block_h = int(self.block_height or 0)
             if block_h <= 0:
@@ -1918,11 +1918,11 @@ class VMExecutionEngine:
                     return (False, b'')
             try:
                 prof_hash = svf.svf_profile_hash(int(config.CHAIN_ID), token_addr, profile_bytes)
-            except svf_keys.SVFReject:
+            except svf.SVFReject:
                 return (False, b'')
             try:
                 verdict = svf.evaluate_profile(profile, recs, block_h, challenge_seed=None, epoch_root=epoch_root, certificate=cert, chain_id=int(config.CHAIN_ID), token_address=token_addr, profile_hash=prof_hash.hex(), prune_blocks=100)
-            except svf_keys.SVFReject:
+            except svf.SVFReject:
                 return (False, b'')
             if verdict == 'PASS':
                 return (True, b'\x01')
@@ -1946,11 +1946,11 @@ class VMExecutionEngine:
                 return (False, b'')
             try:
                 profile = svf.svf_parse_profile(profile_bytes)
-            except svf_keys.SVFReject:
+            except svf.SVFReject:
                 return (False, b'')
             try:
                 prof_hash = svf.svf_profile_hash(int(config.CHAIN_ID), token_addr, profile_bytes)
-            except svf_keys.SVFReject:
+            except svf.SVFReject:
                 return (False, b'')
             rows = _db_query('SELECT profile_hash FROM svf_profiles WHERE token_address = ?', (token_addr,))
             if rows is svf._DB_FAILED:

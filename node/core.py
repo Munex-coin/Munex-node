@@ -26,6 +26,12 @@ def _ws_app_routes(app, websocket_handler):
     app.router.add_get('/healthz', _ws_health_handler)
     return app
 
+class AuxStateError(Exception):
+    pass
+
+class _StageRollback(Exception):
+    pass
+
 class MicroCoreNode:
 
     def __init__(self, config: dict=None):
@@ -457,7 +463,7 @@ class MicroCoreNode:
                         try:
                             _prof_bytes = svf.svf_profile_bytes(profile)
                             _prof_hash = svf.svf_profile_hash(int(config.CHAIN_ID), tok, _prof_bytes)
-                        except svf_keys.SVFReject:
+                        except svf.SVFReject:
                             return (False, {'error': f'SVF profile invalid for token {token_addr[:16]}...'})
                         verdict = svf.evaluate_profile(profile, records, int(block_id), challenge_seed=None, epoch_root=epoch_root, certificate=cert, chain_id=int(config.CHAIN_ID), token_address=tok, profile_hash=_prof_hash, prune_blocks=100)
                         if verdict == 'FAIL':
@@ -1907,17 +1913,17 @@ class MicroCoreNode:
                     try:
                         cert_epoch = int(cert.get('evidence_epoch', -1))
                         if cert_epoch < 0:
-                            raise svf_keys.SVFReject('certificate missing evidence_epoch')
+                            raise svf.SVFReject('certificate missing evidence_epoch')
                         cert_committee_epoch = int(cert.get('committee_epoch', -1))
                         if cert_committee_epoch != svf_keys.SVF_COMMITTEE_EPOCH:
-                            raise svf_keys.SVFReject(f'certificate committee epoch {cert_committee_epoch} does not match configured epoch {svf_keys.SVF_COMMITTEE_EPOCH}')
+                            raise svf.SVFReject(f'certificate committee epoch {cert_committee_epoch} does not match configured epoch {svf_keys.SVF_COMMITTEE_EPOCH}')
                         end_height = cert_epoch * svf.SVF_EPOCH_BLOCKS + svf.SVF_EPOCH_BLOCKS - 1
                         anchor_hash = cert.get('anchor_block_hash', '')
                         if not anchor_hash:
-                            raise svf_keys.SVFReject('certificate missing anchor_block_hash')
+                            raise svf.SVFReject('certificate missing anchor_block_hash')
                         anchor_block = await self.block_repo.get_by_id(end_height)
                         if anchor_block is None or anchor_block.get('hash') != anchor_hash:
-                            raise svf_keys.SVFReject(f'certificate anchor hash {anchor_hash[:16]}... does not match canonical block hash at height {end_height}')
+                            raise svf.SVFReject(f'certificate anchor hash {anchor_hash[:16]}... does not match canonical block hash at height {end_height}')
                         epoch_root_entry = self.svf_epoch_roots.get(cert_epoch)
                         epoch_root = None
                         if isinstance(epoch_root_entry, (tuple, list)) and len(epoch_root_entry) >= 1:
@@ -1925,17 +1931,17 @@ class MicroCoreNode:
                             epoch_root = _er if isinstance(_er, bytes) else bytes.fromhex(_er)
                         cert_root = cert.get('evidence_root', '')
                         if not cert_root:
-                            raise svf_keys.SVFReject('certificate missing evidence_root')
+                            raise svf.SVFReject('certificate missing evidence_root')
                         if epoch_root is None:
-                            raise svf_keys.SVFReject(f'epoch {cert_epoch} evidence root not yet committed')
+                            raise svf.SVFReject(f'epoch {cert_epoch} evidence root not yet committed')
                         _cr = cert_root if isinstance(cert_root, bytes) else bytes.fromhex(cert_root)
                         if epoch_root != _cr:
-                            raise svf_keys.SVFReject('certificate evidence_root does not match committed epoch root')
+                            raise svf.SVFReject('certificate evidence_root does not match committed epoch root')
                         cert_sig = cert.get('threshold_signature') or cert.get('signature', '')
                         if not cert_sig:
-                            raise svf_keys.SVFReject('certificate missing threshold signature')
+                            raise svf.SVFReject('certificate missing threshold signature')
                         if svf_keys.SVF_GROUP_PUBLIC_KEY is None:
-                            raise svf_keys.SVFReject('SVF group public key is not loaded')
+                            raise svf.SVFReject('SVF group public key is not loaded')
                         group_pubkey_hex = svf_keys.SVF_GROUP_PUBLIC_KEY.hex()
                         group_pubkey_bytes = bytes.fromhex(group_pubkey_hex)
                         import struct as _svf_struct
@@ -1950,9 +1956,9 @@ class MicroCoreNode:
                         cert_msg += _cr
                         sig_bytes = bytes.fromhex(cert_sig) if isinstance(cert_sig, str) else bytes(cert_sig)
                         if not svf_keys._svf_bls_verify(group_pubkey_bytes, cert_msg, sig_bytes):
-                            raise svf_keys.SVFReject('certificate threshold signature does not verify against group key')
+                            raise svf.SVFReject('certificate threshold signature does not verify against group key')
                         bootstrap.logger.debug(f'[SVF] block {block['id']}: certificate for epoch {cert_epoch} verified (applied on append, usable from block {block.get('id', 0) + 1})')
-                    except svf_keys.SVFReject as _cre:
+                    except svf.SVFReject as _cre:
                         bootstrap.logger.warning(f'[Verify] Block {block['id']}: invalid SVF certificate: {_cre}')
                         return False
                     except Exception as e:
@@ -2680,23 +2686,23 @@ class MicroCoreNode:
                 if int(common_height) == 0:
                     _anchor_hash = '0' * 64
                 else:
-                    raise consensus.AuxStateError(f'reorg cumulative: no common ancestor at {common_height}')
+                    raise AuxStateError(f'reorg cumulative: no common ancestor at {common_height}')
             _prev = str(_anchor_hash)
             for _b in adopted:
                 _bid = int(_b.get('id', -1))
                 _row = await self.block_repo.get_by_id(_bid)
                 if not isinstance(_row, dict):
-                    raise consensus.AuxStateError(f'reorg cumulative: adopted block {_bid} missing from block_repo')
+                    raise AuxStateError(f'reorg cumulative: adopted block {_bid} missing from block_repo')
                 if str(_row.get('hash', '')) != str(_b.get('hash', '')):
-                    raise consensus.AuxStateError(f'reorg cumulative: adopted block {_bid} hash mismatch repo-vs-branch')
+                    raise AuxStateError(f'reorg cumulative: adopted block {_bid} hash mismatch repo-vs-branch')
                 if str(_row.get('phash', '')) != _prev:
-                    raise consensus.AuxStateError(f'reorg cumulative: adopted block {_bid} not parent-linked')
+                    raise AuxStateError(f'reorg cumulative: adopted block {_bid} not parent-linked')
                 _prev = str(_b.get('hash', ''))
                 _tip_id, _tip_hash = (_bid, _prev)
             if int(self.height) != _tip_id + 1:
-                raise consensus.AuxStateError(f'reorg cumulative: height {self.height} != tip {_tip_id}+1')
+                raise AuxStateError(f'reorg cumulative: height {self.height} != tip {_tip_id}+1')
             if str(self.last_hash) != str(_tip_hash):
-                raise consensus.AuxStateError('reorg cumulative: last_hash != adopted tip hash')
+                raise AuxStateError('reorg cumulative: last_hash != adopted tip hash')
             _sim = int(pre_minted)
             for _ob in sorted((o for o in orphaned or [] if isinstance(o, dict)), key=lambda x: int(x.get('id', 0))):
                 _om = gas._reorg_base_mint(_ob)
@@ -2708,7 +2714,7 @@ class MicroCoreNode:
             for _b in adopted:
                 _sim += gas._reorg_base_mint(_b)
             if int(self.total_minted) != _sim:
-                raise consensus.AuxStateError(f'reorg cumulative: total_minted {self.total_minted} != conserved {_sim} (pre={pre_minted})')
+                raise AuxStateError(f'reorg cumulative: total_minted {self.total_minted} != conserved {_sim} (pre={pre_minted})')
             for _b in adopted:
                 _bid = int(_b.get('id', -1))
                 _want = set((str(h) for h in _b.get('tx_hashes') or []))
@@ -2718,9 +2724,9 @@ class MicroCoreNode:
                     _rows = await self.db.fetch('SELECT tx_hash FROM transactions WHERE block_id = $1', _bid)
                 _got = set((str(_r.get('tx_hash', '')) for _r in _rows or []))
                 if _got != _want:
-                    raise consensus.AuxStateError(f'reorg cumulative: block {_bid} persisted txs {sorted(_got)[:4]} != sealed {sorted(_want)[:4]}')
+                    raise AuxStateError(f'reorg cumulative: block {_bid} persisted txs {sorted(_got)[:4]} != sealed {sorted(_want)[:4]}')
         elif int(self.height) != int(common_height) + 1:
-            raise consensus.AuxStateError(f'reorg cumulative: empty adoption left height {self.height} != common {common_height}+1')
+            raise AuxStateError(f'reorg cumulative: empty adoption left height {self.height} != common {common_height}+1')
 
     async def _reorg_chain(self, common_height: int, new_blocks: bootstrap.List[bootstrap.Dict]):
         try:
@@ -3181,7 +3187,7 @@ class MicroCoreNode:
     async def _apply_maze_state(self, block: dict) -> None:
         _ms = block.get('maze_state') or []
         if not isinstance(_ms, list):
-            raise consensus.AuxStateError(f'malformed maze_state in block {block.get('id')}')
+            raise AuxStateError(f'malformed maze_state in block {block.get('id')}')
         if not _ms:
             return
         _att = block.get('maze_attestation') or {}
@@ -3189,13 +3195,13 @@ class MicroCoreNode:
         _bid = int(block.get('id', 0))
         for _e in _ms:
             if not isinstance(_e, dict):
-                raise consensus.AuxStateError(f'malformed maze_state entry in block {_bid}')
+                raise AuxStateError(f'malformed maze_state entry in block {_bid}')
             _mid = str(_e.get('maze_id', '') or '')
             if not _mid:
-                raise consensus.AuxStateError(f'maze_state entry without maze_id in block {_bid}')
+                raise AuxStateError(f'maze_state entry without maze_id in block {_bid}')
             if _att_mid and _mid.lower() == _att_mid:
                 if str(_e.get('minerid', '') or '').lower() == _att_mid and (not str(_e.get('minerid', '') or '')):
-                    raise consensus.AuxStateError(f'maze_state entry for attested maze has no minerid in block {_bid}')
+                    raise AuxStateError(f'maze_state entry for attested maze has no minerid in block {_bid}')
             existing = await self.maze_repo.get_by_maze_id(_mid)
             if existing:
                 row = dict(existing)
@@ -3211,11 +3217,11 @@ class MicroCoreNode:
     async def _append_block(self, block: dict):
         _vbase = gas._validated_block_reward(block, self.total_minted)
         if _vbase is None:
-            raise consensus.AuxStateError(f'reward/subsidy/supply mismatch in block {block.get('id')}')
+            raise AuxStateError(f'reward/subsidy/supply mismatch in block {block.get('id')}')
         _vbase = _vbase[0]
         _lok, _lreason = gas._block_limits_ok(block.get('transactions'))
         if not _lok:
-            raise consensus.AuxStateError(f'block {block.get('id')} exceeds block limits: {_lreason}')
+            raise AuxStateError(f'block {block.get('id')} exceeds block limits: {_lreason}')
         async with await self.db.transaction():
             await self.block_repo.create(block)
             _pending_svf_epoch_root = None
@@ -3235,10 +3241,10 @@ class MicroCoreNode:
                     _root = svf._svf_epoch_root_if_complete(_epoch_recs, _ev_epoch)
                     if _root is not None:
                         _pending_svf_epoch_root = (_ev_epoch, _root)
-                except svf_keys.SVFReject:
+                except svf.SVFReject:
                     pass
                 except Exception as _ev_e:
-                    raise consensus.AuxStateError(f'SVF evidence extraction failed for block {block['id']}: {_ev_e}') from _ev_e
+                    raise AuxStateError(f'SVF evidence extraction failed for block {block['id']}: {_ev_e}') from _ev_e
             winner = block.get('winner')
             if not winner:
                 _miners = block.get('miners')
@@ -3249,10 +3255,10 @@ class MicroCoreNode:
             for ev in block.get('slashes') or []:
                 try:
                     await self._apply_slash_event(ev, block['id'])
-                except consensus.AuxStateError:
+                except AuxStateError:
                     raise
                 except Exception as e:
-                    raise consensus.AuxStateError(f'slashes of block {block.get('id')}: {e}') from e
+                    raise AuxStateError(f'slashes of block {block.get('id')}: {e}') from e
             if bool(block.get('transactions', [])) != bool(block.get('tx_hashes', [])):
                 raise RuntimeError(f'transactions/tx_hashes presence mismatch in block {block.get('id')}')
             _replay_error = None
@@ -3312,7 +3318,7 @@ class MicroCoreNode:
                 _mint = _vbase
                 if _mint > 0:
                     if self.total_minted + _mint > config.MAX_SUPPLY:
-                        raise consensus.AuxStateError(f'mint of block {block.get('id')} exceeds MAX_SUPPLY')
+                        raise AuxStateError(f'mint of block {block.get('id')} exceeds MAX_SUPPLY')
                     self.total_minted += _mint
                     await self.network_state_repo.set('total_minted', str(self.total_minted))
             for update in block.get('maze_updates', []):
@@ -3378,16 +3384,16 @@ class MicroCoreNode:
                     continue
                 _row = await self.maze_repo.get_by_maze_id(_mid)
                 if _row is None:
-                    raise consensus.AuxStateError(f'maze_state maze {_mid[:16]} missing after apply in block {block.get('id')}')
+                    raise AuxStateError(f'maze_state maze {_mid[:16]} missing after apply in block {block.get('id')}')
                 for _k in maze._MAZE_STATE_COLUMNS:
                     if _k == 'maze_id':
                         continue
                     if _k in _e and str(_row.get(_k, '')) != str(_e.get(_k, '')):
-                        raise consensus.AuxStateError(f'maze_state mismatch for {_mid[:16]} column {_k} in block {block.get('id')}')
+                        raise AuxStateError(f'maze_state mismatch for {_mid[:16]} column {_k} in block {block.get('id')}')
             if int(block.get('id', 0)) > 0 and block.get('state_root'):
                 _post_root = await db._compute_full_state_root(self.db, self, int(block['id']))
                 if _post_root != block.get('state_root'):
-                    raise consensus.AuxStateError(f'state_root of block {block.get('id')} does not match post-apply state')
+                    raise AuxStateError(f'state_root of block {block.get('id')} does not match post-apply state')
             if _pending_svf_epoch_root is not None:
                 _pe, _pr = _pending_svf_epoch_root
                 self.svf_epoch_roots[_pe] = (_pr, svf.SVF_EPOCH_BLOCKS)
@@ -3417,11 +3423,11 @@ class MicroCoreNode:
             if isinstance(_att, dict) and _att.get('maze_id') and (_att.get('size') is not None):
                 _av = config._effective_validators()
                 if _av and config._normalize_validator_key(_att.get('pubkey', '')) not in _av:
-                    raise consensus.AuxStateError(f'attestation key not in validator set in block {block.get('id')}')
+                    raise AuxStateError(f'attestation key not in validator set in block {block.get('id')}')
                 try:
                     await self.maze_attestation_repo.upsert({'maze_id': str(_att['maze_id']), 'last_size': int(_att['size']), 'last_block': int(block['id']), 'last_block_hash': str(block.get('hash', '')), 'pubkey': str(_att.get('pubkey', ''))})
                 except Exception as _e:
-                    raise consensus.AuxStateError(f'maze_attestation of block {block.get('id')}: {_e}') from _e
+                    raise AuxStateError(f'maze_attestation of block {block.get('id')}: {_e}') from _e
             await self.distribute_token_mining_rewards(block['id'])
         if getattr(self, 'mempool', None) is not None:
             for _h in _sealed_hashes:

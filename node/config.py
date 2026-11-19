@@ -1,6 +1,6 @@
 import bootstrap
 CONFIG_PATH = bootstrap.os.environ.get('MCX_CONFIG', 'config.yaml')
-DEFAULT_CONFIG = {'node': {'ws_port': 8080, 'ws_bind_ip': '0.0.0.0', 'api_port': 8085, 'p2p_port': 8081, 'public_url': None, 'external_ip': '', 'external_port': 8081, 'bind_ip': '0.0.0.0', 'rpc_bind_ip': '127.0.0.1', 'rpc_token': '', 'rpc_trust_loopback': False, 'mainnet': True}, 'database': {'url': None, 'require_postgres': False}, 'consensus': {'block_time': 50, 'min_step_interval': 0, 'max_misses': 3, 'epoch_length': 100, 'prune_blocks': 10000, 'wall_density_3d': 0.55, 'initial_required_knowledge': 10, 'min_required_knowledge': 5, 'max_required_knowledge': 100, 'knowledge_adjustment_interval': 5, 'target_catch_time': 60.0, 'finality_threshold': 0.66, 'commit_reveal_activation_height': 0, 'lottery_scale': 1 << 249, 'attest_fresh_buffer': 5, 'attest_growth_per_block': 5, 'slot_timeout': 30, 'validators': []}, 'fees': {'max_fee': 100000, 'fee_per_byte': 10, 'rbf_increment': 1.1, 'cpfp_min_fee': 100}, 'p2p': {'genesis_node': 'munexseed.duckdns.org', 'dns_seeds': ['munexseed.duckdns.org'], 'bootstrap_nodes': ['munexseed.duckdns.org:8081'], 'dht_bootstrap_nodes': ['munexseed.duckdns.org:8083'], 'fallback_nodes': [], 'max_peers': 50, 'ban_threshold': 5, 'ban_duration': 3600, 'dht_enabled': True, 'discovery_interval': 300, 'discovery_timeout': 60, 'registry_url': 'https://munex-registry.animax-plorer.workers.dev/nodes', 'registry_enabled': True, 'registry_interval': 300, 'allow_private_peers': False}, 'vm': {'max_state_size': 1024, 'sandbox': True, 'require_sandbox': True, 'timeout_seconds': 5}, 'mempool': {'max_size': 10000, 'expiry': 3600, 'max_tx_per_block': 100}, 'svf': {'key_file': ''}}
+DEFAULT_CONFIG = {'node': {'ws_port': 8080, 'ws_bind_ip': '0.0.0.0', 'api_port': 8085, 'p2p_port': 8081, 'public_url': None, 'external_ip': '', 'external_port': 8081, 'bind_ip': '0.0.0.0', 'rpc_bind_ip': '127.0.0.1', 'rpc_token': '', 'rpc_trust_loopback': False, 'mainnet': True}, 'database': {'url': None, 'require_postgres': False}, 'consensus': {'block_time': 50, 'min_step_interval': 0, 'max_misses': 3, 'epoch_length': 100, 'prune_blocks': 10000, 'wall_density_3d': 0.55, 'initial_required_knowledge': 10, 'min_required_knowledge': 5, 'max_required_knowledge': 100, 'knowledge_adjustment_interval': 5, 'target_catch_time': 60.0, 'finality_threshold': 0.66, 'commit_reveal_activation_height': 0, 'lottery_scale': 1 << 249, 'attest_fresh_buffer': 5, 'attest_growth_per_block': 5, 'slot_timeout': 30, 'validators': []}, 'fees': {'max_fee': 100000, 'fee_per_byte': 10, 'rbf_increment': 1.1, 'cpfp_min_fee': 100}, 'p2p': {'genesis_node': 'munexseed.duckdns.org', 'dns_seeds': ['munexseed.duckdns.org'], 'bootstrap_nodes': ['munexseed.duckdns.org:8081'], 'dht_bootstrap_nodes': ['munexseed.duckdns.org:8083'], 'fallback_nodes': [], 'max_peers': 50, 'ban_threshold': 5, 'ban_duration': 3600, 'dht_enabled': True, 'discovery_interval': 300, 'discovery_timeout': 60, 'registry_url': 'https://munex-registry.animax-plorer22.workers.dev/nodes', 'registry_enabled': True, 'registry_interval': 300, 'allow_private_peers': False}, 'vm': {'max_state_size': 1024, 'sandbox': True, 'require_sandbox': True, 'timeout_seconds': 5}, 'mempool': {'max_size': 10000, 'expiry': 3600, 'max_tx_per_block': 100}, 'svf': {'key_file': ''}}
 
 def load_config():
     cfg = bootstrap.copy.deepcopy(DEFAULT_CONFIG)
@@ -69,7 +69,7 @@ GENESIS_NODE_P2P_PORT = 8081
 GENESIS_NODE_DHT_PORT = 8083
 GENESIS_NODE_WS_PORT = 8080
 GENESIS_BOOTSTRAP_ENDPOINT = f'{GENESIS_NODE_HOST}:{GENESIS_NODE_P2P_PORT}'
-REGISTRY_URL_DEFAULT = 'https://munex-registry.animax-plorer.workers.dev/nodes'
+REGISTRY_URL_DEFAULT = 'https://munex-registry.animax-plorer22.workers.dev/nodes'
 BURN_ADDRESS_ZERO = '0x0000000000000000000000000000000000000000'
 BURN_ADDRESS_DEAD = '0x000000000000000000000000000000000000dEaD'
 BURN_ADDRESSES = {BURN_ADDRESS_ZERO.lower(), BURN_ADDRESS_DEAD.lower()}
@@ -119,7 +119,7 @@ VERSION = '64.3-PoSW'
 SUBS = 1000000
 SCHEMA_VERSION = 1
 CHAIN_ID = 6621
-TESTNET_GENESIS_HASH = '1a36f67d646bff38d9d2169e34f1bc3d41700046920bb4ca6e62c8e230d2bc5c'
+TESTNET_GENESIS_HASH = '4aa436a1aa8d20ba8194faa99d544f1f81052670b7f1ada7b5c734dc571a5864'
 SECP256K1_N = 115792089237316195423570985008687907852837564279074904382605163141518161494337
 PROTOCOL_VERSION = 64
 POG_ACTIVATION_HEIGHT = 100000

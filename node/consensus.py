@@ -9,6 +9,7 @@ import svf_keys
 import svf
 import db
 import repos
+import core
 
 class ConsensusRng:
 
@@ -1359,8 +1360,8 @@ class PoSWConsensus:
             try:
                 async with await self.node.db.transaction():
                     staged = await self._stage_block_candidate(block_id, prev_hash, winner_miner_id, maze_attestation, _att_proof, _stamped_ts, computed_shrink_factor, _seal_wallet, _seal_pre_bal, lottery_draw=_lottery_draw)
-                    raise _StageRollback()
-            except _StageRollback:
+                    raise core._StageRollback()
+            except core._StageRollback:
                 pass
             unsigned_block = staged['unsigned_block']
             executed_txs = staged['executed_txs']
@@ -1511,11 +1512,11 @@ class PoSWConsensus:
                                     self.node.svf_epoch_roots[_ev_epoch] = (_root, svf.SVF_EPOCH_BLOCKS)
                                     bootstrap.logger.debug(f'[SVF] block {_svf_block_id}: epoch {_ev_epoch} complete, root recorded')
                                 bootstrap.logger.debug(f'[SVF] block {_svf_block_id}: evidence recorded for epoch {_ev_epoch}')
-                            except svf_keys.SVFReject as _ev_rej:
+                            except svf.SVFReject as _ev_rej:
                                 self.node.svf_evidence_store.setdefault(_ev_epoch, []).append(None)
                                 bootstrap.logger.debug(f'[SVF] block {_svf_block_id}: no attestation evidence (genesis-like), epoch {_ev_epoch}')
                             except Exception as _ev_e:
-                                raise AuxStateError(f'SVF evidence extraction failed for block {_svf_block_id}: {_ev_e}') from _ev_e
+                                raise core.AuxStateError(f'SVF evidence extraction failed for block {_svf_block_id}: {_ev_e}') from _ev_e
                             _block_certs = block.get('svf_epoch_certificates') or []
                             if _block_certs:
                                 _cert = _block_certs[0]
@@ -1827,9 +1828,3 @@ class PoSWConsensus:
         bootstrap.logger.error(f'[Slash] Miner {miner_id[:16]} EQUIVOCATED at block {block_id}: {hash_a[:16]} vs {hash_b[:16]}, slashed {slash_amount}')
 PoMRConsensus = PoSWConsensus
 POW_BASE_DIFFICULTY = 5
-
-class AuxStateError(Exception):
-    pass
-
-class _StageRollback(Exception):
-    pass

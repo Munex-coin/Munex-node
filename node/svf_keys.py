@@ -1,44 +1,11 @@
 import bootstrap
 import config
 import config as _config
+import svf
+import genesis
 
-def _normalize_svf_public(value) -> dict:
-    if not isinstance(value, dict):
-        raise ValueError('malformed genesis field: svf_public must be an object')
-    _cid = value.get('chain_id')
-    if isinstance(_cid, bool) or not isinstance(_cid, int):
-        raise ValueError('malformed genesis field: svf_public.chain_id must be an integer')
-    _gpk = value.get('group_public_key')
-    if not isinstance(_gpk, str):
-        raise ValueError('malformed genesis field: svf_public.group_public_key must be a hex string')
-    _gpk_norm = _gpk.strip().lower()
-    if len(_gpk_norm) != 192:
-        raise ValueError('malformed genesis field: svf_public.group_public_key must be 96 bytes (192 hex chars)')
-    try:
-        bytes.fromhex(_gpk_norm)
-    except ValueError:
-        raise ValueError('malformed genesis field: svf_public.group_public_key is not valid hex')
-    _th = value.get('template_hashes')
-    if not isinstance(_th, dict):
-        raise ValueError('malformed genesis field: svf_public.template_hashes must be an object')
-    _norm_th = {}
-    for _name, _sha in _th.items():
-        if not isinstance(_name, str) or not _name.strip():
-            raise ValueError('malformed genesis field: svf_public.template_hashes keys must be non-empty strings')
-        if not isinstance(_sha, str):
-            raise ValueError('malformed genesis field: svf_public.template_hashes values must be hex strings')
-        _sha_norm = _sha.strip().lower()
-        if len(_sha_norm) != 64:
-            raise ValueError('malformed genesis field: svf_public.template_hashes values must be 32 bytes (64 hex chars)')
-        try:
-            bytes.fromhex(_sha_norm)
-        except ValueError:
-            raise ValueError('malformed genesis field: svf_public.template_hashes values must be valid hex')
-        _norm_th[_name] = _sha_norm
-    return {'chain_id': int(_cid), 'group_public_key': _gpk_norm, 'template_hashes': {k: _norm_th[k] for k in sorted(_norm_th)}}
-
-class SVFReject(ValueError):
-    pass
+def _svf_canon(obj) -> bytes:
+    return bootstrap.json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode('ascii')
 '\nSVF v1 Threshold-BLS Consensus using py_ecc for all curve operations.\n\nBLS12-381 curve:\n- G1: points over F_q (base field), coordinates are FQ elements (integers mod q)\n- G2: points over F_q^2, coordinates are FQ2 elements (pairs of FQ elements)\n\nSerialization:\n- G1 point (public key): x(48 bytes) + y(48 bytes) = 96 bytes uncompressed\n- G2 point (signature): x(96 bytes) + y(96 bytes) = 192 bytes uncompressed\n'
 from py_ecc.optimized_bls12_381 import multiply as _bls_multiply, add as _bls_add, G1, G2, FQ, FQ2, pairing, final_exponentiate, is_on_curve, is_inf, normalize, optimized_swu_G2, curve_order, field_modulus, b, b2
 from hashlib import sha256
@@ -246,7 +213,7 @@ def _svf_load_from_genesis(svf_public):
     if not svf_public:
         return None
     try:
-        _norm = _normalize_svf_public(svf_public)
+        _norm = genesis._normalize_svf_public(svf_public)
     except ValueError as _e:
         raise SVFKeyError(f'genesis svf_public is malformed: {_e}')
     if int(_norm['chain_id']) != int(config.CHAIN_ID):
@@ -410,7 +377,7 @@ def _svf_committee_verify_partial(share_pk_bytes: bytes, message: bytes, partial
 
 def _svf_committee_combine_partials(partial_sigs: list, shares: list, message: bytes, p: int=_BLS_CURVE_ORDER) -> bytes:
     if not partial_sigs or not shares or len(partial_sigs) != len(shares):
-        raise SVFReject('partial signatures and shares must be non-empty and equal length')
+        raise svf.SVFReject('partial signatures and shares must be non-empty and equal length')
     x_vals = [s[0] for s in shares]
     k = len(shares)
     lagrange_coeffs = []
@@ -431,7 +398,7 @@ def _svf_committee_combine_partials(partial_sigs: list, shares: list, message: b
         else:
             combined = _bls_add(combined, scaled)
     if combined is None:
-        raise SVFReject('no partial signatures to combine')
+        raise svf.SVFReject('no partial signatures to combine')
     return _g2_to_bytes(combined)
 
 def _svf_committee_generate_certificate(dkg_config: dict, evidence_root: bytes, chain_id: int, committee_epoch: int, evidence_epoch: int, window_start: int, window_end: int, anchor_hash: str) -> dict:
@@ -461,12 +428,12 @@ def _svf_committee_generate_certificate(dkg_config: dict, evidence_root: bytes, 
         share_pks.append(bytes.fromhex(_pk) if isinstance(_pk, str) else _pk)
     for (mid, psig), spk in zip(partials, share_pks):
         if not _svf_committee_verify_partial(spk, msg, psig):
-            raise SVFReject(f'Partial signature verification failed for member {mid}')
+            raise svf.SVFReject(f'Partial signature verification failed for member {mid}')
     selected_shares = [(mid, dkg_config['member_shares'][str(mid)]) for mid in member_ids[:t]]
     partial_sig_bytes = [psig for _, psig in partials]
     threshold_sig = _svf_committee_combine_partials(partial_sig_bytes, selected_shares, msg)
     group_pk = bytes.fromhex(dkg_config['group_public_key'])
     if not _svf_bls_verify(group_pk, msg, threshold_sig):
-        raise SVFReject('Combined threshold signature verification failed')
+        raise svf.SVFReject('Combined threshold signature verification failed')
     beacon_output = _hashlib.sha256(b'MCX-SVF-BEACON-OUTPUT-V1' + b'\x00' + threshold_sig).digest()
     return {'protocol_version': 1, 'chain_id': chain_id, 'committee_epoch': committee_epoch, 'evidence_epoch': evidence_epoch, 'window_start_height': window_start, 'window_end_height': window_end, 'anchor_block_hash': anchor_hash, 'evidence_root': evidence_root.hex() if isinstance(evidence_root, bytes) else evidence_root, 'group_public_key_id': dkg_config['group_public_key'], 'group_pubkey': dkg_config['group_public_key'], 'threshold_signature': threshold_sig.hex(), 'beacon_output': beacon_output.hex(), 'canonical_message': msg.hex()}

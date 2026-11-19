@@ -439,7 +439,6 @@ class P2PNode:
         self.registry_interval = max(60, int(p2p_cfg.get('registry_interval', 300) or 300))
         self._registry_last_fetch = 0.0
         self._registry_cached_peers = []
-        self._registry_last_push = 0.0
         self.fallback_nodes = list(p2p_cfg.get('fallback_nodes', []))
         self.dht_port = int(p2p_cfg.get('dht_port', config.DHT_PORT))
         self.allow_private_peers = config._strict_bool('p2p.allow_private_peers', p2p_cfg.get('allow_private_peers', False))
@@ -1591,38 +1590,6 @@ class P2PNode:
         self._registry_cached_peers = list(peers)
         return list(peers)
 
-    def _registry_push_self_sync(self, ip, p2p_port):
-        push_url = self.registry_url.rstrip('/').rsplit('/', 1)[0] + '/register'
-        payload = bootstrap.json.dumps({'ip': ip, 'p2p_port': int(p2p_port)}).encode('utf-8')
-        req = bootstrap.urllib.request.Request(push_url, data=payload, method='POST', headers={'User-Agent': 'munex-node/11', 'Content-Type': 'application/json'})
-        try:
-            with bootstrap.urllib.request.urlopen(req, timeout=10) as res:
-                res.read()
-        except Exception as e:
-            bootstrap.logger.debug(f'[REGISTRY] push failed: {e}')
-
-    async def _registry_push_self(self):
-        if not self.registry_enabled or not self.registry_url:
-            return
-        now = bootstrap.time.time()
-        if now - self._registry_last_push < self.registry_interval:
-            return
-        self._registry_last_push = now
-        ip = getattr(self, 'public_ip', '') or ''
-        if not ip:
-            return
-        try:
-            addr = bootstrap.ipaddress.ip_address(ip)
-            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
-                return
-        except ValueError:
-            return
-        try:
-            loop = bootstrap.asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._registry_push_self_sync, ip, config.P2P_PORT)
-        except Exception as e:
-            bootstrap.logger.debug(f'[REGISTRY] push failed: {e}')
-
     async def _resolve_dns_seeds(self) -> bootstrap.List[str]:
         loop = bootstrap.asyncio.get_running_loop()
         seeds = self.dns_seeds
@@ -1734,7 +1701,6 @@ class P2PNode:
                     await self._connect_to_peer(addr)
                     if len(self.peers) >= self.max_peers:
                         break
-            await self._registry_push_self()
             dns_peers = await self._resolve_dns_seeds()
             for addr in dns_peers:
                 if not self._is_peer_connected(addr) and (not self._is_banned(address=addr)):

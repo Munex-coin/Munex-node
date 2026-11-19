@@ -141,52 +141,52 @@ SVF_RELEASING_STATES = {'REJECTED', 'EXPIRED'}
 class SVFBlocked(RuntimeError):
     pass
 
-def _svf_canon(obj) -> bytes:
-    return bootstrap.json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode('ascii')
+class SVFReject(ValueError):
+    pass
 
 def _svf_int(name, value, lo, hi):
     if isinstance(value, bool) or not isinstance(value, int):
-        raise svf_keys.SVFReject(f'{name} must be an integer')
+        raise SVFReject(f'{name} must be an integer')
     if not lo <= value <= hi:
-        raise svf_keys.SVFReject(f'{name} out of range [{lo}, {hi}]')
+        raise SVFReject(f'{name} out of range [{lo}, {hi}]')
     return value
 
 def _svf_hex32(name, value) -> str:
     if not isinstance(value, str) or len(value) != 64 or any((c not in '0123456789abcdef' for c in value)):
-        raise svf_keys.SVFReject(f'{name} must be 64 lowercase hex characters')
+        raise SVFReject(f'{name} must be 64 lowercase hex characters')
     return value
 
 def svf_intent_body(intent: dict, expected_chain_id: int) -> dict:
     if not isinstance(intent, dict) or set(intent.keys()) != set(SVF_INTENT_FIELDS):
-        raise svf_keys.SVFReject(f'intent fields must be exactly {list(SVF_INTENT_FIELDS)}')
+        raise SVFReject(f'intent fields must be exactly {list(SVF_INTENT_FIELDS)}')
     chain_id = _svf_int('chain_id', intent['chain_id'], 0, 2 ** 63 - 1)
     if chain_id != int(expected_chain_id):
-        raise svf_keys.SVFReject('chain_id mismatch (domain separation)')
+        raise SVFReject('chain_id mismatch (domain separation)')
     for name in ('token', 'sender', 'recipient'):
         if not crypto._valid_wallet(intent[name]):
-            raise svf_keys.SVFReject(f'{name} is not a valid wallet')
+            raise SVFReject(f'{name} is not a valid wallet')
     if intent['sender'].lower() == intent['recipient'].lower():
-        raise svf_keys.SVFReject('self-transfer not allowed')
+        raise SVFReject('self-transfer not allowed')
     amount = _svf_int('amount', intent['amount'], 1, SVF_MAX_AMOUNT)
     nonce = _svf_int('nonce', intent['nonce'], 0, 2 ** 63 - 1)
     profile_hash = _svf_hex32('profile_hash', intent['profile_hash'])
     after = _svf_int('valid_after_height', intent['valid_after_height'], 0, 2 ** 63 - 1)
     before = _svf_int('valid_before_height', intent['valid_before_height'], 1, 2 ** 63 - 1)
     if before <= after:
-        raise svf_keys.SVFReject('valid_before_height must exceed valid_after_height')
+        raise SVFReject('valid_before_height must exceed valid_after_height')
     return {'chain_id': chain_id, 'token': intent['token'].lower(), 'sender': intent['sender'].lower(), 'recipient': intent['recipient'].lower(), 'amount': amount, 'nonce': nonce, 'profile_hash': profile_hash, 'valid_after_height': after, 'valid_before_height': before}
 
 def svf_billable_bytes(body: dict) -> int:
-    return len(_svf_canon(body)) + SVF_BILLABLE_SIG_BYTES
+    return len(svf_keys._svf_canon(body)) + SVF_BILLABLE_SIG_BYTES
 
 def svf_fee(body: dict) -> int:
     fee = svf_billable_bytes(body) * SVF_FEE_PER_BYTE
     if fee <= 0:
-        raise svf_keys.SVFReject('SVF fee must be positive')
+        raise SVFReject('SVF fee must be positive')
     return fee
 
 def svf_intent_hash(body: dict, fee: int) -> bytes:
-    return bootstrap.hashlib.sha256(SVF_DOMAIN_INTENT + _svf_canon(dict(body, fee=int(fee)))).digest()
+    return bootstrap.hashlib.sha256(SVF_DOMAIN_INTENT + svf_keys._svf_canon(dict(body, fee=int(fee)))).digest()
 
 def svf_reserve_batch(state: dict, intents: list) -> tuple:
     st = {'balances': dict(state['balances']), 'reserved': dict(state['reserved']), 'nonces': dict(state['nonces']), 'open': dict(state['open']), 'seen': set(state['seen'])}
@@ -222,30 +222,30 @@ def svf_reserve_batch(state: dict, intents: list) -> tuple:
 
 def svf_release(state: dict, intent_hash: bytes) -> dict:
     if intent_hash not in state['open']:
-        raise svf_keys.SVFReject('no open reservation for this intent (already released or never reserved)')
+        raise SVFReject('no open reservation for this intent (already released or never reserved)')
     token, sender, amount = state['open'][intent_hash]
     key = (token, sender)
     st = {'balances': dict(state['balances']), 'reserved': dict(state['reserved']), 'nonces': dict(state['nonces']), 'open': {k: v for k, v in state['open'].items() if k != intent_hash}, 'seen': set(state['seen'])}
     st['reserved'][key] = st['reserved'].get(key, 0) - amount
     if st['reserved'][key] < 0:
-        raise svf_keys.SVFReject('reserved balance would go negative')
+        raise SVFReject('reserved balance would go negative')
     return st
 
 def svf_next_state(current: str, nxt: str) -> str:
     if current not in SVF_TRANSITIONS or nxt not in SVF_STATES:
-        raise svf_keys.SVFReject('unknown lifecycle state')
+        raise SVFReject('unknown lifecycle state')
     if nxt not in SVF_TRANSITIONS[current]:
-        raise svf_keys.SVFReject(f'illegal transition {current} -> {nxt}')
+        raise SVFReject(f'illegal transition {current} -> {nxt}')
     return nxt
 
 def svf_batch_root(intent_hashes: list) -> bytes:
     if len(intent_hashes) > SVF_MAX_BATCH_INTENTS:
-        raise svf_keys.SVFReject('batch exceeds SVF_MAX_BATCH_INTENTS')
+        raise SVFReject('batch exceeds SVF_MAX_BATCH_INTENTS')
     if len(set(intent_hashes)) != len(intent_hashes):
-        raise svf_keys.SVFReject('duplicate intent in batch')
+        raise SVFReject('duplicate intent in batch')
     for i, h in enumerate(intent_hashes):
         if not isinstance(h, (bytes, bytearray)) or len(h) != 32:
-            raise svf_keys.SVFReject(f'intent_hashes[{i}] must be exactly 32 bytes')
+            raise SVFReject(f'intent_hashes[{i}] must be exactly 32 bytes')
     if not intent_hashes:
         return bootstrap.hashlib.sha256(SVF_DOMAIN_BATCH_NODE + b'empty').digest()
     level = [bootstrap.hashlib.sha256(SVF_DOMAIN_BATCH_LEAF + bytes(h)).digest() for h in sorted(intent_hashes)]
@@ -262,18 +262,18 @@ def svf_challenge(beacon, chain_id: int, token: str, profile_hash: str, batch_ro
     if beacon is None:
         raise SVFBlocked('B1 randomness beacon unavailable: SVF activation is blocked')
     if not isinstance(beacon, (bytes, bytearray)) or len(beacon) != 32:
-        raise svf_keys.SVFReject('beacon must be 32 bytes')
+        raise SVFReject('beacon must be 32 bytes')
     _svf_int('chain_id', chain_id, 0, 2 ** 63 - 1)
     if not crypto._valid_wallet(token):
-        raise svf_keys.SVFReject('invalid token')
+        raise SVFReject('invalid token')
     _svf_hex32('profile_hash', profile_hash)
     if not isinstance(batch_root, (bytes, bytearray)) or len(batch_root) != 32:
-        raise svf_keys.SVFReject('batch_root must be 32 bytes')
+        raise SVFReject('batch_root must be 32 bytes')
     _svf_int('window_start', window_start, 0, 2 ** 63 - 1)
     _svf_int('window_end', window_end, 1, 2 ** 63 - 1)
     span = window_end - window_start
     if not 1 <= span <= SVF_MAX_WINDOW_BLOCKS:
-        raise svf_keys.SVFReject(f'evidence window must span 1..{SVF_MAX_WINDOW_BLOCKS} blocks')
+        raise SVFReject(f'evidence window must span 1..{SVF_MAX_WINDOW_BLOCKS} blocks')
     tok = token.lower().encode('ascii')
     h = bootstrap.hashlib.sha256()
     h.update(SVF_DOMAIN_CHALLENGE)
@@ -287,41 +287,41 @@ def svf_challenge(beacon, chain_id: int, token: str, profile_hash: str, batch_ro
 
 def svf_evidence_body(rec: dict) -> dict:
     if not isinstance(rec, dict) or set(rec.keys()) != set(SVF_EVIDENCE_FIELDS):
-        raise svf_keys.SVFReject(f'evidence fields must be exactly {list(SVF_EVIDENCE_FIELDS)}')
+        raise SVFReject(f'evidence fields must be exactly {list(SVF_EVIDENCE_FIELDS)}')
     if rec['direction'] not in SVF_DIRECTIONS:
-        raise svf_keys.SVFReject('unknown direction')
+        raise SVFReject('unknown direction')
     if not crypto._valid_wallet(rec['miner']):
-        raise svf_keys.SVFReject('miner must be a wallet-format identity')
+        raise SVFReject('miner must be a wallet-format identity')
     prev = rec['prev_hash']
     if prev != '00' * 32:
         _svf_hex32('prev_hash', prev)
     return {'chain_id': _svf_int('chain_id', rec['chain_id'], 0, 2 ** 63 - 1), 'miner': rec['miner'].lower(), 'maze_id': str(rec['maze_id']), 'maze_version': _svf_int('maze_version', rec['maze_version'], 0, 2 ** 63 - 1), 'move_nonce': _svf_int('move_nonce', rec['move_nonce'], 0, 2 ** 63 - 1), 'direction': rec['direction'], 'prev_hash': prev, 'parent_height': _svf_int('parent_height', rec['parent_height'], 0, 2 ** 63 - 1)}
 
 def svf_evidence_hash(body: dict) -> bytes:
-    return bootstrap.hashlib.sha256(SVF_DOMAIN_EVIDENCE + _svf_canon(body)).digest()
+    return bootstrap.hashlib.sha256(SVF_DOMAIN_EVIDENCE + svf_keys._svf_canon(body)).digest()
 
 def svf_verify_evidence_chain(records: list, verify_sig) -> dict:
     if not isinstance(records, list) or not 1 <= len(records) <= SVF_MAX_EVIDENCE_RECORDS:
-        raise svf_keys.SVFReject(f'evidence must contain 1..{SVF_MAX_EVIDENCE_RECORDS} records')
+        raise SVFReject(f'evidence must contain 1..{SVF_MAX_EVIDENCE_RECORDS} records')
     prev_h = '00' * 32
     first = None
     expect_nonce = None
     for entry in records:
         if not isinstance(entry, dict) or set(entry.keys()) != {'body', 'signature'}:
-            raise svf_keys.SVFReject('each record must carry exactly a body and a signature')
+            raise SVFReject('each record must carry exactly a body and a signature')
         body = svf_evidence_body(entry['body'])
         if first is None:
             first = body
             expect_nonce = body['move_nonce']
         for k in ('chain_id', 'miner', 'maze_id', 'maze_version'):
             if body[k] != first[k]:
-                raise svf_keys.SVFReject(f'record {k} differs within the window')
+                raise SVFReject(f'record {k} differs within the window')
         if body['move_nonce'] != expect_nonce:
-            raise svf_keys.SVFReject('move_nonce is not contiguous (gap, duplicate or reorder)')
+            raise SVFReject('move_nonce is not contiguous (gap, duplicate or reorder)')
         if body['prev_hash'] != prev_h:
-            raise svf_keys.SVFReject('prev_hash does not link to the previous record')
-        if not isinstance(entry['signature'], str) or not verify_sig(body['miner'], _svf_canon(body), entry['signature']):
-            raise svf_keys.SVFReject('record signature does not verify')
+            raise SVFReject('prev_hash does not link to the previous record')
+        if not isinstance(entry['signature'], str) or not verify_sig(body['miner'], svf_keys._svf_canon(body), entry['signature']):
+            raise SVFReject('record signature does not verify')
         prev_h = svf_evidence_hash(body).hex()
         expect_nonce += 1
     return {'count': len(records), 'tip_hash': prev_h}
@@ -348,9 +348,9 @@ def svf_profile_hash(chain_id: int, token_address: str, profile_bytes: bytes) ->
     if _tok and (not _tok.startswith('0x')):
         _tok = '0x' + _tok
     if not crypto._valid_wallet(_tok):
-        raise svf_keys.SVFReject('invalid token address for profile hash')
+        raise SVFReject('invalid token address for profile hash')
     if not isinstance(profile_bytes, (bytes, bytearray)) or len(profile_bytes) != SVF_PROFILE_SIZE:
-        raise svf_keys.SVFReject('profile_bytes must be exactly 42 bytes')
+        raise SVFReject('profile_bytes must be exactly 42 bytes')
     h = bootstrap.hashlib.sha256()
     h.update(SVF_PROFILE_DOMAIN)
     h.update(bootstrap.struct.pack('>Q', int(chain_id)))
@@ -363,34 +363,34 @@ def svf_profile_hash(chain_id: int, token_address: str, profile_bytes: bytes) ->
 
 def svf_parse_profile(raw: bytes) -> dict:
     if not isinstance(raw, (bytes, bytearray)) or len(raw) != SVF_PROFILE_SIZE:
-        raise svf_keys.SVFReject('profile must be exactly 42 bytes')
+        raise SVFReject('profile must be exactly 42 bytes')
     if raw[:4] != SVF_PROFILE_MAGIC:
-        raise svf_keys.SVFReject('invalid profile magic')
+        raise SVFReject('invalid profile magic')
     schema_version = bootstrap.struct.unpack('>H', raw[4:6])[0]
     if schema_version != SVF_PROFILE_SCHEMA_VERSION:
-        raise svf_keys.SVFReject(f'unsupported profile schema version: {schema_version}')
+        raise SVFReject(f'unsupported profile schema version: {schema_version}')
     family_id = raw[6]
     if family_id != SVF_PROFILE_FAMILY_ID:
-        raise svf_keys.SVFReject(f'unsupported profile family: {family_id}')
+        raise SVFReject(f'unsupported profile family: {family_id}')
     sample_blocks = raw[7]
     min_distinct_winners = raw[8]
     min_growth_blocks = raw[9]
     min_total_attestation_weight = int.from_bytes(raw[10:42], 'big')
     if not 1 <= sample_blocks <= SVF_EPOCH_BLOCKS:
-        raise svf_keys.SVFReject(f'sample_blocks out of range [1, {SVF_EPOCH_BLOCKS}]: {sample_blocks}')
+        raise SVFReject(f'sample_blocks out of range [1, {SVF_EPOCH_BLOCKS}]: {sample_blocks}')
     if not 1 <= min_distinct_winners <= sample_blocks:
-        raise svf_keys.SVFReject(f'min_distinct_winners out of range [1, {sample_blocks}]: {min_distinct_winners}')
+        raise SVFReject(f'min_distinct_winners out of range [1, {sample_blocks}]: {min_distinct_winners}')
     if not 0 <= min_growth_blocks <= sample_blocks:
-        raise svf_keys.SVFReject(f'min_growth_blocks out of range [0, {sample_blocks}]: {min_growth_blocks}')
+        raise SVFReject(f'min_growth_blocks out of range [0, {sample_blocks}]: {min_growth_blocks}')
     if min_total_attestation_weight <= 0:
-        raise svf_keys.SVFReject('min_total_attestation_weight must be positive')
+        raise SVFReject('min_total_attestation_weight must be positive')
     return {'schema_version': schema_version, 'family_id': family_id, 'sample_blocks': sample_blocks, 'min_distinct_winners': min_distinct_winners, 'min_growth_blocks': min_growth_blocks, 'min_total_attestation_weight': min_total_attestation_weight}
 
 def svf_profile_bytes(profile: dict) -> bytes:
     if profile['schema_version'] != SVF_PROFILE_SCHEMA_VERSION:
-        raise svf_keys.SVFReject(f'unsupported schema version: {profile['schema_version']}')
+        raise SVFReject(f'unsupported schema version: {profile['schema_version']}')
     if profile['family_id'] != SVF_PROFILE_FAMILY_ID:
-        raise svf_keys.SVFReject(f'unsupported family id: {profile['family_id']}')
+        raise SVFReject(f'unsupported family id: {profile['family_id']}')
     sb = bytearray()
     sb += SVF_PROFILE_MAGIC
     sb += bootstrap.struct.pack('>H', profile['schema_version'])
@@ -415,16 +415,16 @@ class SVFBlockEvidence:
 def compute_block_evidence(block: dict, block_id: int) -> SVFBlockEvidence:
     att = block.get('maze_attestation')
     if not isinstance(att, dict):
-        raise svf_keys.SVFReject('block has no maze_attestation')
+        raise SVFReject('block has no maze_attestation')
     attested_size = int(att.get('size', 0))
     if attested_size <= 0:
-        raise svf_keys.SVFReject('attestation size must be positive')
+        raise SVFReject('attestation size must be positive')
     maze_updates = block.get('maze_updates', [])
     if not isinstance(maze_updates, list):
-        raise svf_keys.SVFReject('block maze_updates is not a list')
+        raise SVFReject('block maze_updates is not a list')
     att_pub = str(att.get('pubkey', '') or '')
     if not att_pub:
-        raise svf_keys.SVFReject('maze_attestation has no pubkey')
+        raise SVFReject('maze_attestation has no pubkey')
     winner_pubkey = att_pub.lower()
     winner = block.get('winner') or att_pub
     growth_present = False
@@ -444,7 +444,7 @@ def compute_block_evidence(block: dict, block_id: int) -> SVFBlockEvidence:
     att_weight = maze._maze_att_weight(attested_size)
     block_hash = block.get('hash')
     if not block_hash:
-        raise svf_keys.SVFReject('block has no hash')
+        raise SVFReject('block has no hash')
     block_hash_bytes = bytes.fromhex(block_hash) if isinstance(block_hash, str) else bytes(block_hash)
     winner_pubkey_bytes = bytes.fromhex(winner_pubkey.removeprefix('0x')) if winner_pubkey.startswith('0x') else bytes.fromhex(winner_pubkey)
     h = bootstrap.hashlib.sha256()
@@ -460,7 +460,7 @@ def compute_block_evidence(block: dict, block_id: int) -> SVFBlockEvidence:
 
 def compute_epoch_root(records: list) -> bytes:
     if len(records) != SVF_EPOCH_BLOCKS:
-        raise svf_keys.SVFReject(f'epoch root requires exactly {SVF_EPOCH_BLOCKS} records, got {len(records)}')
+        raise SVFReject(f'epoch root requires exactly {SVF_EPOCH_BLOCKS} records, got {len(records)}')
 
     def _get(rec, key):
         if isinstance(rec, dict):
@@ -491,33 +491,33 @@ def _svf_epoch_root_if_complete(records, epoch_id):
 
 def compute_epoch_challenge(beacon: bytes, chain_id: int, epoch_id: int, token_address: str, profile_hash: bytes, evidence_root: bytes) -> bytes:
     if not isinstance(beacon, (bytes, bytearray)) or len(beacon) != 32:
-        raise svf_keys.SVFReject('beacon must be 32 bytes')
+        raise SVFReject('beacon must be 32 bytes')
     _svf_int('chain_id', chain_id, 0, 2 ** 63 - 1)
     _svf_int('evidence_epoch', epoch_id, 0, 2 ** 63 - 1)
     _tok = str(token_address).lower() if isinstance(token_address, str) else ''
     if _tok and (not _tok.startswith('0x')):
         _tok = '0x' + _tok
     if not crypto._valid_wallet(_tok):
-        raise svf_keys.SVFReject('invalid token address for challenge')
+        raise SVFReject('invalid token address for challenge')
     token_address = _tok
     if isinstance(profile_hash, (bytes, bytearray)):
         if len(profile_hash) != 32:
-            raise svf_keys.SVFReject('profile_hash must be 32 bytes')
+            raise SVFReject('profile_hash must be 32 bytes')
         profile_hash_hex = bytes(profile_hash).hex()
     elif isinstance(profile_hash, str):
         _svf_hex32('profile_hash', profile_hash)
         profile_hash_hex = profile_hash
     else:
-        raise svf_keys.SVFReject('profile_hash must be 32 bytes or 64-char hex string')
+        raise SVFReject('profile_hash must be 32 bytes or 64-char hex string')
     if isinstance(evidence_root, (bytes, bytearray)):
         if len(evidence_root) != 32:
-            raise svf_keys.SVFReject('evidence_root must be 32 bytes')
+            raise SVFReject('evidence_root must be 32 bytes')
         evidence_root_hex = bytes(evidence_root).hex()
     elif isinstance(evidence_root, str):
         _svf_hex32('evidence_root', evidence_root)
         evidence_root_hex = evidence_root
     else:
-        raise svf_keys.SVFReject('evidence_root must be 32 bytes or 64-char hex string')
+        raise SVFReject('evidence_root must be 32 bytes or 64-char hex string')
     h = bootstrap.hashlib.sha256()
     h.update(SVF_CHALLENGE_DOMAIN)
     h.update(b'\x00')
@@ -580,7 +580,7 @@ def evaluate_profile(profile: dict, evidence_records: list, block_id: int, chall
             computed_root = compute_epoch_root(sorted_recs)
             if computed_root != (epoch_root if isinstance(epoch_root, bytes) else bytes.fromhex(epoch_root)):
                 return 'FAIL'
-        except svf_keys.SVFReject:
+        except SVFReject:
             return 'FAIL'
     end_height = epoch_id * SVF_EPOCH_BLOCKS + SVF_EPOCH_BLOCKS - 1
     if not end_height + int(prune_blocks) < int(block_id):
@@ -602,7 +602,7 @@ def evaluate_profile(profile: dict, evidence_records: list, block_id: int, chall
             return 'UNAVAILABLE'
         try:
             challenge_seed = compute_epoch_challenge(beacon_output, int(chain_id), epoch_id, token_address, profile_hash, epoch_root)
-        except svf_keys.SVFReject:
+        except SVFReject:
             return 'UNAVAILABLE'
     permutation = fisher_yates_shuffle(challenge_seed, SVF_EPOCH_BLOCKS)
     selected_indices = sorted(permutation[:sample_blocks])

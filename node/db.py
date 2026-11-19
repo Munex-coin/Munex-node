@@ -3,7 +3,6 @@ import config
 import crypto
 import util
 import maze
-import svf_keys
 import svf
 VERIFY_STATE_ROOT = True
 STATE_COMMITMENT_SCOPE = 'two-key'
@@ -172,7 +171,7 @@ async def _state_snapshot_for_block(db, node, block_id: int) -> dict:
                 _pb = svf.svf_profile_bytes(prof)
                 _ph = svf.svf_profile_hash(int(config.CHAIN_ID), tok, _pb)
                 snap[f'svfreg:{tok}'] = {'profile_hash': _ph.hex(), 'sample_blocks': prof.get('sample_blocks', 0), 'min_distinct_winners': prof.get('min_distinct_winners', 0), 'min_growth_blocks': prof.get('min_growth_blocks', 0), 'min_total_attestation_weight': str(prof.get('min_total_attestation_weight', 0))}
-            except svf_keys.SVFReject:
+            except svf.SVFReject:
                 snap[f'svfreg:{tok}'] = {'error': 'invalid_profile'}
         svf_epoch_roots = getattr(node, 'svf_epoch_roots', {}) or {}
         for epoch_id in sorted(svf_epoch_roots.keys()):

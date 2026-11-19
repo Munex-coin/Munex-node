@@ -121,7 +121,7 @@ def _genesis_economics_ok(data: dict):
         return (False, f'state_root recomputation failed: {e}')
     return (True, 'ok')
 GENESIS_IDENTITY_VERSION = 1
-GENESIS_CONSENSUS_RULESET_VERSION = 13
+GENESIS_CONSENSUS_RULESET_VERSION = 12
 GENESIS_IDENTITY_FIELDS = ('id', 'ts', 'phash', 'miners', 'reward', 'tx_count', 'merkle_root', 'nonce', 'difficulty', 'version', 'challenge', 'coverage', 'total_tx_value', 'total_fees', 'tx_hashes', 'state_root', 'producer_pub', 'alloc', 'total_minted', 'chain_id', 'consensus', 'validators', 'svf_public')
 GENESIS_TRANSPORT_KEYS = frozenset({'hash', 'signature', 'finalized'})
 
@@ -148,6 +148,41 @@ def _effective_consensus_ruleset() -> dict:
     _live.update(_fixed_consensus_params())
     return _live
 
+def _normalize_svf_public(value) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError('malformed genesis field: svf_public must be an object')
+    _cid = value.get('chain_id')
+    if isinstance(_cid, bool) or not isinstance(_cid, int):
+        raise ValueError('malformed genesis field: svf_public.chain_id must be an integer')
+    _gpk = value.get('group_public_key')
+    if not isinstance(_gpk, str):
+        raise ValueError('malformed genesis field: svf_public.group_public_key must be a hex string')
+    _gpk_norm = _gpk.strip().lower()
+    if len(_gpk_norm) != 192:
+        raise ValueError('malformed genesis field: svf_public.group_public_key must be 96 bytes (192 hex chars)')
+    try:
+        bytes.fromhex(_gpk_norm)
+    except ValueError:
+        raise ValueError('malformed genesis field: svf_public.group_public_key is not valid hex')
+    _th = value.get('template_hashes')
+    if not isinstance(_th, dict):
+        raise ValueError('malformed genesis field: svf_public.template_hashes must be an object')
+    _norm_th = {}
+    for _name, _sha in _th.items():
+        if not isinstance(_name, str) or not _name.strip():
+            raise ValueError('malformed genesis field: svf_public.template_hashes keys must be non-empty strings')
+        if not isinstance(_sha, str):
+            raise ValueError('malformed genesis field: svf_public.template_hashes values must be hex strings')
+        _sha_norm = _sha.strip().lower()
+        if len(_sha_norm) != 64:
+            raise ValueError('malformed genesis field: svf_public.template_hashes values must be 32 bytes (64 hex chars)')
+        try:
+            bytes.fromhex(_sha_norm)
+        except ValueError:
+            raise ValueError('malformed genesis field: svf_public.template_hashes values must be valid hex')
+        _norm_th[_name] = _sha_norm
+    return {'chain_id': int(_cid), 'group_public_key': _gpk_norm, 'template_hashes': {k: _norm_th[k] for k in sorted(_norm_th)}}
+
 def _canonical_genesis_payload(data: dict) -> dict:
     if not isinstance(data, dict):
         raise ValueError('genesis body is not a dict')
@@ -169,7 +204,7 @@ def _canonical_genesis_payload(data: dict) -> dict:
         raise ValueError('malformed genesis field: alloc/consensus must be maps')
     if not isinstance(data['validators'], list) or any((not isinstance(v, str) for v in data['validators'])):
         raise ValueError('malformed genesis field: validators must be a list of strings')
-    _payload['svf_public'] = svf_keys._normalize_svf_public(data['svf_public'])
+    _payload['svf_public'] = _normalize_svf_public(data['svf_public'])
     return _payload
 
 def _genesis_identity_hash(payload: dict) -> str:
