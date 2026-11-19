@@ -121,7 +121,7 @@ def _genesis_economics_ok(data: dict):
         return (False, f'state_root recomputation failed: {e}')
     return (True, 'ok')
 GENESIS_IDENTITY_VERSION = 1
-GENESIS_CONSENSUS_RULESET_VERSION = 12
+GENESIS_CONSENSUS_RULESET_VERSION = 13
 GENESIS_IDENTITY_FIELDS = ('id', 'ts', 'phash', 'miners', 'reward', 'tx_count', 'merkle_root', 'nonce', 'difficulty', 'version', 'challenge', 'coverage', 'total_tx_value', 'total_fees', 'tx_hashes', 'state_root', 'producer_pub', 'alloc', 'total_minted', 'chain_id', 'consensus', 'validators', 'svf_public')
 GENESIS_TRANSPORT_KEYS = frozenset({'hash', 'signature', 'finalized'})
 

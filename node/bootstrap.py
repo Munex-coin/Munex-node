@@ -202,6 +202,7 @@ try:
 except ImportError:
     asyncpg = None
 from urllib.parse import urlparse
+import urllib.request
 try:
     import bip32utils
 except ImportError:

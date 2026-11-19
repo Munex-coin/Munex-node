@@ -255,6 +255,7 @@ try:
 except ImportError:
     asyncpg = None
 from urllib.parse import urlparse
+import urllib.request
 try:
     import bip32utils
 except ImportError:
@@ -373,7 +374,7 @@ DEFAULT_CONFIG = {
     # (no protocol min fee; token creation is a flat hardcoded SVF
     # fee). max_fee / fee_per_byte were already dead keys.
     'fees': {'max_fee': 100000, 'fee_per_byte': 10, 'rbf_increment': 1.1, 'cpfp_min_fee': 100},
-    'p2p': {'genesis_node': 'munexseed.duckdns.org', 'dns_seeds': ['munexseed.duckdns.org'], 'bootstrap_nodes': ['munexseed.duckdns.org:8081'], 'dht_bootstrap_nodes': ['munexseed.duckdns.org:8083'], 'fallback_nodes': [], 'max_peers': 50, 'ban_threshold': 5, 'ban_duration': 3600, 'dht_enabled': True, 'discovery_interval': 300, 'discovery_timeout': 60, 'allow_private_peers': False},
+    'p2p': {'genesis_node': 'munexseed.duckdns.org', 'dns_seeds': ['munexseed.duckdns.org'], 'bootstrap_nodes': ['munexseed.duckdns.org:8081'], 'dht_bootstrap_nodes': ['munexseed.duckdns.org:8083'], 'fallback_nodes': [], 'max_peers': 50, 'ban_threshold': 5, 'ban_duration': 3600, 'dht_enabled': True, 'discovery_interval': 300, 'discovery_timeout': 60, 'registry_url': 'https://munex-registry.animax-plorer.workers.dev/nodes', 'registry_enabled': True, 'registry_interval': 300, 'allow_private_peers': False},
     # GAS-USED-1 / v9.3: gas_price / gas_limit_default / max_block_gas
     # / max_block_txs / max_bytecode are HARDCODED protocol constants
     # now (see the GAS-USED-1 block); a config.yaml that sets them
@@ -474,6 +475,7 @@ GENESIS_NODE_P2P_PORT = 8081
 GENESIS_NODE_DHT_PORT = 8083
 GENESIS_NODE_WS_PORT = 8080
 GENESIS_BOOTSTRAP_ENDPOINT = f"{GENESIS_NODE_HOST}:{GENESIS_NODE_P2P_PORT}"
+REGISTRY_URL_DEFAULT = "https://munex-registry.animax-plorer.workers.dev/nodes"
 
 BURN_ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
 BURN_ADDRESS_DEAD = "0x000000000000000000000000000000000000dEaD"
@@ -543,7 +545,7 @@ SCHEMA_VERSION = 1
 
 # --- PoSW Consensus Constants -----------------------------
 CHAIN_ID = 6621
-TESTNET_GENESIS_HASH = "4aa436a1aa8d20ba8194faa99d544f1f81052670b7f1ada7b5c734dc571a5864"
+TESTNET_GENESIS_HASH = "1a36f67d646bff38d9d2169e34f1bc3d41700046920bb4ca6e62c8e230d2bc5c"
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 PROTOCOL_VERSION = 64
 POG_ACTIVATION_HEIGHT = 100000
@@ -1452,7 +1454,11 @@ GENESIS_IDENTITY_VERSION = 1
 # GAS-USED-1 / v9.3: ruleset v12 — gas schedule + SVF fee schedule
 # bound; min_fee / token_creation_multiplier removed (no protocol
 # min fee; token creation is a flat hardcoded SVF fee).
-GENESIS_CONSENSUS_RULESET_VERSION = 12
+# V11: ruleset v13 — registry reader (peer discovery from the Munex
+# registry, DNS seeds kept as fallback). Discovery is not consensus:
+# no block, state-root, fee or SVF rule changes; the bump exists only
+# to give this release a fresh genesis (new chain).
+GENESIS_CONSENSUS_RULESET_VERSION = 13
 GENESIS_IDENTITY_FIELDS = (
     "id", "ts", "phash", "miners", "reward", "tx_count", "merkle_root",
     "nonce", "difficulty", "version", "challenge", "coverage",
@@ -13257,6 +13263,13 @@ class P2PNode:
         p2p_cfg = getattr(self.node, 'config', {}).get('p2p', {}) if self.node else CONFIG.get('p2p', {})
         (self.genesis_node, self.dns_seeds, self.bootstrap_nodes,
          self.dht_bootstrap_nodes) = resolve_seed_lists(p2p_cfg)
+        self.registry_url = str(p2p_cfg.get('registry_url', REGISTRY_URL_DEFAULT)).strip()
+        self.registry_enabled = _strict_bool(
+            'p2p.registry_enabled', p2p_cfg.get('registry_enabled', True))
+        self.registry_interval = max(60, int(p2p_cfg.get('registry_interval', 300) or 300))
+        self._registry_last_fetch = 0.0
+        self._registry_cached_peers = []
+        self._registry_last_push = 0.0
         self.fallback_nodes = list(p2p_cfg.get('fallback_nodes', []))
         self.dht_port = int(p2p_cfg.get('dht_port', DHT_PORT))
         self.allow_private_peers = _strict_bool(
@@ -14549,6 +14562,103 @@ class P2PNode:
         except Exception:
             logger.debug(msg)
 
+    def _fetch_registry_peers_sync(self):
+        # V11: one blocking HTTPS GET of the registry list, run in an
+        # executor so the event loop never stalls. Returns ["host:port"]
+        # P2P endpoints, or [] on any failure (registry down, bad JSON,
+        # non-list) — discovery then falls back to the DNS seeds.
+        # Private/loopback endpoints are dropped unless
+        # p2p.allow_private_peers is set (local/test nets).
+        req = urllib.request.Request(
+            self.registry_url,
+            headers={"User-Agent": "munex-node/11", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:
+                if res.status != 200:
+                    return []
+                data = json.loads(res.read().decode("utf-8", "replace"))
+        except Exception as e:
+            logger.debug(f"[REGISTRY] fetch failed: {e}")
+            return []
+        endpoints = []
+        if isinstance(data, dict) and isinstance(data.get("nodes"), list):
+            for n in data["nodes"]:
+                if not isinstance(n, dict):
+                    continue
+                p2p = n.get("p2p") or ""
+                host, port = parse_ip_port(str(p2p), P2P_PORT)
+                if not host:
+                    continue
+                try:
+                    ip = ipaddress.ip_address(host)
+                except ValueError:
+                    continue
+                if not self.allow_private_peers and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast):
+                    continue
+                endpoints.append(f"{host}:{port}" if ":" not in str(host) else f"[{host}]:{port}")
+        return list(dict.fromkeys(endpoints))
+
+    async def _fetch_registry_peers(self):
+        if not self.registry_enabled or not self.registry_url:
+            return []
+        # V11: at most one fetch per registry_interval — the discovery
+        # loop runs every ~6 s and the registry list does not change
+        # that fast. Between fetches the cached list is reused; a
+        # failed fetch also waits out the interval before retrying.
+        now = time.time()
+        if now - self._registry_last_fetch < self.registry_interval:
+            return list(self._registry_cached_peers)
+        self._registry_last_fetch = now
+        try:
+            loop = asyncio.get_running_loop()
+            peers = await loop.run_in_executor(None, self._fetch_registry_peers_sync)
+        except Exception as e:
+            logger.debug(f"[REGISTRY] fetch failed: {e}")
+            return list(self._registry_cached_peers)
+        self._registry_cached_peers = list(peers)
+        return list(peers)
+
+    def _registry_push_self_sync(self, ip, p2p_port):
+        # V11: best-effort POST of this node's own public IP to the
+        # registry. The registry probes the IP before listing it, so a
+        # wrong or unreachable IP simply never appears. Any failure is
+        # ignored — the registry is discovery only, never required.
+        push_url = self.registry_url.rstrip("/").rsplit("/", 1)[0] + "/register"
+        payload = json.dumps({"ip": ip, "p2p_port": int(p2p_port)}).encode("utf-8")
+        req = urllib.request.Request(
+            push_url, data=payload, method="POST",
+            headers={"User-Agent": "munex-node/11", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:
+                res.read()
+        except Exception as e:
+            logger.debug(f"[REGISTRY] push failed: {e}")
+
+    async def _registry_push_self(self):
+        if not self.registry_enabled or not self.registry_url:
+            return
+        # V11: at most one push per registry_interval (same reason as
+        # the fetch throttle above; the worker also throttles pushes
+        # to one per 60 s per IP).
+        now = time.time()
+        if now - self._registry_last_push < self.registry_interval:
+            return
+        self._registry_last_push = now
+        ip = getattr(self, "public_ip", "") or ""
+        if not ip:
+            return
+        try:
+            addr = ipaddress.ip_address(ip)
+            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
+                return
+        except ValueError:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._registry_push_self_sync, ip, P2P_PORT)
+        except Exception as e:
+            logger.debug(f"[REGISTRY] push failed: {e}")
+
     async def _resolve_dns_seeds(self) -> List[str]:
         loop = asyncio.get_running_loop()
         seeds = self.dns_seeds
@@ -14660,6 +14770,13 @@ class P2PNode:
 
     async def _discovery_loop(self):
         while not self._discovery_stop.is_set():
+            registry_peers = await self._fetch_registry_peers()
+            for addr in registry_peers:
+                if not self._is_peer_connected(addr) and not self._is_banned(address=addr):
+                    await self._connect_to_peer(addr)
+                    if len(self.peers) >= self.max_peers:
+                        break
+            await self._registry_push_self()
             dns_peers = await self._resolve_dns_seeds()
             for addr in dns_peers:
                 if not self._is_peer_connected(addr) and not self._is_banned(address=addr):
