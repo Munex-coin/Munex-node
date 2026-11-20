@@ -202,7 +202,7 @@ def validate_rpc_startup_token(config) -> None:
     if not _token:
         _token = _generate_and_save_rpc_token(config)
     if not _token:
-        bootstrap.logger.error('[RPC-AUTH] JSON-RPC HTTP API is bound to %s (not loopback-only) with no API access secret. This is NOT related to deploying fungible tokens — it only protects POST /rpc from the network. For a local node: set node.rpc_bind_ip: 127.0.0.1 (default). To expose RPC on the LAN: set MCX_RPC_TOKEN or node.rpc_token to a >=24-char random secret. Refusing to start.', _rpc_bind)
+        bootstrap.logger.error('[RPC-AUTH] JSON-RPC HTTP API is bound to %s (not loopback-only) with no API access secret. This is NOT related to deploying fungible tokens — it only protects POST /rpc from the network. For a local node: set node.rpc_bind_ip: 127.0.0.1. To expose RPC on the LAN: set MCX_RPC_TOKEN or node.rpc_token to a >=24-char random secret. Refusing to start.', _rpc_bind)
         bootstrap.sys.exit(1)
     if 'CHANGE_ME' in _token:
         bootstrap.logger.error("[RPC-AUTH] Configured bearer token is a placeholder (contains 'CHANGE_ME'). Refusing to start. Set MCX_RPC_TOKEN / node.rpc_token to a real secret.")

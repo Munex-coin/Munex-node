@@ -347,7 +347,7 @@ RESET, GREEN, CYAN, YELLOW, RED, BOLD = "\033[0m","\033[92m","\033[96m","\033[93
 
 CONFIG_PATH = os.environ.get('MCX_CONFIG', 'config.yaml')
 DEFAULT_CONFIG = {
-    'node': {'ws_port': 8080, 'ws_bind_ip': '0.0.0.0', 'api_port': 8085, 'p2p_port': 8081, 'public_url': None, 'external_ip': '', 'external_port': 8081, 'bind_ip': '0.0.0.0', 'rpc_bind_ip': '127.0.0.1', 'rpc_token': '', 'rpc_trust_loopback': False, 'mainnet': True},
+    'node': {'ws_port': 8080, 'ws_bind_ip': '0.0.0.0', 'api_port': 8085, 'p2p_port': 8081, 'public_url': None, 'external_ip': '', 'external_port': 8081, 'bind_ip': '0.0.0.0', 'rpc_bind_ip': '0.0.0.0', 'rpc_token': '', 'rpc_trust_loopback': False, 'mainnet': True},
     'database': {'url': None, 'require_postgres': False},
     'consensus': {
         'block_time': 50,
@@ -4484,7 +4484,7 @@ def validate_rpc_startup_token(config) -> None:
             "[RPC-AUTH] JSON-RPC HTTP API is bound to %s (not loopback-only) "
             "with no API access secret. This is NOT related to deploying "
             "fungible tokens — it only protects POST /rpc from the network. "
-            "For a local node: set node.rpc_bind_ip: 127.0.0.1 (default). "
+            "For a local node: set node.rpc_bind_ip: 127.0.0.1. "
             "To expose RPC on the LAN: set MCX_RPC_TOKEN or node.rpc_token "
             "to a >=24-char random secret. Refusing to start.", _rpc_bind)
         sys.exit(1)
