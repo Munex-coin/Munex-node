@@ -22287,7 +22287,7 @@ class MicroCoreNode:
                 query = "SELECT tx_hash, from_wallet, to_wallet, amount, timestamp, block_id, status FROM transactions WHERE block_id >= 0 ORDER BY timestamp DESC LIMIT $1 OFFSET $2"
             rows = await self.db.fetch(query, limit, offset)
             txs = [{"hash": r['tx_hash'][:12], "full_hash": r['tx_hash'], "from": r['from_wallet'], "to": r['to_wallet'], "amount": r['amount']//SUBS, "timestamp": r['timestamp'], "block": r['block_id'], "status": r['status']} for r in rows]
-            total_row = await self.db.fetchrow("SELECT COUNT(*) FROM transactions WHERE block_id >= 0")
+            total_row = await self.db.fetchrow("SELECT COUNT(*) AS count FROM transactions WHERE block_id >= 0")
             total = total_row['count'] if total_row else 0
             has_more = (total - offset - limit) > 0
             await ws.send_json({"type": "transactions", "data": {"transactions": txs, "has_more": has_more}})
