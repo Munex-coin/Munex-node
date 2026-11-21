@@ -4051,6 +4051,71 @@ class MicroCoreNode:
         await self.db.close()
         bootstrap.logger.info('[Node] Shutdown complete.')
 
+    async def _listener_probe(self, host, port, path):
+        try:
+            reader, writer = await bootstrap.asyncio.wait_for(bootstrap.asyncio.open_connection(host, port), timeout=5)
+        except Exception:
+            return False
+        try:
+            writer.write(f'GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n'.encode())
+            await writer.drain()
+            data = await bootstrap.asyncio.wait_for(reader.read(256), timeout=5)
+            return data.startswith(b'HTTP/')
+        except Exception:
+            return False
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _listener_rebind(self, rec):
+        from aiohttp import web
+        old = rec['site']
+        try:
+            await bootstrap.asyncio.wait_for(old.stop(), timeout=5)
+        except Exception as _e:
+            bootstrap.logger.warning(f'[LISTENER] {rec['name']} old site stop failed (ignored): {_e}')
+        try:
+            site = web.TCPSite(rec['runner'], rec['host'], rec['port'])
+            await site.start()
+        except OSError as _e:
+            if getattr(_e, 'errno', None) in (48, 98, 10048):
+                bootstrap.logger.warning(f'[LISTENER] {rec['name']} port still held - old listener alive, keeping it')
+                return
+            raise
+        rec['site'] = site
+        bootstrap.logger.info(f'[LISTENER] {rec['name']} re-bound on {rec['host']}:{rec['port']}')
+
+    async def _listener_watchdog(self, sites):
+        while True:
+            await bootstrap.asyncio.sleep(15)
+            for rec in sites:
+                try:
+                    host = rec['host']
+                    if host in ('0.0.0.0', ''):
+                        probe_host = '127.0.0.1'
+                    elif host == '::':
+                        probe_host = '::1'
+                    else:
+                        probe_host = host
+                    alive = await self._listener_probe(probe_host, rec['port'], rec['path'])
+                except Exception as _e:
+                    bootstrap.logger.warning(f'[LISTENER] {rec['name']} probe error (ignored): {_e}')
+                    continue
+                if alive:
+                    rec['fails'] = 0
+                    continue
+                rec['fails'] += 1
+                bootstrap.logger.warning(f'[LISTENER] {rec['name']} probe failed ({rec['fails']}/3)')
+                if rec['fails'] < 3:
+                    continue
+                rec['fails'] = 0
+                try:
+                    await self._listener_rebind(rec)
+                except Exception as _e:
+                    bootstrap.logger.error(f'[LISTENER] {rec['name']} rebind failed: {_e}')
+
     async def _run_websocket(self):
         from aiohttp import web, WSMsgType
         from aiohttp.web import Application, Request, Response, WebSocketResponse
@@ -4898,7 +4963,8 @@ class MicroCoreNode:
         runner_ws = web.AppRunner(app_ws)
         await runner_ws.setup()
         try:
-            await web.TCPSite(runner_ws, ws_bind_ip, ws_port).start()
+            _site_ws = web.TCPSite(runner_ws, ws_bind_ip, ws_port)
+            await _site_ws.start()
         except OSError as _oe:
             bootstrap.logger.error(f'[WS] Failed to bind miner WebSocket on {ws_bind_ip}:{ws_port}: {_oe} (port already in use by another process? invalid address for this host?)')
             await runner_ws.cleanup()
@@ -4906,16 +4972,26 @@ class MicroCoreNode:
         runner_api = web.AppRunner(app)
         await runner_api.setup()
         _rpc_bind = self.config.get('node', {}).get('rpc_bind_ip', config.RPC_BIND_IP)
-        await web.TCPSite(runner_api, _rpc_bind, api_port).start()
+        _site_api = web.TCPSite(runner_api, _rpc_bind, api_port)
+        await _site_api.start()
         bootstrap.logger.info(f'[API] Private RPC/REST:       http://{_rpc_bind}:{api_port}/rpc')
         bootstrap.logger.info(f'[API] Private metrics/health: http://{_rpc_bind}:{api_port}/metrics')
         if str(_rpc_bind) == '0.0.0.0' and (not wallet._rpc_bearer_token(self.config)):
             bootstrap.logger.warning('[API] RPC bound to 0.0.0.0 with no bearer token configured: remote POST /rpc is refused; set MCX_RPC_TOKEN / node.rpc_token to serve LAN wallets, and firewall the port')
         bootstrap.logger.info(f'[WS] MetaMask RPC URL: http://{lan_ip}:{api_port}/rpc  (Chain ID: {config.CHAIN_ID})')
+        _sites = [{'name': 'WS', 'runner': runner_ws, 'site': _site_ws, 'host': ws_bind_ip, 'port': ws_port, 'path': '/healthz', 'fails': 0}, {'name': 'API', 'runner': runner_api, 'site': _site_api, 'host': _rpc_bind, 'port': api_port, 'path': '/health', 'fails': 0}]
+        self._listener_watchdog_task = bootstrap.asyncio.create_task(self._listener_watchdog(_sites))
         try:
             while True:
                 await bootstrap.asyncio.sleep(3600)
         except bootstrap.asyncio.CancelledError:
+            _wd = getattr(self, '_listener_watchdog_task', None)
+            if _wd is not None:
+                _wd.cancel()
+                try:
+                    await _wd
+                except bootstrap.asyncio.CancelledError:
+                    pass
             await runner_ws.cleanup()
             await runner_api.cleanup()
             raise

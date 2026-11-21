@@ -20339,6 +20339,92 @@ class MicroCoreNode:
         await self.db.close()
         logger.info("[Node] Shutdown complete.")
 
+    async def _listener_probe(self, host, port, path):
+        # LISTENER-WATCHDOG-1: plain HTTP GET against a listener. Any
+        # complete HTTP response means the listener is alive; a refused
+        # or timed-out connection means it is dead. Returns True/False,
+        # never raises.
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=5)
+        except Exception:
+            return False
+        try:
+            writer.write(
+                f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(256), timeout=5)
+            return data.startswith(b"HTTP/")
+        except Exception:
+            return False
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _listener_rebind(self, rec):
+        # Drop the dead site and start a fresh TCPSite on the same
+        # runner (same app, same port). The old site's listening socket
+        # is already closed; stopping it is best-effort and bounded so
+        # a live connection can never wedge the watchdog. If the port
+        # is still held, the old listener is actually alive and the
+        # probe failed for another reason — keep it and let the next
+        # probe cycle confirm.
+        from aiohttp import web
+        old = rec["site"]
+        try:
+            await asyncio.wait_for(old.stop(), timeout=5)
+        except Exception as _e:
+            logger.warning(f"[LISTENER] {rec['name']} old site stop failed (ignored): {_e}")
+        try:
+            site = web.TCPSite(rec["runner"], rec["host"], rec["port"])
+            await site.start()
+        except OSError as _e:
+            if getattr(_e, "errno", None) in (48, 98, 10048):
+                logger.warning(f"[LISTENER] {rec['name']} port still held - old listener alive, keeping it")
+                return
+            raise
+        rec["site"] = site
+        logger.info(f"[LISTENER] {rec['name']} re-bound on {rec['host']}:{rec['port']}")
+
+    async def _listener_watchdog(self, sites):
+        # LISTENER-WATCHDOG-1: on Windows, one transient accept failure
+        # (WinError 64 when the network blips) makes asyncio close the
+        # listening socket for good — the process keeps running and the
+        # other listener keeps answering, but no new connection is ever
+        # accepted on the dead one again. Probe each listener every
+        # 15 s; after 3 consecutive failed probes, rebind it. Same app,
+        # same port, same chain — no restart, no new genesis. Never
+        # raises: a watchdog failure must not kill the node.
+        while True:
+            await asyncio.sleep(15)
+            for rec in sites:
+                try:
+                    host = rec["host"]
+                    if host in ("0.0.0.0", ""):
+                        probe_host = "127.0.0.1"
+                    elif host == "::":
+                        probe_host = "::1"
+                    else:
+                        probe_host = host
+                    alive = await self._listener_probe(probe_host, rec["port"], rec["path"])
+                except Exception as _e:
+                    logger.warning(f"[LISTENER] {rec['name']} probe error (ignored): {_e}")
+                    continue
+                if alive:
+                    rec["fails"] = 0
+                    continue
+                rec["fails"] += 1
+                logger.warning(f"[LISTENER] {rec['name']} probe failed ({rec['fails']}/3)")
+                if rec["fails"] < 3:
+                    continue
+                rec["fails"] = 0
+                try:
+                    await self._listener_rebind(rec)
+                except Exception as _e:
+                    logger.error(f"[LISTENER] {rec['name']} rebind failed: {_e}")
+
     async def _run_websocket(self):
         from aiohttp import web, WSMsgType
         from aiohttp.web import Application, Request, Response, WebSocketResponse
@@ -21371,7 +21457,8 @@ class MicroCoreNode:
         runner_ws = web.AppRunner(app_ws)
         await runner_ws.setup()
         try:
-            await web.TCPSite(runner_ws, ws_bind_ip, ws_port).start()
+            _site_ws = web.TCPSite(runner_ws, ws_bind_ip, ws_port)
+            await _site_ws.start()
         except OSError as _oe:
             logger.error(f"[WS] Failed to bind miner WebSocket on {ws_bind_ip}:{ws_port}: {_oe} "
                          f"(port already in use by another process? invalid address for this host?)")
@@ -21380,17 +21467,32 @@ class MicroCoreNode:
         runner_api = web.AppRunner(app)
         await runner_api.setup()
         _rpc_bind = self.config.get('node', {}).get('rpc_bind_ip', RPC_BIND_IP)
-        await web.TCPSite(runner_api, _rpc_bind, api_port).start()
+        _site_api = web.TCPSite(runner_api, _rpc_bind, api_port)
+        await _site_api.start()
         logger.info(f"[API] Private RPC/REST:       http://{_rpc_bind}:{api_port}/rpc")
         logger.info(f"[API] Private metrics/health: http://{_rpc_bind}:{api_port}/metrics")
         if str(_rpc_bind) == '0.0.0.0' and not _rpc_bearer_token(self.config):
             logger.warning("[API] RPC bound to 0.0.0.0 with no bearer token configured: remote POST /rpc is refused; set MCX_RPC_TOKEN / node.rpc_token to serve LAN wallets, and firewall the port")
         logger.info(f"[WS] MetaMask RPC URL: http://{lan_ip}:{api_port}/rpc  (Chain ID: {CHAIN_ID})")
+        _sites = [
+            {"name": "WS", "runner": runner_ws, "site": _site_ws,
+             "host": ws_bind_ip, "port": ws_port, "path": "/healthz", "fails": 0},
+            {"name": "API", "runner": runner_api, "site": _site_api,
+             "host": _rpc_bind, "port": api_port, "path": "/health", "fails": 0},
+        ]
+        self._listener_watchdog_task = asyncio.create_task(self._listener_watchdog(_sites))
 
         try:
             while True:
                 await asyncio.sleep(3600)
         except asyncio.CancelledError:
+            _wd = getattr(self, "_listener_watchdog_task", None)
+            if _wd is not None:
+                _wd.cancel()
+                try:
+                    await _wd
+                except asyncio.CancelledError:
+                    pass
             await runner_ws.cleanup()
             await runner_api.cleanup()
             raise
