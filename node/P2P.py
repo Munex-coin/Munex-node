@@ -759,8 +759,8 @@ class P2PNode:
                     req = bootstrap.json.loads(data.decode())
                     start = req.get('start', 0)
                     end = req.get('end', self.node.height)
-                    if end - start > 500:
-                        end = start + 500
+                    if end - start + 1 > config.SYNC_BATCH_BLOCKS:
+                        end = start + config.SYNC_BATCH_BLOCKS - 1
                     blocks = await self.node.get_blocks_range(start, end)
                     payload = bootstrap.json.dumps({'blocks': blocks}).encode()
                     await self._send_message(peer, config.MSG_BLOCKS, payload)
@@ -1831,7 +1831,7 @@ class P2PNode:
                 if self.node.height >= best_height:
                     break
                 start = self.node.height
-                end = min(best_height, start + 500)
+                end = min(best_height, start + config.SYNC_BATCH_BLOCKS - 1)
                 payload = bootstrap.json.dumps({'start': start, 'end': end}).encode()
                 await self._send_message(best_peer, config.MSG_GET_BLOCKS, payload)
                 waited = 0.0
@@ -1884,7 +1884,7 @@ class P2PNode:
         best_peer = max(self.peers.values(), key=lambda p: p.height)
         latest = await self.node.block_repo.get_latest()
         if latest is None:
-            batch_end = min(best_peer.height, 500)
+            batch_end = min(best_peer.height, config.SYNC_BATCH_BLOCKS - 1)
             bootstrap.logger.info(f'[SYNC] Requesting genesis/initial blocks from {best_peer.address} (0 -> {batch_end} of {best_peer.height})')
             payload = bootstrap.json.dumps({'start': 0, 'end': batch_end}).encode()
             await self._send_message(best_peer, config.MSG_GET_BLOCKS, payload)
@@ -1892,7 +1892,7 @@ class P2PNode:
             return
         if best_peer.height <= self.node.height:
             return
-        batch_end = min(best_peer.height, self.node.height + 500)
+        batch_end = min(best_peer.height, self.node.height + config.SYNC_BATCH_BLOCKS - 1)
         bootstrap.logger.info(f'[SYNC] Starting sync from {best_peer.address} (height {self.node.height} -> {batch_end} of {best_peer.height})')
         payload = bootstrap.json.dumps({'start': self.node.height, 'end': batch_end}).encode()
         await self._send_message(best_peer, config.MSG_GET_BLOCKS, payload)

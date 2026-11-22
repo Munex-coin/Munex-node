@@ -1250,6 +1250,7 @@ HEARTBEAT_INTERVAL = 30
 SYNC_INTERVAL = 10
 CHECKPOINT_SYNC_THRESHOLD = 500
 SYNC_STUCK_TRIP_COOLDOWN = 300
+SYNC_BATCH_BLOCKS = 50
 DHT_PORT = int(CONFIG.get('p2p', {}).get('dht_port', 8083))
 DHT_BOOTSTRAP_NODES = [(GENESIS_NODE_HOST, GENESIS_NODE_DHT_PORT)]
 DHT_SHARD_COUNT = 16
@@ -13633,8 +13634,8 @@ class P2PNode:
                     req = json.loads(data.decode())
                     start = req.get("start", 0)
                     end = req.get("end", self.node.height)
-                    if end - start > 500:
-                        end = start + 500
+                    if end - start + 1 > SYNC_BATCH_BLOCKS:
+                        end = start + SYNC_BATCH_BLOCKS - 1
                     blocks = await self.node.get_blocks_range(start, end)
                     payload = json.dumps({"blocks": blocks}).encode()
                     await self._send_message(peer, MSG_BLOCKS, payload)
@@ -14872,7 +14873,7 @@ class P2PNode:
                 if self.node.height >= best_height:
                     break
                 start = self.node.height
-                end = min(best_height, start + 500)
+                end = min(best_height, start + SYNC_BATCH_BLOCKS - 1)
                 payload = json.dumps({"start": start, "end": end}).encode()
                 await self._send_message(best_peer, MSG_GET_BLOCKS, payload)
 
@@ -14950,7 +14951,7 @@ class P2PNode:
         best_peer = max(self.peers.values(), key=lambda p: p.height)
         latest = await self.node.block_repo.get_latest()
         if latest is None:
-            batch_end = min(best_peer.height, 500)
+            batch_end = min(best_peer.height, SYNC_BATCH_BLOCKS - 1)
             logger.info(f"[SYNC] Requesting genesis/initial blocks from {best_peer.address} (0 -> {batch_end} of {best_peer.height})")
             payload = json.dumps({"start": 0, "end": batch_end}).encode()
             await self._send_message(best_peer, MSG_GET_BLOCKS, payload)
@@ -14959,7 +14960,7 @@ class P2PNode:
 
         if best_peer.height <= self.node.height:
             return
-        batch_end = min(best_peer.height, self.node.height + 500)
+        batch_end = min(best_peer.height, self.node.height + SYNC_BATCH_BLOCKS - 1)
         logger.info(f"[SYNC] Starting sync from {best_peer.address} (height {self.node.height} -> {batch_end} of {best_peer.height})")
         payload = json.dumps({"start": self.node.height, "end": batch_end}).encode()
         await self._send_message(best_peer, MSG_GET_BLOCKS, payload)
