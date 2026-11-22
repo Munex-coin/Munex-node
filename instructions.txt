@@ -1,0 +1,6 @@
+To run the node, u have to forward ur port so outside miners can connect to ur node as well. 
+
+wallet file:wallet.json
+rpc token file: rpc_token
+configs: config.yaml
+
