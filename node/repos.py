@@ -752,6 +752,13 @@ class MinerMazeRepo:
         query = 'SELECT * FROM minermazes WHERE minerid = ?' if self.db.db_type == 'sqlite' else 'SELECT * FROM minermazes WHERE minerid = $1'
         return await self.db.fetch(query, miner_id)
 
+    async def get_for_miner(self, miner_id: str, maze_id: str):
+        rows = await self.get_by_miner_id(miner_id)
+        if rows:
+            return dict(rows[0])
+        row = await self.get_by_maze_id(maze_id)
+        return dict(row) if row else None
+
     async def upsert(self, m: dict):
         now = int(bootstrap.time.time())
         if self.db.db_type == 'sqlite':

@@ -6817,6 +6817,17 @@ class MinerMazeRepo:
         query = "SELECT * FROM minermazes WHERE minerid = ?" if self.db.db_type == "sqlite" else "SELECT * FROM minermazes WHERE minerid = $1"
         return await self.db.fetch(query, miner_id)
 
+    async def get_for_miner(self, miner_id: str, maze_id: str):
+        # R14: resolve the maze row this miner owns. A second miner
+        # on the same wallet has its own maze under a derived id,
+        # so look up by miner first; fall back to the wallet maze
+        # id it sent.
+        rows = await self.get_by_miner_id(miner_id)
+        if rows:
+            return dict(rows[0])
+        row = await self.get_by_maze_id(maze_id)
+        return dict(row) if row else None
+
     async def upsert(self, m: dict):
         now = int(time.time())
         if self.db.db_type == "sqlite":
@@ -10639,7 +10650,10 @@ class PoSWConsensus:
             if not miner:
                 return False, "Unknown miner", {}
 
-            row = await self.maze_repo.get_by_maze_id(maze_id)
+            # R14: a second miner on the same wallet has its own
+            # maze under a derived id, so find this miner's row
+            # by miner, not by the wallet maze id it sent.
+            row = await self.maze_repo.get_for_miner(miner_id, maze_id)
             if not row:
                 return False, "No maze state", {}
 
@@ -10652,8 +10666,11 @@ class PoSWConsensus:
                 return False, f"Nonce mismatch: expected {expected_nonce}, got {move_nonce}", {}
             move_nonce = expected_nonce
 
+            # R14: the miner signs with the maze id it sent (its
+            # wallet pubkey), not with the row's derived id, so
+            # authenticate against the sent id.
             auth_msg = self._move_auth_bytes(
-                miner_id, row.get("maze_id") or miner_id,
+                miner_id, maze_id,
                 row["growthcount"], move_nonce, direction)
             if not verify_signature_bytes(miner['pub'], auth_msg, signature):
                 logger.warning(f"[SIG FAIL] minerid={miner_id} mazeid={row.get('maze_id')} growthcount={row['growthcount']} movenonce={move_nonce} dir={direction} chainid={CHAIN_ID}")
@@ -11186,6 +11203,28 @@ class PoSWConsensus:
     async def _load_or_create_maze(self, miner_id: str, maze_id: str = None) -> dict:
         if not maze_id:
             maze_id = miner_id
+        # R14 (Xaver 2026-11-23: one wallet holds many miners,
+        # like Bitcoin): a second miner on the same wallet gets
+        # its OWN maze, not a rejection. The wallet maze row is
+        # keyed by the wallet pubkey, so a second miner needs a
+        # distinct maze id, derived deterministically from
+        # (wallet, miner) so every node agrees. A miner that
+        # already owns a maze (first or second on its wallet)
+        # keeps it across reconnects.
+        _owned = await self.maze_repo.get_by_miner_id(miner_id)
+        if _owned:
+            maze_id = str(_owned[0].get("maze_id") or maze_id)
+        else:
+            _wallet_row = await self.maze_repo.get_by_maze_id(maze_id)
+            if _wallet_row:
+                _prev = _wallet_row.get("minerid")
+                if _prev and _prev != miner_id:
+                    _prev_ws = self.node.miner_websockets.get(_prev)
+                    if _prev_ws is not None:
+                        maze_id = eth_keccak(
+                            b"MCXMAZEV2" + maze_id.encode() + b"|" + miner_id.encode()
+                        ).hex()
+                        logger.info(f"[MAZE] new maze {maze_id[:16]} for second miner {miner_id[:16]} on shared wallet")
         existing = await self.maze_repo.get_by_maze_id(maze_id)
         if existing:
             row = dict(existing)
@@ -21771,14 +21810,15 @@ class MicroCoreNode:
                         # behind the stuck move - a deadlock broken only by
                         # the 60 s timeout. Do the DB checks inside the task
                         # so the message loop stays free to take block_signed.
-                        _own_row = await self.maze_repo.get_by_maze_id(maze_id)
+                        # R14: resolve this miner's own maze by miner.
+                        _own_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
                         if not _own_row or str(_own_row.get("minerid") or "") != miner_id:
                             await ws.send_json({"type": "error", "message": "Maze not owned by miner"})
                             return
                         if not await self._miner_path_allowed(miner_id):
                             await ws.send_json({"type": "error", "message": "Rate limit exceeded"})
                             return
-                        _pre_row = await self.maze_repo.get_by_maze_id(maze_id)
+                        _pre_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
                         _pre_growthcount = int(_pre_row["growthcount"]) if _pre_row else 0
                         success, msg, state = await self.consensus.process_move(miner_id, maze_id, direction, signature, move_nonce)
                         if ws.closed:
@@ -21792,7 +21832,7 @@ class MicroCoreNode:
                                 "message": msg,
                                 "state": state
                             }
-                            _ack_row = await self.maze_repo.get_by_maze_id(maze_id)
+                            _ack_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
                             if _ack_row:
                                 ack["movenonce"] = int(_ack_row["movenonce"])
                                 ack["growthcount"] = int(_ack_row["growthcount"])
@@ -21804,7 +21844,7 @@ class MicroCoreNode:
                                 ack["sealed_walls"] = [list(w) for w in sealed]
                             if success and (state.get("caught") or state.get("shrink")):
                                 try:
-                                    row = await self.maze_repo.get_by_maze_id(maze_id)
+                                    row = await self.maze_repo.get_for_miner(miner_id, maze_id)
                                     if row:
                                         loop = asyncio.get_event_loop()
                                         sparse_maze = await loop.run_in_executor(
@@ -21824,7 +21864,7 @@ class MicroCoreNode:
                             await ws.send_json(ack)
                         if (success or state.get("type") == "wall_hit") and getattr(self, 'p2p', None):
                             try:
-                                _post_row = await self.maze_repo.get_by_maze_id(maze_id)
+                                _post_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
                                 _g_pubrow = await self.miner_repo.get(miner_id)
                                 _g_pub = ""
                                 if _g_pubrow and _g_pubrow.get("pub"):
@@ -21888,7 +21928,8 @@ class MicroCoreNode:
                     or not (session.get("authenticated") and session.get("miner_id") == miner_id)):
                 await ws.send_json({"type": "wall_hit_solved", "accepted": False, "error": "Not authenticated as miner"})
                 return
-            _own_row = await self.maze_repo.get_by_maze_id(maze_id)
+            # R14: resolve this miner's own maze by miner.
+            _own_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
             if not _own_row or str(_own_row.get("minerid") or "") != miner_id:
                 await ws.send_json({"type": "wall_hit_solved", "accepted": False, "error": "Maze not owned by miner"})
                 return
@@ -21920,7 +21961,8 @@ class MicroCoreNode:
                             return
                         caught = False
                         async with self.consensus._lock_for(maze_id):
-                            row = await self.consensus.maze_repo.get_by_maze_id(maze_id)
+                            # R14: resolve this miner's own maze by miner.
+                            row = await self.consensus.maze_repo.get_for_miner(miner_id, maze_id)
                             if row:
                                 gpos = self.consensus._ghost_tuple(row)
                                 gpos_moved = False
@@ -21990,7 +22032,7 @@ class MicroCoreNode:
                         reply["sealed_walls"] = list(self.consensus._sealed_walls.get(maze_id, set()))
                         reply["ghost"] = None
                         try:
-                            row_data = await self.maze_repo.get_by_maze_id(maze_id)
+                            row_data = await self.maze_repo.get_for_miner(miner_id, maze_id)
                             if row_data:
                                 _gp = self.consensus._ghost_tuple(row_data)
                                 reply["ghost"] = list(_gp) if _gp else None
@@ -22093,7 +22135,8 @@ class MicroCoreNode:
                 return
             if ws.closed:
                 return
-            row = await self.maze_repo.get_by_maze_id(maze_id)
+            # R14: resolve this miner's own maze by miner.
+            row = await self.maze_repo.get_for_miner(miner_id, maze_id)
             if not row or str(row.get("minerid") or "") != miner_id:
                 await ws.send_json({"type": "error", "message": "Maze not owned by miner"})
                 return

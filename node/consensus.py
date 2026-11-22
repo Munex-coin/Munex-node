@@ -395,7 +395,7 @@ class PoSWConsensus:
             miner = await self.miner_repo.get(miner_id)
             if not miner:
                 return (False, 'Unknown miner', {})
-            row = await self.maze_repo.get_by_maze_id(maze_id)
+            row = await self.maze_repo.get_for_miner(miner_id, maze_id)
             if not row:
                 return (False, 'No maze state', {})
             if str(row.get('minerid') or '') != str(miner_id):
@@ -405,7 +405,7 @@ class PoSWConsensus:
             if move_nonce is not None and move_nonce != expected_nonce:
                 return (False, f'Nonce mismatch: expected {expected_nonce}, got {move_nonce}', {})
             move_nonce = expected_nonce
-            auth_msg = self._move_auth_bytes(miner_id, row.get('maze_id') or miner_id, row['growthcount'], move_nonce, direction)
+            auth_msg = self._move_auth_bytes(miner_id, maze_id, row['growthcount'], move_nonce, direction)
             if not crypto.verify_signature_bytes(miner['pub'], auth_msg, signature):
                 bootstrap.logger.warning(f'[SIG FAIL] minerid={miner_id} mazeid={row.get('maze_id')} growthcount={row['growthcount']} movenonce={move_nonce} dir={direction} chainid={config.CHAIN_ID}')
                 bootstrap.logger.warning(f'[SIG FAIL] pub={miner['pub']} sig={signature[:32]}... auth_msg={auth_msg}')
@@ -803,6 +803,18 @@ class PoSWConsensus:
     async def _load_or_create_maze(self, miner_id: str, maze_id: str=None) -> dict:
         if not maze_id:
             maze_id = miner_id
+        _owned = await self.maze_repo.get_by_miner_id(miner_id)
+        if _owned:
+            maze_id = str(_owned[0].get('maze_id') or maze_id)
+        else:
+            _wallet_row = await self.maze_repo.get_by_maze_id(maze_id)
+            if _wallet_row:
+                _prev = _wallet_row.get('minerid')
+                if _prev and _prev != miner_id:
+                    _prev_ws = self.node.miner_websockets.get(_prev)
+                    if _prev_ws is not None:
+                        maze_id = bootstrap.eth_keccak(b'MCXMAZEV2' + maze_id.encode() + b'|' + miner_id.encode()).hex()
+                        bootstrap.logger.info(f'[MAZE] new maze {maze_id[:16]} for second miner {miner_id[:16]} on shared wallet')
         existing = await self.maze_repo.get_by_maze_id(maze_id)
         if existing:
             row = dict(existing)
