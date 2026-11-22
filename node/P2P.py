@@ -200,7 +200,7 @@ async def perform_handshake(reader: bootstrap.asyncio.StreamReader, writer: boot
             return None
     elif not genesis._node_genesis_hash and remote_genesis:
         if not allow_genesis_learn:
-            bootstrap.logger.info(f'[P2P] Peer {addr_str} offered genesis but this is not a bootstrap dial; ignoring')
+            bootstrap.logger.info(f'[P2P] Peer {addr_str} offered genesis but this node is not learning a genesis; ignoring')
             return None
         if bootstrap.os.path.exists(config.GENESIS_FILE):
             bootstrap.logger.warning(f'[P2P] Refusing to overwrite existing {config.GENESIS_FILE}')
@@ -234,7 +234,7 @@ async def perform_handshake(reader: bootstrap.asyncio.StreamReader, writer: boot
         genesis._node_genesis_hash = gh
         genesis._node_genesis_data = remote_genesis_body
         genesis.FORK_ID = int(gh[:8], 16) ^ int(gh[8:16], 16)
-        bootstrap.logger.info(f'[P2P] Learned genesis from bootstrap {addr_str}: hash={gh[:16]}...')
+        bootstrap.logger.info(f'[P2P] Learned genesis from {addr_str}: hash={gh[:16]}...')
         try:
             svf_keys._svf_load_from_genesis(remote_genesis_body.get('svf_public'))
         except svf_keys.SVFKeyError as _e:
@@ -1440,7 +1440,7 @@ class P2PNode:
                     except Exception:
                         pass
                 is_bootstrap = any((addr == b for b in self.bootstrap_nodes)) or any((h == parse_ip_port(b, config.P2P_PORT)[0] for b in self.dns_seeds)) or h == self.genesis_node
-                peer = await bootstrap.asyncio.wait_for(perform_handshake(reader, writer, self.node.node_id, self.node.height, config.VERSION, self.node.priv, self.node.pub, allow_genesis_learn=is_bootstrap and self.node.height == 0), timeout=10.0)
+                peer = await bootstrap.asyncio.wait_for(perform_handshake(reader, writer, self.node.node_id, self.node.height, config.VERSION, self.node.priv, self.node.pub, allow_genesis_learn=self.node.height == 0), timeout=10.0)
             if peer is None:
                 writer.close()
                 await writer.wait_closed()

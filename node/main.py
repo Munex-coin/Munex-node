@@ -48,7 +48,7 @@ async def main():
         bootstrap.logger.error(f'[CONFIG] {_pe}; refusing to start')
         bootstrap.sys.exit(1)
     if _config.EXPECTED_GENESIS_PIN is None:
-        bootstrap.logger.warning('[CONFIG] p2p.expected_genesis_hash is not set: this node will learn genesis from any bootstrap peer that answers. Pin it for any real network.')
+        bootstrap.logger.warning('[CONFIG] p2p.expected_genesis_hash is not set: this node will learn genesis from any existing peer that answers. Pin it for any real network.')
     _gen_src = 'default genesis.json'
     if args.genesis_file:
         _gen_src = '--genesis-file CLI'

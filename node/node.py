@@ -545,7 +545,7 @@ SCHEMA_VERSION = 1
 
 # --- PoSW Consensus Constants -----------------------------
 CHAIN_ID = 6621
-TESTNET_GENESIS_HASH = "4aa436a1aa8d20ba8194faa99d544f1f81052670b7f1ada7b5c734dc571a5864"
+TESTNET_GENESIS_HASH = ""
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 PROTOCOL_VERSION = 64
 POG_ACTIVATION_HEIGHT = 100000
@@ -870,8 +870,8 @@ def _update_genesis_pin_in_file(new_hash):
 def _mainnet_guard_failures(config, allow_new_genesis=False) -> list:
     """The one node profile: mainnet. There is no testnet mode.
     Empty list = clear to boot; every entry is a refusal reason.
-    allow_new_genesis=True is the one-time genesis creator: it has no genesis
-    hash to pin yet, so the pin is exempt for that start only."""
+    A node with no genesis pin learns it from an existing peer at height 0
+    and pins what it learns, so no pin is required to boot."""
     _cfg = config or {}
     failures = []
     _db_url = str((_cfg.get('database') or {}).get('url', '') or '')
@@ -894,8 +894,7 @@ def _mainnet_guard_failures(config, allow_new_genesis=False) -> list:
                 failures.append("on Windows the VM worker is not isolated: run on Linux, or set "
                                 "MCX_ALLOW_UNSANDBOXED_VM=1 to accept that risk knowingly")
     try:
-        if _expected_genesis_pin(_cfg) is None and not allow_new_genesis:
-            failures.append("p2p.expected_genesis_hash must be set (64 hex chars) unless this is the genesis creator")
+        _expected_genesis_pin(_cfg)
     except ValueError as _pe:
         failures.append(str(_pe))
     _rtl = (_cfg.get('node') or {}).get('rpc_trust_loopback', True)
@@ -12919,7 +12918,7 @@ async def perform_handshake(reader: asyncio.StreamReader, writer: asyncio.Stream
             return None
     elif not _node_genesis_hash and remote_genesis:
         if not allow_genesis_learn:
-            logger.info(f"[P2P] Peer {addr_str} offered genesis but this is not a bootstrap dial; ignoring")
+            logger.info(f"[P2P] Peer {addr_str} offered genesis but this node is not learning a genesis; ignoring")
             return None
         if os.path.exists(GENESIS_FILE):
             logger.warning(f"[P2P] Refusing to overwrite existing {GENESIS_FILE}")
@@ -12954,7 +12953,7 @@ async def perform_handshake(reader: asyncio.StreamReader, writer: asyncio.Stream
         _node_genesis_hash = gh
         _node_genesis_data = remote_genesis_body
         FORK_ID = int(gh[:8], 16) ^ int(gh[8:16], 16)
-        logger.info(f"[P2P] Learned genesis from bootstrap {addr_str}: hash={gh[:16]}...")
+        logger.info(f"[P2P] Learned genesis from {addr_str}: hash={gh[:16]}...")
         # E4/E5: load SVF public parameters from the learned genesis (no-op
         # when already loaded from a key file). A malformed svf_public
         # exits 1 naming the field.
@@ -14430,7 +14429,7 @@ class P2PNode:
                         VERSION,
                         self.node.priv,
                         self.node.pub,
-                        allow_genesis_learn=(is_bootstrap and self.node.height == 0)
+                        allow_genesis_learn=(self.node.height == 0)
                     ),
                     timeout=10.0
                 )
@@ -19901,6 +19900,9 @@ class MicroCoreNode:
             latest = await self.block_repo.get_latest()
             if latest:
                 await self._load_state()
+                _g0 = await self.block_repo.get_by_id(0)
+                if _g0:
+                    self.genesis_hash = str(_g0.get("hash") or "")
                 await self._register_self_node()
                 self._genesis_handled = True
                 logger.info("Synced blockchain from network.")
@@ -22653,7 +22655,7 @@ async def main():
         logger.error(f"[CONFIG] {_pe}; refusing to start")
         sys.exit(1)
     if EXPECTED_GENESIS_PIN is None:
-        logger.warning("[CONFIG] p2p.expected_genesis_hash is not set: this node will learn genesis from any bootstrap peer that answers. Pin it for any real network.")
+        logger.warning("[CONFIG] p2p.expected_genesis_hash is not set: this node will learn genesis from any existing peer that answers. Pin it for any real network.")
 
     global GENESIS_FILE
     _gen_src = "default genesis.json"

@@ -119,7 +119,7 @@ VERSION = '64.3-PoSW'
 SUBS = 1000000
 SCHEMA_VERSION = 1
 CHAIN_ID = 6621
-TESTNET_GENESIS_HASH = '4aa436a1aa8d20ba8194faa99d544f1f81052670b7f1ada7b5c734dc571a5864'
+TESTNET_GENESIS_HASH = ''
 SECP256K1_N = 115792089237316195423570985008687907852837564279074904382605163141518161494337
 PROTOCOL_VERSION = 64
 POG_ACTIVATION_HEIGHT = 100000
@@ -331,8 +331,7 @@ def _mainnet_guard_failures(config, allow_new_genesis=False) -> list:
             if _ans not in ('y', 'yes'):
                 failures.append('on Windows the VM worker is not isolated: run on Linux, or set MCX_ALLOW_UNSANDBOXED_VM=1 to accept that risk knowingly')
     try:
-        if _expected_genesis_pin(_cfg) is None and (not allow_new_genesis):
-            failures.append('p2p.expected_genesis_hash must be set (64 hex chars) unless this is the genesis creator')
+        _expected_genesis_pin(_cfg)
     except ValueError as _pe:
         failures.append(str(_pe))
     _rtl = (_cfg.get('node') or {}).get('rpc_trust_loopback', True)

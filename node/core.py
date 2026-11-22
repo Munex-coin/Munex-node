@@ -3765,6 +3765,9 @@ class MicroCoreNode:
             latest = await self.block_repo.get_latest()
             if latest:
                 await self._load_state()
+                _g0 = await self.block_repo.get_by_id(0)
+                if _g0:
+                    self.genesis_hash = str(_g0.get('hash') or '')
                 await self._register_self_node()
                 self._genesis_handled = True
                 bootstrap.logger.info('Synced blockchain from network.')
