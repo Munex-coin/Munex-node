@@ -1,4 +1,6 @@
-To run the node, u have to forward ur port so outside miners can connect to ur node as well. 
+To run the node, u have to forward ur port so outside miners can connect to ur node as well.
+
+Forward these ports: 8080(TCP),8081(TCP), 8085(TCP), 8083(UDP)
 
 wallet file:wallet.json
 rpc token file: rpc_token
