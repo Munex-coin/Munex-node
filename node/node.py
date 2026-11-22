@@ -10189,14 +10189,15 @@ class PoSWConsensus:
         # INFLIGHT-STALE-1: miner_id -> monotonic() when its move task
         # started. A task that never finishes (DB lock, hung process_move)
         # would otherwise pin the miner in this set forever and every later
-        # move gets busy, retry. Entries older than the reclaim age are
-        # treated as dead and reclaimed by the next move.
+        # move would queue behind it. Entries older than the reclaim age
+        # are treated as dead and reclaimed by the next move.
         self._inflight_moves: dict = {}
         # MOVE-QUEUE-1: per-miner FIFO of overlapping maze_move jobs that
         # arrived while another move for the same miner was in flight.
         # Drained in arrival order when the in-flight move finishes, so
         # an overlapping move is processed (and acked) instead of being
-        # rejected with "busy, retry". Bounded to 2 per miner (guard).
+        # rejected. Unbounded (R13) — a slow node queues moves instead
+        # of rejecting them.
         self._move_queues: dict = {}
         self._move_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="move")
         self._watchdog_task = None
@@ -21734,26 +21735,23 @@ class MicroCoreNode:
                     if time.monotonic() - _inflight_since > 30:
                         # INFLIGHT-STALE-1: the previous move task has been
                         # stuck for over 30 s (a move normally takes <1 s).
-                        # Reclaim the slot so the miner is not wedged on
-                        # busy, retry forever; the old task, if it ever
-                        # finishes, just finds its slot already gone.
+                        # Reclaim the slot so the miner is not wedged
+                        # forever; the old task, if it ever finishes,
+                        # just finds its slot already gone.
                         logger.warning(f"[WS] Reclaiming stale in-flight move for {miner_id[:16]} (age {time.monotonic() - _inflight_since:.0f}s)")
                         self.consensus._inflight_moves.pop(miner_id, None)
                     else:
-                        # MOVE-QUEUE-1: do not reject an overlapping move
-                        # with "busy, retry". Queue it (bounded) and run
-                        # it when the in-flight move finishes, in arrival
-                        # order. The miner sends sequentially, so arrival
-                        # order is nonce order; the ack then arrives
-                        # instead of a rejection, so there is no busy
-                        # storm for the miner to retry through. Only if
-                        # the queue is already full (2) do we fall back
-                        # to "busy, retry" as a last resort.
+                        # MOVE-QUEUE-1 (R13, Xaver 2026-11-23: busy error
+                        # gone entirely): never reject an overlapping move.
+                        # Queue it and run it when the in-flight move
+                        # finishes, in arrival order. The miner sends
+                        # sequentially, so arrival order is nonce order;
+                        # the ack then arrives instead of a rejection, so
+                        # there is no busy storm for the miner to retry
+                        # through. The queue is unbounded — a slow node
+                        # queues moves instead of rejecting them.
                         _q = self.consensus._move_queues.setdefault(miner_id, deque())
-                        if len(_q) < 2:
-                            _q.append((ws, session, miner_id, maze_id, direction, signature, move_nonce))
-                            return
-                        await ws.send_json({"type": "maze_move_ack", "success": False, "message": "busy, retry"})
+                        _q.append((ws, session, miner_id, maze_id, direction, signature, move_nonce))
                         return
                 self.consensus._inflight_moves[miner_id] = time.monotonic()
 
@@ -21860,7 +21858,7 @@ class MicroCoreNode:
                         # miner, if any. Skip entries whose socket already
                         # closed (miner reconnected; it retries on the
                         # new connection). The drained move takes the slot
-                        # and is acked in turn -- no "busy, retry".
+                        # and is acked in turn.
                         _q = self.consensus._move_queues.get(miner_id)
                         while _q:
                             _njob = _q.popleft()

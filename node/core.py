@@ -5194,10 +5194,7 @@ class MicroCoreNode:
                         self.consensus._inflight_moves.pop(miner_id, None)
                     else:
                         _q = self.consensus._move_queues.setdefault(miner_id, bootstrap.deque())
-                        if len(_q) < 2:
-                            _q.append((ws, session, miner_id, maze_id, direction, signature, move_nonce))
-                            return
-                        await ws.send_json({'type': 'maze_move_ack', 'success': False, 'message': 'busy, retry'})
+                        _q.append((ws, session, miner_id, maze_id, direction, signature, move_nonce))
                         return
                 self.consensus._inflight_moves[miner_id] = bootstrap.time.monotonic()
 
