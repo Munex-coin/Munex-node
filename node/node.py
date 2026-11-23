@@ -21667,6 +21667,15 @@ class MicroCoreNode:
                 takeover_sig = data.get("takeover_sig")
                 ok = await self.register_miner(miner_id, wallet, pub_key, sig, timestamp, block_signing_pub, takeover_sig)
                 if ok:
+                    # R15: a live connection already holds this miner_id
+                    # (a second device on the same wallet). Do not let
+                    # the newcomer silently displace it — reject with a
+                    # clear error so the miner retries with a distinct
+                    # id. A closed socket is a dead reconnect, allow it.
+                    _live = self.miner_websockets.get(miner_id)
+                    if _live is not None and _live is not ws and not _live.closed:
+                        await ws.send_json({"type": "registration_failed", "error": f"miner_id already connected from another device - use --miner-id {miner_id}_2 for a second miner on this wallet"})
+                        return
                     challenge = self.memory_mgr.generate_challenge(miner_id)
                     session["challenge_sent"] = True
                     session["miner_id"] = miner_id
@@ -21700,6 +21709,13 @@ class MicroCoreNode:
             loop = asyncio.get_event_loop()
             ok = await loop.run_in_executor(None, self.memory_mgr.verify_commitment, miner_id, seed, commitment)
             if ok:
+                # R15: same live-connection check as register (closes the
+                # race where two miners pass register while the first is
+                # still doing the memory challenge).
+                _live = self.miner_websockets.get(miner_id)
+                if _live is not None and _live is not ws and not _live.closed:
+                    await ws.send_json({"type": "registration_failed", "error": f"miner_id already connected from another device - use --miner-id {miner_id}_2 for a second miner on this wallet"})
+                    return
                 session["authenticated"] = True
                 session["challenge_verified"] = True
                 self.miner_websockets[miner_id] = ws

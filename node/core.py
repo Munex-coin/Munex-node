@@ -5113,6 +5113,10 @@ class MicroCoreNode:
                 takeover_sig = data.get('takeover_sig')
                 ok = await self.register_miner(miner_id, wallet, pub_key, sig, timestamp, block_signing_pub, takeover_sig)
                 if ok:
+                    _live = self.miner_websockets.get(miner_id)
+                    if _live is not None and _live is not ws and (not _live.closed):
+                        await ws.send_json({'type': 'registration_failed', 'error': f'miner_id already connected from another device - use --miner-id {miner_id}_2 for a second miner on this wallet'})
+                        return
                     challenge = self.memory_mgr.generate_challenge(miner_id)
                     session['challenge_sent'] = True
                     session['miner_id'] = miner_id
@@ -5142,6 +5146,10 @@ class MicroCoreNode:
             loop = bootstrap.asyncio.get_event_loop()
             ok = await loop.run_in_executor(None, self.memory_mgr.verify_commitment, miner_id, seed, commitment)
             if ok:
+                _live = self.miner_websockets.get(miner_id)
+                if _live is not None and _live is not ws and (not _live.closed):
+                    await ws.send_json({'type': 'registration_failed', 'error': f'miner_id already connected from another device - use --miner-id {miner_id}_2 for a second miner on this wallet'})
+                    return
                 session['authenticated'] = True
                 session['challenge_verified'] = True
                 self.miner_websockets[miner_id] = ws
