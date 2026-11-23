@@ -44,7 +44,7 @@ class PoSWConsensus:
         self._move_locks: bootstrap.Dict[str, bootstrap.asyncio.Lock] = {}
         self._inflight_moves: dict = {}
         self._move_queues: dict = {}
-        self._move_executor = bootstrap.ThreadPoolExecutor(max_workers=4, thread_name_prefix='move')
+        self._move_executor = bootstrap.ThreadPoolExecutor(max_workers=16, thread_name_prefix='move')
         self._watchdog_task = None
         self._height_last_advanced = bootstrap.time.time()
         self._catch_times = bootstrap.deque(maxlen=20)

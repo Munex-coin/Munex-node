@@ -5115,7 +5115,7 @@ class MicroCoreNode:
                 if ok:
                     _live = self.miner_websockets.get(miner_id)
                     if _live is not None and _live is not ws and (not _live.closed):
-                        await ws.send_json({'type': 'registration_failed', 'error': f'miner_id already connected from another device - use --miner-id {miner_id}_2 for a second miner on this wallet'})
+                        await ws.send_json({'type': 'registration_failed', 'error': f'miner_id already connected from another device - use --miner-id {(miner_id.rsplit('_', 1)[0] if miner_id.rsplit('_', 1)[-1].isdigit() else miner_id)}_2 for a second miner on this wallet'})
                         return
                     challenge = self.memory_mgr.generate_challenge(miner_id)
                     session['challenge_sent'] = True
@@ -5148,7 +5148,7 @@ class MicroCoreNode:
             if ok:
                 _live = self.miner_websockets.get(miner_id)
                 if _live is not None and _live is not ws and (not _live.closed):
-                    await ws.send_json({'type': 'registration_failed', 'error': f'miner_id already connected from another device - use --miner-id {miner_id}_2 for a second miner on this wallet'})
+                    await ws.send_json({'type': 'registration_failed', 'error': f'miner_id already connected from another device - use --miner-id {(miner_id.rsplit('_', 1)[0] if miner_id.rsplit('_', 1)[-1].isdigit() else miner_id)}_2 for a second miner on this wallet'})
                     return
                 session['authenticated'] = True
                 session['challenge_verified'] = True
@@ -5197,7 +5197,7 @@ class MicroCoreNode:
                     return
                 _inflight_since = self.consensus._inflight_moves.get(miner_id)
                 if _inflight_since is not None:
-                    if bootstrap.time.monotonic() - _inflight_since > 30:
+                    if bootstrap.time.monotonic() - _inflight_since > 10:
                         bootstrap.logger.warning(f'[WS] Reclaiming stale in-flight move for {miner_id[:16]} (age {bootstrap.time.monotonic() - _inflight_since:.0f}s)')
                         self.consensus._inflight_moves.pop(miner_id, None)
                     else:
@@ -5251,7 +5251,11 @@ class MicroCoreNode:
                                         ack['movenonce'] = row['movenonce']
                                 except Exception as e:
                                     bootstrap.logger.error(f'[WS] maze growth send error for {miner_id}: {e}', exc_info=True)
-                            await ws.send_json(ack)
+                            if not ws.closed:
+                                try:
+                                    await ws.send_json(ack)
+                                except Exception:
+                                    return
                         if (success or state.get('type') == 'wall_hit') and getattr(self, 'p2p', None):
                             try:
                                 _post_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
@@ -5512,7 +5516,10 @@ class MicroCoreNode:
                     await self.maze_repo.upsert({**dict(row), 'goalx': gx, 'goaly': gy, 'goalz': gz, 'updatedat': int(bootstrap.time.time())})
                 state = {'miner_id': row['minerid'], 'size': size, 'position': (sx, sy, sz), 'goal': (gx, gy, gz), 'movenonce': row['movenonce'], 'mazeroot': row['mazeroot'], 'growthcount': row['growthcount'], 'walldensityppm': row['walldensityppm'], 'turbulenceppm': row['turbulenceppm'], 'maze': maze_array, 'ghost': list(self.consensus._ghost_tuple(row) or (0, 0, 0))}
             if not ws.closed:
-                await ws.send_json({'type': 'maze_state', 'state': state})
+                try:
+                    await ws.send_json({'type': 'maze_state', 'state': state})
+                except Exception:
+                    return
         elif msg_type == 'get_fee':
             min_fee = gas.quote_transfer_fee(self.mempool.size())
             token_fee = gas.quote_token_creation_fee(self.mempool.size())

@@ -10218,7 +10218,7 @@ class PoSWConsensus:
         # rejected. Unbounded (R13) — a slow node queues moves instead
         # of rejecting them.
         self._move_queues: dict = {}
-        self._move_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="move")
+        self._move_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="move")
         self._watchdog_task = None
         self._height_last_advanced = time.time()
         self._catch_times = deque(maxlen=20)
@@ -21682,7 +21682,7 @@ class MicroCoreNode:
                     # id. A closed socket is a dead reconnect, allow it.
                     _live = self.miner_websockets.get(miner_id)
                     if _live is not None and _live is not ws and not _live.closed:
-                        await ws.send_json({"type": "registration_failed", "error": f"miner_id already connected from another device - use --miner-id {miner_id}_2 for a second miner on this wallet"})
+                        await ws.send_json({"type": "registration_failed", "error": f"miner_id already connected from another device - use --miner-id {miner_id.rsplit('_', 1)[0] if miner_id.rsplit('_', 1)[-1].isdigit() else miner_id}_2 for a second miner on this wallet"})
                         return
                     challenge = self.memory_mgr.generate_challenge(miner_id)
                     session["challenge_sent"] = True
@@ -21722,7 +21722,7 @@ class MicroCoreNode:
                 # still doing the memory challenge).
                 _live = self.miner_websockets.get(miner_id)
                 if _live is not None and _live is not ws and not _live.closed:
-                    await ws.send_json({"type": "registration_failed", "error": f"miner_id already connected from another device - use --miner-id {miner_id}_2 for a second miner on this wallet"})
+                    await ws.send_json({"type": "registration_failed", "error": f"miner_id already connected from another device - use --miner-id {miner_id.rsplit('_', 1)[0] if miner_id.rsplit('_', 1)[-1].isdigit() else miner_id}_2 for a second miner on this wallet"})
                     return
                 session["authenticated"] = True
                 session["challenge_verified"] = True
@@ -21795,9 +21795,9 @@ class MicroCoreNode:
                     return
                 _inflight_since = self.consensus._inflight_moves.get(miner_id)
                 if _inflight_since is not None:
-                    if time.monotonic() - _inflight_since > 30:
-                        # INFLIGHT-STALE-1: the previous move task has been
-                        # stuck for over 30 s (a move normally takes <1 s).
+                    if time.monotonic() - _inflight_since > 10:
+                        # INFLIGHT-STALE-1 (R18): the previous move task has been
+                        # stuck for over 10 s (a move normally takes <1 s).
                         # Reclaim the slot so the miner is not wedged
                         # forever; the old task, if it ever finishes,
                         # just finds its slot already gone.
@@ -21885,7 +21885,11 @@ class MicroCoreNode:
                                         ack["movenonce"] = row["movenonce"]
                                 except Exception as e:
                                     logger.error(f"[WS] maze growth send error for {miner_id}: {e}", exc_info=True)
-                            await ws.send_json(ack)
+                            if not ws.closed:
+                                try:
+                                    await ws.send_json(ack)
+                                except Exception:
+                                    return
                         if (success or state.get("type") == "wall_hit") and getattr(self, 'p2p', None):
                             try:
                                 _post_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
@@ -22200,7 +22204,10 @@ class MicroCoreNode:
                     "ghost": list(self.consensus._ghost_tuple(row) or (0, 0, 0)),
                 }
             if not ws.closed:
-                await ws.send_json({"type": "maze_state", "state": state})
+                try:
+                    await ws.send_json({"type": "maze_state", "state": state})
+                except Exception:
+                    return
 
         elif msg_type == "get_fee":
             min_fee = quote_transfer_fee(self.mempool.size())
