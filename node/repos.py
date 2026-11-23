@@ -38,6 +38,12 @@ class BlockRepo:
             query = 'INSERT INTO blocks (id,ts,phash,miners,hash,reward,tx_count,merkle_root,nonce,difficulty,version,challenge,coverage,total_tx_value,total_fees,tx_hashes,finalized,proof) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)'
             params = (block['id'], block['ts'], block['phash'], block['miners'], block['hash'], block['reward'], block['tx_count'], block['merkle_root'], 0, block['difficulty'], block['version'], block['challenge'], block['coverage'], block['total_tx_value'], block['total_fees'], block['tx_hashes'], block.get('finalized', False), proof_json)
         await self.db.execute_dml(query, *params)
+        if block.get('id', 0) > 0:
+            _rb = await self.get_by_id(block['id'])
+            if _rb is not None:
+                _rehash = crypto.calculate_block_hash({k: v for k, v in _rb.items() if k not in maze.CONSENSUS_EXCLUDED_FIELDS})
+                if _rb.get('hash') != _rehash:
+                    raise RuntimeError(f'R16 block {block['id']} hash did not survive storage (stored={block.get('hash')} reloaded={_rehash})')
 
     async def get_by_id(self, block_id):
         query = 'SELECT * FROM blocks WHERE id = ?' if self.db.db_type == 'sqlite' else 'SELECT * FROM blocks WHERE id = $1'

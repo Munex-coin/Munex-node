@@ -6170,6 +6170,14 @@ class BlockRepo:
             query = "INSERT INTO blocks (id,ts,phash,miners,hash,reward,tx_count,merkle_root,nonce,difficulty,version,challenge,coverage,total_tx_value,total_fees,tx_hashes,finalized,proof) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"
             params = (block['id'], block['ts'], block['phash'], block['miners'], block['hash'], block['reward'], block['tx_count'], block['merkle_root'], 0, block['difficulty'], block['version'], block['challenge'], block['coverage'], block['total_tx_value'], block['total_fees'], block['tx_hashes'], block.get('finalized', False), proof_json)
         await self.db.execute_dml(query, *params)
+        # R16: verify-after-write — the hash must survive the
+        # store/load round-trip, or the node bricks on restart.
+        if block.get('id', 0) > 0:
+            _rb = await self.get_by_id(block['id'])
+            if _rb is not None:
+                _rehash = calculate_block_hash({k: v for k, v in _rb.items() if k not in CONSENSUS_EXCLUDED_FIELDS})
+                if _rb.get('hash') != _rehash:
+                    raise RuntimeError(f"R16 block {block['id']} hash did not survive storage (stored={block.get('hash')} reloaded={_rehash})")
     async def get_by_id(self, block_id):
         query = "SELECT * FROM blocks WHERE id = ?" if self.db.db_type == "sqlite" else "SELECT * FROM blocks WHERE id = $1"
         return self._unpack_block(await self.db.fetchrow(query, block_id))
@@ -22452,9 +22460,9 @@ class MicroCoreNode:
         for b in sorted(blocks, key=lambda x: x['id']):
             expected = calculate_block_hash({k: v for k, v in b.items() if k not in CONSENSUS_EXCLUDED_FIELDS})
             if b.get('hash') != expected and b.get('id', 0) > 0:
-                logger.error(f"[Integrity] Block {b['id']} hash mismatch"); sys.exit(1)
+                logger.error(f"[Integrity] Block {b['id']} hash mismatch (stored={b.get('hash')} recomputed={expected}) — stop the node and run: python repair_chain.py (it backs up microcore.db and recomputes the hash chain; block contents are kept)"); sys.exit(1)
             if prev_hash is not None and b.get('phash') != prev_hash and b.get('id', 0) > 0:
-                logger.error(f"[Integrity] Block {b['id']} parent mismatch"); sys.exit(1)
+                logger.error(f"[Integrity] Block {b['id']} parent mismatch (phash={b.get('phash')} prev={prev_hash}) — stop the node and run: python repair_chain.py"); sys.exit(1)
             prev_hash = b.get('hash', '')
         logger.info(f"[Integrity] Verified last {len(blocks)} blocks")
 

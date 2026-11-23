@@ -5696,10 +5696,10 @@ class MicroCoreNode:
         for b in sorted(blocks, key=lambda x: x['id']):
             expected = crypto.calculate_block_hash({k: v for k, v in b.items() if k not in maze.CONSENSUS_EXCLUDED_FIELDS})
             if b.get('hash') != expected and b.get('id', 0) > 0:
-                bootstrap.logger.error(f'[Integrity] Block {b['id']} hash mismatch')
+                bootstrap.logger.error(f'[Integrity] Block {b['id']} hash mismatch (stored={b.get('hash')} recomputed={expected}) — stop the node and run: python repair_chain.py (it backs up microcore.db and recomputes the hash chain; block contents are kept)')
                 bootstrap.sys.exit(1)
             if prev_hash is not None and b.get('phash') != prev_hash and (b.get('id', 0) > 0):
-                bootstrap.logger.error(f'[Integrity] Block {b['id']} parent mismatch')
+                bootstrap.logger.error(f'[Integrity] Block {b['id']} parent mismatch (phash={b.get('phash')} prev={prev_hash}) — stop the node and run: python repair_chain.py')
                 bootstrap.sys.exit(1)
             prev_hash = b.get('hash', '')
         bootstrap.logger.info(f'[Integrity] Verified last {len(blocks)} blocks')
