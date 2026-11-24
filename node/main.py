@@ -4,6 +4,7 @@ import config as _config
 import svf_keys
 import genesis
 import core
+import tunnel
 
 async def main():
     parser = bootstrap.argparse.ArgumentParser(description=f'{_config.NAME} Node v{_config.VERSION}')
@@ -92,6 +93,8 @@ async def main():
     finally:
         await node.shutdown()
 if __name__ == '__main__':
+    if any((a.startswith('--tunnel') for a in bootstrap.sys.argv[1:])):
+        bootstrap.sys.exit(tunnel.tunnel_main(bootstrap.sys.argv[1:]))
     try:
         if bootstrap.sys.platform == 'win32':
             import ctypes
