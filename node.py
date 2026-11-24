@@ -1104,6 +1104,15 @@ GLOBAL_SHRINK_FACTOR = 1.0
 BASE_DENSITY_PPM = 500000
 BASE_TURBULENCE_PPM = 100000
 SNAPSHOT_INTERVAL = 10000
+# R20: snapshot sync — a fresh/far-behind node downloads the state
+# at a recent height plus the tip block instead of every block
+# from genesis. SNAPSHOT_SYNC_THRESHOLD: use a snapshot when the
+# gap exceeds this or the local height is 0. SNAPSHOT_WINDOW: the
+# recent-history blocks fetched after loading a snapshot.
+SNAPSHOT_SYNC_THRESHOLD = 100
+SNAPSHOT_WINDOW = 100
+SNAPSHOT_RETRY_COOLDOWN = 60
+SNAPSHOT_REQUEST_TIMEOUT = 30
 CONSENSUS_EXCLUDED_FIELDS = {"hash", "signature", "pqc_signature", "finalized"}
 _BLOCK_PROOF_KEYS = {"winner","producer_pub","signature","state_root","transactions","maze_attestation","reward_wallet","maze_updates","attestation_proof","global_shrink_factor","slashes","maze_state","svf_epoch_certificates","lottery_draw"}
 MAZE_ROW_COLS = frozenset({
@@ -1302,6 +1311,8 @@ ASN_STATIC_MAP = (
 )
 MSG_HANDSHAKE, MSG_PING, MSG_PONG, MSG_GET_BLOCKS, MSG_BLOCKS, MSG_NEW_BLOCK, MSG_NEW_TX, MSG_GET_PEERS, MSG_PEERS, MSG_SLASH, MSG_BAN, MSG_UNBAN, MSG_GET_STATUS, MSG_STATUS, MSG_GET_CHECKPOINT, MSG_CHECKPOINT = range(0x01, 0x11)
 MSG_NEW_MOVE = 0x11
+MSG_GET_SNAPSHOT = 0x12
+MSG_SNAPSHOT = 0x13
 
 GENESIS_FILE = "genesis.json"
 _node_genesis_hash = ""
@@ -12460,13 +12471,38 @@ class PoSWConsensus:
             if block_id % self.epoch_length == 0:
                 await self._create_finality_checkpoint(block_id, self.node.last_hash)
 
-            if block_id % SNAPSHOT_INTERVAL == 0 and block_id > 0:
+            # R21: cache the SEAL-TIME snapshot and persist it on
+            # EVERY seal — not only every SNAPSHOT_INTERVAL
+            # blocks. A node must be able to serve the tip's
+            # snapshot, and the tip is almost never a multiple
+            # of the interval. The cached / persisted snapshot
+            # is _full_snap in its RAW form (dict values as
+            # dicts, ints as ints) — the exact dict whose root
+            # is sealed into this block. The RAW form is what
+            # the receiving side's _load_state_snapshot expects
+            # (it calls .get() on the maze/attestation values);
+            # the canonicalised snapshot_dirty (all strings)
+            # would break it. _state_root_from_snapshot
+            # canonicalises internally, so the root matches.
+            if block_id > 0:
                 try:
-                    snapshot_data = json.dumps(snapshot_dirty, sort_keys=True) if snapshot_dirty else "{}"
+                    self.node._sealed_snapshot = {"height": block_id, "tip_hash": str(block["hash"]), "state_root": str(state_root), "snapshot": copy.deepcopy(_full_snap)}
+                except Exception:
+                    self.node._sealed_snapshot = None
+                try:
+                    snapshot_data = json.dumps(_full_snap, sort_keys=True) if _full_snap else "{}"
                     if self.db.db_type == "sqlite":
                         await self.db.execute_dml("INSERT OR REPLACE INTO state_snapshots (block_id,state_root,receipt_root,snapshot_data,created_at) VALUES (?,?,?,?,?)", block_id, state_root, "0x" + "00" * 32, snapshot_data, int(time.time()))
                     else:
                         await self.db.execute_dml("INSERT INTO state_snapshots (block_id,state_root,receipt_root,snapshot_data,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (block_id) DO UPDATE SET state_root=$2,snapshot_data=$4", block_id, state_root, "0x" + "00" * 32, snapshot_data, int(time.time()))
+                    # R21: keep only the tip's snapshot — older
+                    # ones are never served (a fresh node wants
+                    # the tip) and never read (the restore takes
+                    # the latest). This bounds the table to one row.
+                    if self.db.db_type == "sqlite":
+                        await self.db.execute_dml("DELETE FROM state_snapshots WHERE block_id < ?", block_id)
+                    else:
+                        await self.db.execute_dml("DELETE FROM state_snapshots WHERE block_id < $1", block_id)
                     logger.info(f"[PoSW] State snapshot saved at block {block_id}")
                 except Exception as e:
                     logger.warning(f"[PoSW] Failed to save snapshot at block {block_id}: {e}")
@@ -13204,6 +13240,21 @@ class P2PNode:
         self.banned_peers: Dict[str, float] = {}
         self.banned_node_ids: Dict[str, float] = {}
         self._pending_checkpoint_requests: Dict[str, asyncio.Future] = {}
+        # R20: snapshot sync state. _snapshot_cache holds the last
+        # built snapshot payload keyed by (tip height, tip hash)
+        # (rebuild only when the tip advances or reorgs);
+        # retries after a failed attempt so a node never hammers
+        # peers with repeated snapshot requests.
+        self._pending_snapshot_requests: Dict[str, asyncio.Future] = {}
+        # R21: (start, end, future) of the history chunk now
+        # awaited from this peer — the MSG_BLOCKS handler only
+        # resolves it when the reply falls inside [start, end].
+        self._pending_snapshot_history: Dict[str, Tuple[int, int, asyncio.Future]] = {}
+        self._pending_tip_requests: Dict[str, asyncio.Future] = {}
+        self._snapshot_cache = None
+        self._snapshot_last_attempt = 0.0
+        self._snapshot_sync_running = False
+        self._snapshot_consec_failures = 0
         self._lock = asyncio.Lock()
         self._server = None
         self._dht_server = None
@@ -13243,6 +13294,7 @@ class P2PNode:
             MSG_GET_BLOCKS: (60, 60),
             MSG_GET_STATUS: (30, 60),
             MSG_GET_CHECKPOINT: (10, 60),
+            MSG_GET_SNAPSHOT: (5, 60),
             MSG_NEW_BLOCK: (100, 60),
             MSG_NEW_TX: (200, 60),
             MSG_NEW_MOVE: (1200, 60),
@@ -13313,6 +13365,11 @@ class P2PNode:
         self.registry_interval = max(60, int(p2p_cfg.get('registry_interval', 300) or 300))
         self._registry_last_fetch = 0.0
         self._registry_cached_peers = []
+        # R21: WS-ONLY tunnel peers from the registry —
+        # [{host, ws_url}]. Never P2P-dialled. Replaced
+        # wholesale on each registry refresh so a changed
+        # tunnel link drops the stale host.
+        self._registry_tunnel_peers = []
         self.fallback_nodes = list(p2p_cfg.get('fallback_nodes', []))
         self.dht_port = int(p2p_cfg.get('dht_port', DHT_PORT))
         self.allow_private_peers = _strict_bool(
@@ -13694,7 +13751,45 @@ class P2PNode:
                 try:
                     req = json.loads(data.decode())
                     blocks = req.get("blocks", [])
-                    await self.node.import_blocks(blocks)
+                    # R20: if a snapshot history fetch is waiting
+                    # on this peer, hand it the blocks instead of
+                    # importing them here — the snapshot code stores
+                    # history itself after verifying the chain links.
+                    # R21: only hand the blocks to a waiting
+                    # snapshot history fetch if they fall inside
+                    # the chunk that fetch asked for. The
+                    # full-sync loop asks this same peer for
+                    # [11,60] concurrently, and the old code
+                    # resolved the history future with ANY
+                    # MSG_BLOCKS — so a full-sync reply [11,60]
+                    # answered a history request [375,424], the
+                    # real history reply then arrived when no
+                    # future was waiting and fell through to
+                    # import_blocks (skipped: above the local
+                    # tip), and the fetch failed with a missing
+                    # predecessor (block 425). A reply outside
+                    # the expected range is a normal sync reply:
+                    # import it, and leave the history future
+                    # waiting for the right chunk.
+                    hist_entry = self._pending_snapshot_history.get(peer.address)
+                    hist_fut = None
+                    if hist_entry is not None:
+                        hist_start, hist_end, hist_fut = hist_entry
+                        if hist_fut.done():
+                            hist_fut = None
+                        elif not blocks:
+                            hist_fut = None
+                        else:
+                            try:
+                                _ids = [int(b["id"]) for b in blocks if isinstance(b, dict) and "id" in b]
+                            except Exception:
+                                _ids = []
+                            if not _ids or min(_ids) < hist_start or max(_ids) > hist_end:
+                                hist_fut = None
+                    if hist_fut is not None:
+                        hist_fut.set_result(blocks)
+                    else:
+                        await self.node.import_blocks(blocks)
                     if blocks:
                         try:
                             peer.height = max(peer.height, self._bound_peer_height(int(blocks[-1].get("id", 0)) + 1))
@@ -13780,10 +13875,99 @@ class P2PNode:
                     peer.height = max(peer.height, self._bound_peer_height(new_h))
                     peer.version = status.get("version", "unknown")
                     logger.debug(f"[P2P] Peer {peer.address} status: height={peer.height}, version={peer.version}")
+                    # R20: resolve a pending tip-quorum request
+                    # (the STATUS payload carries height and
+                    # last_hash, so the tip is height-1 / last_hash).
+                    # Use the RAW height from the payload, not the
+                    # clamped peer.height (_bound_peer_height caps
+                    # it at local+100, which would mismatch the
+                    # peer's real tip hash).
+                    fut = self._pending_tip_requests.get(peer.address)
+                    if fut and not fut.done():
+                        fut.set_result({"height": new_h, "last_hash": status.get("last_hash", ""), "version": peer.version})
                     if peer.height > self.node.height:
                         asyncio.create_task(self.sync_with_peers())
                 except Exception as e:
                     logger.debug(f"[P2P] Error handling MSG_STATUS from {peer.address}: {e}")
+            elif msg_type == MSG_GET_SNAPSHOT:
+                # R20: serve a state snapshot at our tip. Cached by
+                # tip height AND tip hash (a reorg changing tip H to
+                # a different block invalidates the cache). Any
+                # synced node can serve this — no seed special-casing,
+                # so the load spreads to every synced node. The
+                # snapshot is exactly what _state_snapshot_for_block
+                # returns (no added fields — that would change the
+                # state root). The build runs inside a DB transaction
+                # so the tip cannot advance mid-build and the table
+                # reads cannot tear (the snapshot reads live tables;
+                # without the transaction a block sealing mid-build
+                # would make the snapshot root mismatch the tip
+                # state_root). The root is verified against the tip
+                # BEFORE the snapshot is cached or sent — never serve
+                # a snapshot whose root does not match its tip block.
+                try:
+                    latest = await self.node.block_repo.get_latest()
+                    if latest is None:
+                        logger.warning("[Sync] Snapshot requested but this node has no blocks yet")
+                    else:
+                        tip_id = int(latest["id"])
+                        tip_hash = str(latest.get("hash", ""))
+                        payload = None
+                        if self._snapshot_cache and self._snapshot_cache[0] == tip_id and self._snapshot_cache[1] == tip_hash:
+                            payload = self._snapshot_cache[2]
+                            logger.debug(f"[Sync] Serving cached snapshot at height {tip_id}")
+                        if payload is None:
+                            async with await self.node.db.transaction():
+                                latest2 = await self.node.block_repo.get_latest()
+                                if latest2 is None:
+                                    raise RuntimeError("no tip block")
+                                tip2 = int(latest2["id"])
+                                # R21: serve the CACHED seal-time
+                                # snapshot (_full_snap), NOT a
+                                # snapshot rebuilt from the live
+                                # tables — a live rebuild NEVER
+                                # matches the sealed state_root
+                                # (R20: the sealed root is a
+                                # hybrid — pre-state + post-block
+                                # maze identity + reward credit —
+                                # while live tables are post-append).
+                                # 1. in-memory seal-time cache.
+                                snapshot = None
+                                _sealed = getattr(self.node, "_sealed_snapshot", None)
+                                if isinstance(_sealed, dict) and int(_sealed.get("height", -1)) == tip2 and str(_sealed.get("state_root", "")) == str(latest2.get("state_root", "")):
+                                    snapshot = _sealed.get("snapshot")
+                                # 2. persisted seal-time snapshot.
+                                if snapshot is None:
+                                    try:
+                                        _row = await self.node.db.fetchrow("SELECT state_root, snapshot_data FROM state_snapshots WHERE block_id = ?" if self.node.db.db_type == "sqlite" else "SELECT state_root, snapshot_data FROM state_snapshots WHERE block_id = $1", tip2)
+                                    except Exception:
+                                        _row = None
+                                    if _row is not None and str(_row.get("state_root", "")) == str(latest2.get("state_root", "")):
+                                        try:
+                                            snapshot = json.loads(_row.get("snapshot_data") or "{}")
+                                        except Exception:
+                                            snapshot = None
+                                root = _state_root_from_snapshot(snapshot) if snapshot is not None else ""
+                                if snapshot is None:
+                                    logger.warning(f"[Sync] Snapshot at height {tip2}: no cached seal-time snapshot for the tip — refusing to serve")
+                                elif root != str(latest2.get("state_root", "")):
+                                    logger.warning(f"[Sync] Snapshot at height {tip2}: cached root {root[:16]}... != tip state_root {str(latest2.get('state_root', ''))[:16]}... — refusing to serve")
+                                else:
+                                    genesis_row = await self.node.block_repo.get_by_id(0)
+                                    genesis_hash = genesis_row["hash"] if genesis_row else (getattr(self.node, "genesis_hash", "") or "")
+                                    resp = {"height": tip2, "genesis_hash": genesis_hash,
+                                            "state_root": root, "snapshot": snapshot, "tip_block": latest2}
+                                    payload = json.dumps(resp).encode()
+                                    if len(payload) >= 4000000:
+                                        logger.warning(f"[Sync] Snapshot at height {tip2} is {len(payload)} bytes — over the 4MB P2P limit, refusing to send")
+                                        payload = None
+                                    else:
+                                        self._snapshot_cache = (tip2, str(latest2.get("hash", "")), payload)
+                                        logger.info(f"[Sync] Served seal-time snapshot at height {tip2}: {len(payload)} bytes, state_root={root[:16]}...")
+                        if payload is not None:
+                            await self._send_message(peer, MSG_SNAPSHOT, payload)
+                except Exception as e:
+                    logger.warning(f"[Sync] Snapshot build failed for {peer.address}: {e}")
             elif msg_type == MSG_GET_CHECKPOINT:
                 checkpoint = await self.node.finality_repo.get_latest()
                 resp = {"block_id": checkpoint["block_id"] if checkpoint else 0,
@@ -13798,6 +13982,14 @@ class P2PNode:
                         fut.set_result(resp)
                 except Exception as e:
                     logger.debug(f"[P2P] MSG_CHECKPOINT error from {peer.address}: {e}")
+            elif msg_type == MSG_SNAPSHOT:
+                try:
+                    resp = json.loads(data.decode())
+                    fut = self._pending_snapshot_requests.get(peer.address)
+                    if fut and not fut.done():
+                        fut.set_result(resp)
+                except Exception as e:
+                    logger.debug(f"[P2P] MSG_SNAPSHOT error from {peer.address}: {e}")
             elif msg_type == MSG_BAN:
                 try:
                     req = json.loads(data.decode())
@@ -13903,9 +14095,13 @@ class P2PNode:
     @staticmethod
     def _msg_priority(msg_type: int) -> int:
         """Lower number = higher priority. Consensus traffic jumps gossip."""
-        if msg_type in (MSG_BLOCKS, MSG_NEW_BLOCK, MSG_CHECKPOINT, MSG_GET_CHECKPOINT):
+        # R21: snapshot traffic is a small, infrequent,
+        # direct reply — it must not starve behind block
+        # traffic (a queued snapshot once sat unsent past
+        # the requester's 30 s timeout).
+        if msg_type in (MSG_BLOCKS, MSG_NEW_BLOCK, MSG_CHECKPOINT, MSG_GET_CHECKPOINT, MSG_SNAPSHOT):
             return 0
-        if msg_type in (MSG_PING, MSG_PONG, MSG_STATUS, MSG_GET_STATUS):
+        if msg_type in (MSG_PING, MSG_PONG, MSG_STATUS, MSG_GET_STATUS, MSG_GET_SNAPSHOT):
             return 1
         if msg_type in (MSG_NEW_TX, MSG_GET_BLOCKS):
             return 2
@@ -14624,9 +14820,20 @@ class P2PNode:
             logger.debug(f"[REGISTRY] fetch failed: {e}")
             return []
         endpoints = []
+        tunnel_peers = []
         if isinstance(data, dict) and isinstance(data.get("nodes"), list):
             for n in data["nodes"]:
                 if not isinstance(n, dict):
+                    continue
+                # R21: tunnel nodes are WS-only (raw TCP P2P
+                # cannot go through an HTTP Cloudflare Tunnel).
+                # Record the hostname + ws_url; never dial it.
+                if n.get("tunnel"):
+                    host = str(n.get("host") or "").strip().lower()
+                    ws_url = str(n.get("ws_url") or "").strip()
+                    if host:
+                        tunnel_peers.append({"host": host, "ws_url": ws_url})
+                        logger.info(f"[REGISTRY] tunnel peer {host} (WS-only, not P2P-dialled)")
                     continue
                 p2p = n.get("p2p") or ""
                 host, port = parse_ip_port(str(p2p), P2P_PORT)
@@ -14635,11 +14842,31 @@ class P2PNode:
                 try:
                     ip = ipaddress.ip_address(host)
                 except ValueError:
-                    continue
+                    # R21: a p2p hostname (DDNS) — resolve it
+                    # and dial the resolved public IP. An
+                    # unresolvable name, or one that resolves
+                    # to a private/loopback/reserved IP, is
+                    # dropped by the same rule as below.
+                    try:
+                        resolved = socket.gethostbyname(host)
+                    except Exception:
+                        continue
+                    try:
+                        ip = ipaddress.ip_address(resolved)
+                    except ValueError:
+                        continue
+                    host = resolved
                 if not self.allow_private_peers and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast):
                     continue
                 endpoints.append(f"{host}:{port}" if ":" not in str(host) else f"[{host}]:{port}")
-        return list(dict.fromkeys(endpoints))
+        # Deduplicate tunnel peers by host, keeping the first ws_url.
+        _seen = set()
+        _deduped = []
+        for _tp in tunnel_peers:
+            if _tp["host"] not in _seen:
+                _seen.add(_tp["host"])
+                _deduped.append(_tp)
+        return list(dict.fromkeys(endpoints)), _deduped
 
     async def _fetch_registry_peers(self):
         if not self.registry_enabled or not self.registry_url:
@@ -14654,11 +14881,16 @@ class P2PNode:
         self._registry_last_fetch = now
         try:
             loop = asyncio.get_running_loop()
-            peers = await loop.run_in_executor(None, self._fetch_registry_peers_sync)
+            peers, tunnel_peers = await loop.run_in_executor(None, self._fetch_registry_peers_sync)
         except Exception as e:
             logger.debug(f"[REGISTRY] fetch failed: {e}")
             return list(self._registry_cached_peers)
         self._registry_cached_peers = list(peers)
+        # R21: replace the tunnel-peer list wholesale on each
+        # refresh too, so a changed tunnel link drops the
+        # stale host.
+        self._registry_tunnel_peers = list(tunnel_peers)
+        logger.debug(f"[REGISTRY] tunnel peers: {[t.get('host', '') for t in tunnel_peers]}")
         return list(peers)
 
     async def _resolve_dns_seeds(self) -> List[str]:
@@ -14841,6 +15073,454 @@ class P2PNode:
                 except Exception:
                     pass
 
+    async def _request_snapshot(self, peer: EncryptedPeer, timeout: float = SNAPSHOT_REQUEST_TIMEOUT) -> Optional[Dict]:
+        """R20: ask one peer for a state snapshot at its tip.
+        Returns the parsed response dict, or None on timeout / no
+        response. Same future pattern as _request_checkpoints."""
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending_snapshot_requests[peer.address] = fut
+        try:
+            await self._send_message(peer, MSG_GET_SNAPSHOT, b"")
+            await asyncio.wait({fut}, timeout=timeout)
+        except Exception as e:
+            logger.warning(f"[Sync] Snapshot request to {peer.address} failed: {e}")
+            return None
+        finally:
+            self._pending_snapshot_requests.pop(peer.address, None)
+        if fut.done() and not fut.cancelled() and not fut.exception():
+            return fut.result()
+        logger.warning(f"[Sync] Snapshot request to {peer.address} timed out after {timeout}s")
+        return None
+
+    async def _request_tip_quorum(self, peers: List[EncryptedPeer], timeout: float = 5.0) -> Optional[Dict]:
+        """R20: ask peers for their tip (height-1, last_hash) via
+        MSG_STATUS and require majority agreement — the
+        _request_checkpoints quorum pattern, applied to the tip.
+        A single peer is used with a warning. Returns
+        {"block_id": H, "hash": h} or None."""
+        if not peers:
+            return None
+        loop = asyncio.get_running_loop()
+        futures = {}
+        for p in peers:
+            fut = loop.create_future()
+            self._pending_tip_requests[p.address] = fut
+            futures[p.address] = fut
+        try:
+            for p in peers:
+                try:
+                    await self._send_message(p, MSG_GET_STATUS, b"")
+                except Exception as e:
+                    logger.debug(f"[Sync] Tip request to {p.address} failed: {e}")
+            await asyncio.wait(set(futures.values()), timeout=timeout)
+        except Exception as e:
+            logger.debug(f"[Sync] Tip quorum error: {e}")
+        finally:
+            for addr in futures:
+                self._pending_tip_requests.pop(addr, None)
+        votes = {}
+        for addr, fut in futures.items():
+            if fut.done() and not fut.cancelled() and not fut.exception():
+                r = fut.result()
+                h = int(r.get("height", 0))
+                if h > 0:
+                    key = (h - 1, str(r.get("last_hash", "")))
+                    votes[key] = votes.get(key, 0) + 1
+        if not votes:
+            return None
+        if len(peers) == 1:
+            (bid, hsh), _c = next(iter(votes.items()))
+            logger.warning("[Sync] Only one peer available for tip cross-check — using its tip with a warning")
+            return {"block_id": bid, "hash": hsh}
+        for (bid, hsh), count in votes.items():
+            if count * 2 > len(peers):
+                return {"block_id": bid, "hash": hsh}
+        logger.warning(f"[Sync] Tip cross-check: no majority among {len(peers)} peers (votes={votes})")
+        return None
+
+    async def _fetch_snapshot_history(self, H: int, tip: Dict, peer: EncryptedPeer) -> Optional[List[Dict]]:
+        """R20: fetch the last SNAPSHOT_WINDOW blocks before the tip
+        (H-99..H-1) that the node does not already have, 50 at a
+        time via MSG_GET_BLOCKS. Verifies each block's hash
+        recomputes and the phash chain links back to the tip.
+        Returns the fetched blocks (sorted by id) or None on
+        failure. Does NOT store them — the caller stores after
+        verifying the tip."""
+        start = max(1, H - SNAPSHOT_WINDOW + 1)
+        end = H - 1
+        if end < start:
+            return []
+        missing = []
+        for bid in range(start, end + 1):
+            row = await self.node.block_repo.get_by_id(bid)
+            if row is None:
+                missing.append(bid)
+        if not missing:
+            return []
+        ranges = []
+        r0 = missing[0]; r1 = missing[0]
+        for bid in missing[1:]:
+            if bid == r1 + 1:
+                r1 = bid
+            else:
+                ranges.append((r0, r1)); r0 = bid; r1 = bid
+        ranges.append((r0, r1))
+        fetched = {}
+        for (s, e) in ranges:
+            cur = s
+            while cur <= e:
+                chunk_end = min(e, cur + 49)
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                self._pending_snapshot_history[peer.address] = (cur, chunk_end, fut)
+                try:
+                    payload = json.dumps({"start": cur, "end": chunk_end}).encode()
+                    await self._send_message(peer, MSG_GET_BLOCKS, payload)
+                    await asyncio.wait({fut}, timeout=SNAPSHOT_REQUEST_TIMEOUT)
+                except Exception as ex:
+                    logger.warning(f"[Sync] Snapshot history fetch [{cur},{chunk_end}] from {peer.address} failed: {ex}")
+                    return None
+                finally:
+                    self._pending_snapshot_history.pop(peer.address, None)
+                if not (fut.done() and not fut.cancelled() and not fut.exception()):
+                    logger.warning(f"[Sync] Snapshot history fetch [{cur},{chunk_end}] from {peer.address} timed out")
+                    return None
+                blocks = fut.result() or []
+                # R21: safety net — the handler only resolves
+                # this future with blocks inside [cur, chunk_end];
+                # refuse anything outside that range rather
+                # than storing it.
+                for b in blocks:
+                    if isinstance(b, dict) and "id" in b:
+                        try:
+                            _bid = int(b["id"])
+                        except Exception:
+                            logger.warning(f"[Sync] Snapshot history fetch [{cur},{chunk_end}] from {peer.address} got a block with a bad id — rejecting snapshot")
+                            return None
+                        if _bid < cur or _bid > chunk_end:
+                            logger.warning(f"[Sync] Snapshot history fetch [{cur},{chunk_end}] from {peer.address} got out-of-range block {_bid} — rejecting snapshot")
+                            return None
+                for b in blocks:
+                    if isinstance(b, dict) and "id" in b:
+                        fetched[int(b["id"])] = b
+                cur = chunk_end + 1
+        got = [fetched[i] for i in sorted(fetched.keys()) if start <= i <= end]
+        for b in got:
+            try:
+                if b.get("hash") != calculate_block_hash(b):
+                    logger.warning(f"[Sync] Snapshot history: block {b.get('id')} hash mismatch — rejecting snapshot")
+                    return None
+            except Exception as ex:
+                logger.warning(f"[Sync] Snapshot history: block {b.get('id')} hash check failed ({ex}) — rejecting snapshot")
+                return None
+        by_id = {int(b["id"]): b for b in got}
+        for bid in sorted(by_id.keys()):
+            if bid == start:
+                continue
+            b = by_id[bid]
+            prev = by_id.get(bid - 1)
+            if prev is None:
+                prev = await self.node.block_repo.get_by_id(bid - 1)
+            if prev is None:
+                logger.warning(f"[Sync] Snapshot history: block {bid} has no predecessor — rejecting snapshot")
+                return None
+            if b.get("phash") != prev.get("hash"):
+                logger.warning(f"[Sync] Snapshot history: block {bid} phash does not match block {bid - 1} hash — rejecting snapshot")
+                return None
+        prev_tip = by_id.get(H - 1)
+        if prev_tip is None:
+            prev_tip = await self.node.block_repo.get_by_id(H - 1)
+        if prev_tip is not None and tip.get("phash") != prev_tip.get("hash"):
+            logger.warning("[Sync] Snapshot history: tip phash does not match block H-1 hash — rejecting snapshot")
+            return None
+        return got
+
+    async def _load_state_snapshot(self, snapshot: Dict, height: int) -> bool:
+        """R20: load a VERIFIED snapshot dict into the node's DB.
+        For each table fully captured by the snapshot, DELETE all
+        rows then INSERT the snapshot rows, inside one transaction
+        so a failure cannot leave a half-loaded state. The maze
+        identity rows are inserted with live-state columns NULL/0
+        (size from the attestation); the live state is
+        re-established when each miner re-registers and
+        state-syncs. SVF profiles are rebuilt from the snapshot
+        params via svf_profile_bytes and persisted to the DB
+        profile table read at startup. Returns True on success."""
+        db = self.node.db
+        now = int(time.time())
+        bals = {}
+        toks = {}
+        cst = {}
+        cst2 = {}
+        htlcs = {}
+        mazes = {}
+        tokis = {}
+        convs = {}
+        mazeatts = {}
+        svfregs = {}
+        svfepochs = {}
+        svfcerts = {}
+        for k, v in snapshot.items():
+            if k.startswith("bal:"):
+                bals[k[4:]] = v
+            elif k.startswith("tok:"):
+                rest = k[4:]
+                t, _, w = rest.partition(":")
+                toks[(t, w)] = v
+            elif k.startswith("cst:"):
+                rest = k[4:]
+                c, _, kk = rest.partition(":")
+                cst[(c, kk)] = v
+            elif k.startswith("cst2:"):
+                rest = k[5:]
+                c, _, kk = rest.partition(":")
+                cst2[(c, kk)] = v
+            elif k.startswith("htlc:"):
+                htlcs[k[5:]] = v
+            elif k.startswith("maze:"):
+                mazes[k[5:]] = v
+            elif k.startswith("toki:"):
+                tokis[k[5:]] = v
+            elif k.startswith("conv:"):
+                convs[k[5:]] = v
+            elif k.startswith("mazeatt:"):
+                mazeatts[k[8:]] = v
+            elif k.startswith("svfreg:"):
+                svfregs[k[7:]] = v
+            elif k.startswith("svfepoch:"):
+                svfepochs[k[9:]] = v
+            elif k.startswith("svfcert:"):
+                svfcerts[k[8:]] = v
+            elif k.startswith("height:"):
+                pass
+            else:
+                logger.warning(f"[Sync] Snapshot load: unknown snapshot key {str(k)[:32]} — ignoring")
+        def _ins(table, cols):
+            n = len(cols)
+            if db.db_type == "sqlite":
+                ph = ", ".join(["?"] * n)
+            else:
+                ph = ", ".join("$%d" % (i + 1) for i in range(n))
+            return "INSERT INTO %s (%s) VALUES (%s)" % (table, ", ".join(cols), ph)
+        try:
+            async with await db.transaction():
+                await db.execute_dml("DELETE FROM balances")
+                for wallet, bal in bals.items():
+                    await db.execute_dml(_ins("balances", ["wallet", "bal"]), wallet, int(bal))
+                await db.execute_dml("DELETE FROM token_balances")
+                for (t, w), bal in toks.items():
+                    await db.execute_dml(_ins("token_balances", ["token_address", "wallet", "balance"]), t, w, int(bal))
+                await db.execute_dml("DELETE FROM contract_state")
+                for (c, kk), val in cst.items():
+                    await db.execute_dml(_ins("contract_state", ["contract_address", "key", "value"]), c, kk, str(val))
+                await db.execute_dml("DELETE FROM contract_storage_v2")
+                for (c, kk), val in cst2.items():
+                    await db.execute_dml(_ins("contract_storage_v2", ["contract_address", "key", "value"]), c, kk, str(val))
+                await db.execute_dml("DELETE FROM htlc_contracts")
+                for hid, h in htlcs.items():
+                    await db.execute_dml(_ins("htlc_contracts", ["id", "sender", "receiver", "hashlock", "timelock", "amount", "token_address", "status", "created_at", "claimed_at", "refunded_at"]), hid, h.get("sender", ""), h.get("receiver", ""), h.get("hashlock", ""), int(h.get("timelock", 0)), int(h.get("amount", 0)), h.get("token_address", ""), h.get("status", ""), now, None, None)
+                await db.execute_dml("DELETE FROM tokens")
+                for addr, t in tokis.items():
+                    await db.execute_dml(_ins("tokens", ["address", "name", "symbol", "owner", "total_supply", "decimals", "created_at", "fee_paid", "mintable", "burnable", "mining_type", "mining_reward", "mining_interval", "mining_difficulty", "stake_threshold", "last_mined_block", "total_mined", "max_mineable_supply"]), addr, t.get("name", ""), t.get("symbol", ""), t.get("owner", ""), int(t.get("total_supply", 0)), int(t.get("decimals", 0)), now, 0, int(t.get("mintable", 0)), int(t.get("burnable", 0)), t.get("mining_type", ""), int(t.get("mining_reward", 0)), int(t.get("mining_interval", 0)), int(t.get("mining_difficulty", 0)), int(t.get("stake_threshold", 0)), int(t.get("last_mined_block", 0)), int(t.get("total_mined", 0)), int(t.get("max_mineable_supply", 0)))
+                await db.execute_dml("DELETE FROM contract_v2")
+                for addr, c in convs.items():
+                    await db.execute_dml(_ins("contract_v2", ["address", "owner", "bytecode", "abi", "created_at", "tx_hash", "storage_root", "code_hash"]), addr, c.get("owner", ""), "", "{}", now, "", "", c.get("code_hash", ""))
+                await db.execute_dml("DELETE FROM maze_attestations")
+                for mid, a in mazeatts.items():
+                    await db.execute_dml(_ins("maze_attestations", ["maze_id", "last_size", "last_block", "last_block_hash", "pubkey"]), mid, int(a.get("last_size", 5)), int(a.get("last_block", 0)), a.get("last_block_hash", ""), a.get("pubkey", ""))
+                await db.execute_dml("DELETE FROM minermazes")
+                maze_cols = ["maze_id", "minerid", "size", "walldensityppm", "seed", "posx", "posy", "posz", "goalx", "goaly", "goalz", "movenonce", "consecutivewallhits", "turbulenceppm", "growthcount", "knowledge", "lastgoalheight", "lastactiveheight", "mazeroot", "invitedguest", "guestlock", "lastknowledgeheight", "createdat", "updatedat", "ghostx", "ghosty", "ghostz"]
+                for mid, m in mazes.items():
+                    att = mazeatts.get(mid, {})
+                    size = int(att.get("last_size", 5)) if att else 5
+                    await db.execute_dml(_ins("minermazes", maze_cols), mid, m.get("minerid", ""), size, int(m.get("walldensityppm", 0)), str(m.get("seed", "")), 0, 0, 0, int(m.get("goalx", 0)), int(m.get("goaly", 0)), int(m.get("goalz", 0)), 0, 0, 0, 0, 0, 0, height, "", "", "", 0, now, now, 0, 0, 0)
+                await db.execute_dml("DELETE FROM svf_profiles")
+                for tok, reg in svfregs.items():
+                    profile = {"schema_version": SVF_PROFILE_SCHEMA_VERSION, "family_id": SVF_PROFILE_FAMILY_ID, "sample_blocks": int(reg.get("sample_blocks", 0)), "min_distinct_winners": int(reg.get("min_distinct_winners", 0)), "min_growth_blocks": int(reg.get("min_growth_blocks", 0)), "min_total_attestation_weight": int(reg.get("min_total_attestation_weight", 0))}
+                    canonical = svf_profile_bytes(profile)
+                    phash = reg.get("profile_hash", "")
+                    await db.execute_dml(_ins("svf_profiles", ["token_address", "chain_id", "runtime_code_hash", "template_id", "profile_schema_version", "canonical_profile_bytes", "profile_hash", "registrant", "registration_tx_hash", "registration_block_height", "effective_epoch", "status"]), tok, int(reg.get("chain_id", CHAIN_ID)), "", "", SVF_PROFILE_SCHEMA_VERSION, canonical.hex(), phash, "", "", 0, 0, "ACTIVE")
+                await db.execute_dml("DELETE FROM svf_epoch_roots")
+                for epoch_id, e in svfepochs.items():
+                    await db.execute_dml(_ins("svf_epoch_roots", ["epoch_id", "root_hash", "record_count", "complete"]), int(epoch_id), e.get("root_hash", ""), int(e.get("record_count", 0)), 1 if int(e.get("record_count", 0)) == SVF_EPOCH_BLOCKS else 0)
+                await db.execute_dml("DELETE FROM svf_certificates")
+                for epoch_id, c in svfcerts.items():
+                    ep = int(epoch_id)
+                    ws = ep * SVF_EPOCH_BLOCKS
+                    await db.execute_dml(_ins("svf_certificates", ["evidence_epoch", "chain_id", "committee_epoch", "window_start_height", "window_end_height", "anchor_block_hash", "evidence_root", "group_public_key_id", "threshold_signature", "inclusion_block", "usable_from"]), ep, CHAIN_ID, SVF_COMMITTEE_EPOCH, ws, ws + SVF_EPOCH_BLOCKS - 1, c.get("anchor_block_hash", ""), c.get("evidence_root", ""), "", "", int(c.get("inclusion_block", 0)), int(c.get("usable_from", 0)))
+                if db.db_type == "sqlite":
+                    await db.execute_dml("INSERT OR REPLACE INTO state_snapshots (block_id, state_root, receipt_root, snapshot_data, created_at) VALUES (?, ?, ?, ?, ?)", height, _state_root_from_snapshot(snapshot), "", json.dumps(snapshot), now)
+                else:
+                    await db.execute_dml("INSERT INTO state_snapshots (block_id, state_root, receipt_root, snapshot_data, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (block_id) DO UPDATE SET state_root = EXCLUDED.state_root, receipt_root = EXCLUDED.receipt_root, snapshot_data = EXCLUDED.snapshot_data, created_at = EXCLUDED.created_at", height, _state_root_from_snapshot(snapshot), "", json.dumps(snapshot), now)
+            return True
+        except Exception as e:
+            logger.warning(f"[Sync] Snapshot state load failed at height {height}: {e}")
+            return False
+
+    async def _verify_snapshot_response(self, resp: Dict, peer_list: List[EncryptedPeer]) -> Optional[str]:
+        """R20: verify a snapshot response BEFORE any state is
+        applied. Returns None if it passes, else the reason it was
+        rejected (logged by the caller). Checks, in order: the
+        response shape, the snapshot root against the tip block's
+        state_root, the genesis hash against the pin, and the tip
+        by quorum cross-check."""
+        if not isinstance(resp, dict):
+            return "response is not a dict"
+        H = resp.get("height")
+        snapshot = resp.get("snapshot")
+        tip = resp.get("tip_block")
+        genesis_hash = str(resp.get("genesis_hash") or "")
+        state_root = str(resp.get("state_root") or "")
+        if not isinstance(H, int) or H < 0:
+            return "bad height in snapshot response"
+        if not isinstance(snapshot, dict) or not isinstance(tip, dict):
+            return "snapshot or tip_block missing"
+        if int(tip.get("id", -1)) != H:
+            return f"tip block id {tip.get('id')} != snapshot height {H}"
+        try:
+            recomputed = _state_root_from_snapshot(snapshot)
+        except Exception as e:
+            return f"snapshot root recompute failed: {e}"
+        if recomputed != state_root or recomputed != str(tip.get("state_root", "")):
+            return "snapshot state root does not match tip block state_root"
+        if not genesis_hash or len(genesis_hash) != 64:
+            return "genesis_hash missing or not 64 hex chars"
+        pinned = getattr(self.node, "genesis_hash", "") or ""
+        if pinned and pinned != genesis_hash:
+            return "genesis_hash does not match pinned genesis"
+        quorum = await self._request_tip_quorum(peer_list)
+        if quorum is None:
+            return "tip cross-check: no quorum (peers disagree or did not answer)"
+        # R21: the serving node keeps sealing, so its tip may
+        # have advanced past the snapshot tip between the
+        # serve and this check. A snapshot a few blocks
+        # behind the quorum tip is still valid — the caller
+        # loads the state at H and then forward-syncs to the
+        # tip, and that forward sync verifies the chain links
+        # back to H (a fork snapshot cannot silently stick:
+        # its forward blocks would not link). Only reject if
+        # the quorum is BEHIND the snapshot or the snapshot
+        # is more than a window stale.
+        _qh = int(quorum["block_id"])
+        if _qh < H:
+            return f"tip cross-check: quorum tip {_qh} is behind snapshot tip {H}"
+        if _qh == H and str(quorum["hash"]) != str(tip.get("hash", "")):
+            return f"tip cross-check: quorum tip {_qh}/{str(quorum['hash'])[:16]}... != snapshot tip {H}/{str(tip.get('hash', ''))[:16]}..."
+        if _qh - H > SNAPSHOT_WINDOW:
+            return f"tip cross-check: snapshot tip {H} is {_qh - H} blocks behind quorum tip {_qh} (stale)"
+        return None
+
+    async def _apply_snapshot_response(self, resp: Dict, peer: EncryptedPeer) -> bool:
+        """R20: apply a VERIFIED snapshot response. Order (the
+        last-100 fetch runs BEFORE verify_block_proof, because the
+        proof's timestamp check needs ancestor blocks in the local
+        DB — a fresh node has none): fetch+verify the last-100
+        history, store the history + tip, verify the tip with
+        verify_block_proof, load the snapshot state, refresh the
+        node's in-memory state. On any failure, roll back the
+        stored blocks and return False (never partially apply)."""
+        H = int(resp["height"])
+        snapshot = resp["snapshot"]
+        tip = resp["tip_block"]
+        genesis_hash = str(resp.get("genesis_hash") or "")
+        hist = await self._fetch_snapshot_history(H, tip, peer)
+        if hist is None:
+            logger.warning("[Sync] Snapshot sync rejected: last-100 history fetch/verify failed")
+            return False
+        added = []
+        try:
+            for b in hist:
+                if await self.node.block_repo.get_by_id(int(b["id"])) is None:
+                    await self.node.block_repo.create(b)
+                    added.append(int(b["id"]))
+            if await self.node.block_repo.get_by_id(H) is None:
+                await self.node.block_repo.create(tip)
+                added.append(H)
+        except Exception as e:
+            logger.warning(f"[Sync] Snapshot sync rejected: storing history/tip failed: {e}")
+            for bid in added:
+                try:
+                    await self.node.db.execute_dml("DELETE FROM blocks WHERE id = ?" if self.node.db.db_type == "sqlite" else "DELETE FROM blocks WHERE id = $1", bid)
+                except Exception:
+                    pass
+            return False
+        # R21o: verify_block_proof returns a plain bool; the
+        # R20 apply code unpacked it as (ok, reason) and raised
+        # TypeError on every call. The function itself logs
+        # the specific failure reason.
+        ok = await self.node.verify_block_proof(tip)
+        if not ok:
+            logger.warning(f"[Sync] Snapshot sync rejected: tip block {H} failed verify_block_proof")
+            for bid in added:
+                try:
+                    await self.node.db.execute_dml("DELETE FROM blocks WHERE id = ?" if self.node.db.db_type == "sqlite" else "DELETE FROM blocks WHERE id = $1", bid)
+                except Exception:
+                    pass
+            return False
+        if not getattr(self.node, "genesis_hash", ""):
+            self.node.genesis_hash = genesis_hash
+        if not await self._load_state_snapshot(snapshot, H):
+            logger.warning("[Sync] Snapshot sync rejected: state load failed")
+            for bid in added:
+                try:
+                    await self.node.db.execute_dml("DELETE FROM blocks WHERE id = ?" if self.node.db.db_type == "sqlite" else "DELETE FROM blocks WHERE id = $1", bid)
+                except Exception:
+                    pass
+            return False
+        await self.node._load_state()
+        logger.info(f"[Sync] Snapshot sync complete: height={self.node.height} (tip block {H}), state root verified, last {SNAPSHOT_WINDOW} blocks present. This node is PRUNED (no full history).")
+        return True
+
+    async def _try_snapshot_sync(self, best_peer: EncryptedPeer, peer_list: List[EncryptedPeer]) -> bool:
+        """R20: attempt a snapshot sync from the best peer. Asks
+        ONE peer at a time; a timeout/no-response moves to the
+        next peer, but a VERIFICATION failure backs off to full
+        sync immediately (no retry of another snapshot) and starts
+        the cooldown. Returns True on success."""
+        now = time.time()
+        if now - self._snapshot_last_attempt < SNAPSHOT_RETRY_COOLDOWN:
+            logger.info(f"[Sync] Snapshot sync on cooldown ({int(SNAPSHOT_RETRY_COOLDOWN - (now - self._snapshot_last_attempt))}s left) — falling back to full sync")
+            return False
+        # R21n: only one snapshot sync may run at a time. The history
+        # fetch shares a single future per peer; a second concurrent
+        # attempt would overwrite it and orphan the first fetch, which
+        # then times out. The cooldown only guards the start time, not
+        # an attempt still in progress.
+        if self._snapshot_sync_running:
+            logger.info("[Sync] Snapshot sync already in progress — falling back to full sync")
+            return False
+        self._snapshot_sync_running = True
+        try:
+            self._snapshot_last_attempt = now
+            ordered = sorted(peer_list, key=lambda p: -p.height)
+            seen = set()
+            for peer in ordered:
+                if peer.address in seen:
+                    continue
+                seen.add(peer.address)
+                logger.info(f"[Sync] Snapshot sync: requesting snapshot from {peer.address} (height {peer.height})")
+                resp = await self._request_snapshot(peer)
+                if resp is None:
+                    logger.warning(f"[Sync] Snapshot sync: no snapshot from {peer.address} — trying next peer")
+                    continue
+                reason = await self._verify_snapshot_response(resp, peer_list)
+                if reason is not None:
+                    self._snapshot_consec_failures += 1
+                    logger.warning(f"[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — backing off to full sync")
+                    return False
+                if await self._apply_snapshot_response(resp, peer):
+                    self._snapshot_consec_failures = 0
+                    return True
+                self._snapshot_consec_failures += 1
+                logger.warning(f"[Sync] Snapshot sync: apply failed for {peer.address} — backing off to full sync")
+                return False
+            self._snapshot_consec_failures += 1
+            logger.warning("[Sync] Snapshot sync: no peer offered a snapshot — falling back to full sync")
+            return False
+        finally:
+            self._snapshot_sync_running = False
+
     async def _request_checkpoints(self, peers: List[EncryptedPeer], timeout: float = 5.0) -> Optional[Dict]:
         futures = {}
         for peer in peers:
@@ -14907,6 +15587,8 @@ class P2PNode:
                 continue
 
             gap = best_height - self.node.height
+            if gap <= SNAPSHOT_SYNC_THRESHOLD:
+                self._snapshot_consec_failures = 0
             logger.info(f"[P2P] Syncing from {best_peer.address}: local={self.node.height}, remote={best_height}")
 
             if gap > CHECKPOINT_SYNC_THRESHOLD:
@@ -14915,6 +15597,22 @@ class P2PNode:
                 if checkpoint:
                     logger.info(f"[Sync] Quorum-agreed checkpoint at block {checkpoint['block_id']} — anchoring catch-up sync on it")
 
+            # R20: snapshot sync first when far behind or at
+            # height 0 — download the state at the tip plus the
+            # tip block instead of every block from genesis.
+            if self.node.height == 0 or gap > SNAPSHOT_SYNC_THRESHOLD:
+                if await self._try_snapshot_sync(best_peer, peer_list):
+                    logger.info("[Sync] Snapshot sync succeeded — resuming normal sync from the new tip")
+                    continue
+                # R21q: while a snapshot is still being retried
+                # (fewer than 3 consecutive failures), do not
+                # burn a full sync on a chain that may hold a
+                # corrupt block the snapshot would skip; wait for
+                # the next cycle's snapshot retry instead.
+                if self._snapshot_consec_failures < 3:
+                    logger.info("[Sync] Snapshot sync did not complete — deferring full sync (snapshot retry pending)")
+                    continue
+                logger.info("[Sync] Snapshot sync did not complete — falling back to full sync")
             max_chunks_this_cycle = 25
             rewound_this_stall = False
             for _ in range(max_chunks_this_cycle):
@@ -14944,6 +15642,13 @@ class P2PNode:
                         await asyncio.sleep(0.25)
                         waited += 0.25
                 if self.node.height <= start:
+                    # R20: a node stuck below a rejected/corrupt
+                    # block can jump past it with a snapshot sync
+                    # (cooldown-guarded inside _try_snapshot_sync).
+                    if await self._try_snapshot_sync(best_peer, peer_list):
+                        self._stuck_cycles = 0
+                        self._stuck_peer = None
+                        break
                     logger.warning(
                         f"[Sync] Stuck at height {self.node.height} — no progress importing "
                         f"[{start},{end}) from {best_peer.address}. "
@@ -14997,6 +15702,14 @@ class P2PNode:
         if not self.peers:
             return
         best_peer = max(self.peers.values(), key=lambda p: p.height)
+        # R20: snapshot sync first when far behind or at height 0.
+        if self.node.height == 0 or (best_peer.height - self.node.height) > SNAPSHOT_SYNC_THRESHOLD:
+            if await self._try_snapshot_sync(best_peer, list(self.peers.values())):
+                return
+            # R21q: defer the full-sync fallback while a snapshot
+            # retry is still pending (see _sync_loop).
+            if self._snapshot_consec_failures < 3:
+                return
         latest = await self.node.block_repo.get_latest()
         if latest is None:
             batch_end = min(best_peer.height, SYNC_BATCH_BLOCKS - 1)
@@ -15039,6 +15752,15 @@ class MicroCoreNode:
         self.height = 0
         self.last_hash = "0"*64
         self.blocks = []
+        # R21: the SEAL-TIME snapshot of the tip block — the
+        # exact _full_snap dict (RAW form) whose state_root is
+        # sealed into the tip block. Kept in memory for serving
+        # snapshots to fresh / far-behind peers; only the tip
+        # is kept (bounded memory). {height, tip_hash,
+        # state_root, snapshot}. None until this node seals or
+        # imports its first block (or loads one from
+        # state_snapshots at startup).
+        self._sealed_snapshot = None
         self.total_minted = 0
         self.burned_total = 0
         self.miners: Dict[str, Dict] = {}
@@ -15092,6 +15814,11 @@ class MicroCoreNode:
         self.state_trie = StateTrie(self.db)
 
         self.rate_limiter = RateLimiter()
+        # POLISH-2: per-key refusal counts for the throttled
+        # rate-limit log in websocket_handler. {key: [last_log_ts,
+        # refusals_since_log]}. Bounded by distinct keys; entries
+        # are pruned when the key is logged (reset to 0).
+        self._ws_rate_limit_log: Dict[str, list] = {}
         self.subnet_rate_limiter = RateLimiter(max_requests=300, window_seconds=60)
         self.register_rate_limiter = RateLimiter(max_requests=6, window_seconds=60)
         self.rpc_rate_limiter = RateLimiter(max_requests=30, window_seconds=60)
@@ -15370,6 +16097,24 @@ class MicroCoreNode:
                 logger.debug(f"[SVF] restored evidence from epoch {earliest_epoch} onward")
             except Exception as _e:
                 logger.warning(f"[SVF] state restore from DB failed: {_e}")
+
+        # R21: restore the cached seal-time snapshot for the tip
+        # so this node can serve snapshots immediately after a
+        # restart. Only the tip's snapshot is loaded, and only
+        # if its state_root matches the tip block.
+        try:
+            _tip = await self.block_repo.get_latest()
+            if _tip is not None:
+                _tip_id = int(_tip["id"])
+                _tip_root = str(_tip.get("state_root", ""))
+                _srow = await self.db.fetchrow("SELECT state_root, snapshot_data FROM state_snapshots WHERE block_id = ?" if self.db.db_type == "sqlite" else "SELECT state_root, snapshot_data FROM state_snapshots WHERE block_id = $1", _tip_id)
+                if _srow is not None and str(_srow.get("state_root", "")) == _tip_root:
+                    _snap = json.loads(_srow.get("snapshot_data") or "{}")
+                    if isinstance(_snap, dict) and _snap:
+                        self._sealed_snapshot = {"height": _tip_id, "tip_hash": str(_tip.get("hash", "")), "state_root": _tip_root, "snapshot": _snap}
+                        logger.debug(f"[Sync] Restored seal-time snapshot for tip block {_tip_id} from state_snapshots")
+        except Exception as _ss_e:
+            logger.debug(f"[Sync] seal-time snapshot restore failed: {_ss_e}")
 
     async def _live_mazes(self) -> list:
         """Interpretation A: 'live' = MinerMazeRepo.get_eligible chain state,
@@ -17607,6 +18352,7 @@ class MicroCoreNode:
             # without this the miner stays one miss from an instant re-ban.
             existing['consecutive_misses'] = 0
             await self.miner_repo.update(existing)
+            self.miners[miner_id] = existing
             logger.info(f"[MINER] Reactivated existing miner {miner_id[:16]}")
             return True
         message = f"{miner_id}{wallet}{timestamp}"
@@ -19437,6 +20183,32 @@ class MicroCoreNode:
                 _post_root = await _compute_full_state_root(self.db, self, int(block['id']))
                 if _post_root != block.get('state_root'):
                     raise AuxStateError(f"state_root of block {block.get('id')} does not match post-apply state")
+                # R21: the post-check just proved this snapshot's
+                # root matches the block's state_root — and this
+                # runs BEFORE the attestation upsert below, so
+                # the snapshot is the seal-time view (mazeatt
+                # last_block = H-1). Cache it and persist it so
+                # this node can serve snapshots for the tip.
+                # Best-effort: a failure here must never fail
+                # the block import (the post-check already passed).
+                try:
+                    _seal_snap = await _state_snapshot_for_block(self.db, self, int(block['id']))
+                    _seal_root = _state_root_from_snapshot(_seal_snap)
+                    if _seal_root == str(block.get('state_root', '')):
+                        self._sealed_snapshot = {"height": int(block['id']), "tip_hash": str(block.get('hash', '')), "state_root": str(block.get('state_root', '')), "snapshot": copy.deepcopy(_seal_snap)}
+                        _seal_data = json.dumps(_seal_snap, sort_keys=True) if _seal_snap else "{}"
+                        if self.db.db_type == "sqlite":
+                            await self.db.execute_dml("INSERT OR REPLACE INTO state_snapshots (block_id,state_root,receipt_root,snapshot_data,created_at) VALUES (?,?,?,?,?)", int(block['id']), str(block.get('state_root', '')), "0x" + "00" * 32, _seal_data, int(time.time()))
+                        else:
+                            await self.db.execute_dml("INSERT INTO state_snapshots (block_id,state_root,receipt_root,snapshot_data,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (block_id) DO UPDATE SET state_root=$2,snapshot_data=$4", int(block['id']), str(block.get('state_root', '')), "0x" + "00" * 32, _seal_data, int(time.time()))
+                        if self.db.db_type == "sqlite":
+                            await self.db.execute_dml("DELETE FROM state_snapshots WHERE block_id < ?", int(block['id']))
+                        else:
+                            await self.db.execute_dml("DELETE FROM state_snapshots WHERE block_id < $1", int(block['id']))
+                    else:
+                        logger.warning(f"[Sync] Seal-time snapshot for block {block.get('id')} root mismatch ({_seal_root[:16]}... != {str(block.get('state_root', ''))[:16]}...) — not cached")
+                except Exception as _se:
+                    logger.warning(f"[Sync] Seal-time snapshot cache for block {block.get('id')} failed: {_se}")
             # must do the same (see the deferral comment above). The root is
             if _pending_svf_epoch_root is not None:
                 _pe, _pr = _pending_svf_epoch_root
@@ -20498,7 +21270,17 @@ class MicroCoreNode:
         async def websocket_handler(request):
             ws = WebSocketResponse(heartbeat=60)
             await ws.prepare(request)
-            client_ip = request.remote
+            # R21: real client IP behind a Cloudflare Tunnel —
+            # request.remote is the tunnel/proxy IP for every
+            # miner, so use the forwarding headers Cloudflare
+            # sets (CF-Connecting-IP first, then X-Real-IP,
+            # then the first X-Forwarded-For entry).
+            client_ip = (
+                request.headers.get("CF-Connecting-IP")
+                or request.headers.get("X-Real-IP")
+                or (request.headers.get("X-Forwarded-For", "").split(",")[0].strip())
+                or request.remote
+            )
             # AUDIT-L2: bound concurrent WS connections (global + per-IP).
             if len(self.ws_sessions) >= WS_MAX_CONNECTIONS:
                 logger.warning(f"[WS] Connection from {client_ip} refused: max WS connections ({WS_MAX_CONNECTIONS}) reached")
@@ -20543,8 +21325,34 @@ class MicroCoreNode:
                             # they count against the per-IP limiter.
                             _rate_exempt = msg_type in ("maze_move", "wall_hit_solve", "block_signed", "memory_challenge_response")
                             if not _rate_exempt:
-                                allowed = await self.rate_limiter.is_allowed(client_ip)
+                                # POLISH-1: key the limiter by the session's
+                                # AUTHENTICATED miner_id when the session has
+                                # one. session["authenticated"] is set only
+                                # after register_miner verified the signature
+                                # AND the memory-challenge commitment, so the
+                                # id is signature-bound, not merely claimed
+                                # in the message. Unauthenticated sessions
+                                # stay keyed by client_ip. The 60/60 s budget
+                                # is unchanged — only the key moves, so miners
+                                # behind one proxy/NAT no longer share one
+                                # bucket, and a spammer still hits their own
+                                # per-miner bucket. The "miner:" prefix can
+                                # never collide with an IP key.
+                                _rl_key = client_ip
+                                if session and session.get("authenticated") and session.get("miner_id"):
+                                    _rl_key = "miner:" + str(session["miner_id"])
+                                allowed = await self.rate_limiter.is_allowed(_rl_key)
                                 if not allowed:
+                                    # POLISH-2: throttled refusal log (once
+                                    # per 60 s per key, with the count since
+                                    # the last log line).
+                                    _rl_entry = self._ws_rate_limit_log.setdefault(_rl_key, [0.0, 0])
+                                    _rl_entry[1] += 1
+                                    _rl_now = time.time()
+                                    if _rl_now - _rl_entry[0] >= 60.0:
+                                        logger.warning(f"[WS] Rate limit exceeded for {_rl_key} ({_rl_entry[1]} refusals in the last 60 s)")
+                                        _rl_entry[0] = _rl_now
+                                        _rl_entry[1] = 0
                                     await ws.send_json({"type": "error", "message": "Rate limit exceeded"})
                                     continue
                             await self._handle_ws_message(ws, data, client_ip)

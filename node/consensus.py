@@ -1651,13 +1651,21 @@ class PoSWConsensus:
             await self.node.distribute_token_mining_rewards(block_id)
             if block_id % self.epoch_length == 0:
                 await self._create_finality_checkpoint(block_id, self.node.last_hash)
-            if block_id % maze.SNAPSHOT_INTERVAL == 0 and block_id > 0:
+            if block_id > 0:
                 try:
-                    snapshot_data = bootstrap.json.dumps(snapshot_dirty, sort_keys=True) if snapshot_dirty else '{}'
+                    self.node._sealed_snapshot = {'height': block_id, 'tip_hash': str(block['hash']), 'state_root': str(state_root), 'snapshot': bootstrap.copy.deepcopy(_full_snap)}
+                except Exception:
+                    self.node._sealed_snapshot = None
+                try:
+                    snapshot_data = bootstrap.json.dumps(_full_snap, sort_keys=True) if _full_snap else '{}'
                     if self.db.db_type == 'sqlite':
                         await self.db.execute_dml('INSERT OR REPLACE INTO state_snapshots (block_id,state_root,receipt_root,snapshot_data,created_at) VALUES (?,?,?,?,?)', block_id, state_root, '0x' + '00' * 32, snapshot_data, int(bootstrap.time.time()))
                     else:
                         await self.db.execute_dml('INSERT INTO state_snapshots (block_id,state_root,receipt_root,snapshot_data,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (block_id) DO UPDATE SET state_root=$2,snapshot_data=$4', block_id, state_root, '0x' + '00' * 32, snapshot_data, int(bootstrap.time.time()))
+                    if self.db.db_type == 'sqlite':
+                        await self.db.execute_dml('DELETE FROM state_snapshots WHERE block_id < ?', block_id)
+                    else:
+                        await self.db.execute_dml('DELETE FROM state_snapshots WHERE block_id < $1', block_id)
                     bootstrap.logger.info(f'[PoSW] State snapshot saved at block {block_id}')
                 except Exception as e:
                     bootstrap.logger.warning(f'[PoSW] Failed to save snapshot at block {block_id}: {e}')

@@ -4,7 +4,10 @@ import crypto
 import util
 import maze
 import svf_keys
+import svf
 import genesis
+import db
+import db as _db
 import repos
 try:
     from kademlia.network import Server
@@ -375,6 +378,13 @@ class P2PNode:
         self.banned_peers: bootstrap.Dict[str, float] = {}
         self.banned_node_ids: bootstrap.Dict[str, float] = {}
         self._pending_checkpoint_requests: bootstrap.Dict[str, bootstrap.asyncio.Future] = {}
+        self._pending_snapshot_requests: bootstrap.Dict[str, bootstrap.asyncio.Future] = {}
+        self._pending_snapshot_history: bootstrap.Dict[str, bootstrap.Tuple[int, int, bootstrap.asyncio.Future]] = {}
+        self._pending_tip_requests: bootstrap.Dict[str, bootstrap.asyncio.Future] = {}
+        self._snapshot_cache = None
+        self._snapshot_last_attempt = 0.0
+        self._snapshot_sync_running = False
+        self._snapshot_consec_failures = 0
         self._lock = bootstrap.asyncio.Lock()
         self._server = None
         self._dht_server = None
@@ -386,7 +396,7 @@ class P2PNode:
         self.score_decay_interval = 3600
         self.max_positive_score = 100
         self.min_score_for_ban = -config.BAN_THRESHOLD
-        self.rate_limits = {config.MSG_PING: (30, 60), config.MSG_GET_PEERS: (10, 60), config.MSG_GET_BLOCKS: (60, 60), config.MSG_GET_STATUS: (30, 60), config.MSG_GET_CHECKPOINT: (10, 60), config.MSG_NEW_BLOCK: (100, 60), config.MSG_NEW_TX: (200, 60), config.MSG_NEW_MOVE: (1200, 60)}
+        self.rate_limits = {config.MSG_PING: (30, 60), config.MSG_GET_PEERS: (10, 60), config.MSG_GET_BLOCKS: (60, 60), config.MSG_GET_STATUS: (30, 60), config.MSG_GET_CHECKPOINT: (10, 60), config.MSG_GET_SNAPSHOT: (5, 60), config.MSG_NEW_BLOCK: (100, 60), config.MSG_NEW_TX: (200, 60), config.MSG_NEW_MOVE: (1200, 60)}
         self.peer_message_counts: bootstrap.Dict[str, bootstrap.Dict[int, bootstrap.List[float]]] = {}
         self._seen_block_hashes: bootstrap.OrderedDict = bootstrap.OrderedDict()
         self._seen_tx_hashes: bootstrap.OrderedDict = bootstrap.OrderedDict()
@@ -439,6 +449,7 @@ class P2PNode:
         self.registry_interval = max(60, int(p2p_cfg.get('registry_interval', 300) or 300))
         self._registry_last_fetch = 0.0
         self._registry_cached_peers = []
+        self._registry_tunnel_peers = []
         self.fallback_nodes = list(p2p_cfg.get('fallback_nodes', []))
         self.dht_port = int(p2p_cfg.get('dht_port', config.DHT_PORT))
         self.allow_private_peers = config._strict_bool('p2p.allow_private_peers', p2p_cfg.get('allow_private_peers', False))
@@ -771,7 +782,25 @@ class P2PNode:
                 try:
                     req = bootstrap.json.loads(data.decode())
                     blocks = req.get('blocks', [])
-                    await self.node.import_blocks(blocks)
+                    hist_entry = self._pending_snapshot_history.get(peer.address)
+                    hist_fut = None
+                    if hist_entry is not None:
+                        hist_start, hist_end, hist_fut = hist_entry
+                        if hist_fut.done():
+                            hist_fut = None
+                        elif not blocks:
+                            hist_fut = None
+                        else:
+                            try:
+                                _ids = [int(b['id']) for b in blocks if isinstance(b, dict) and 'id' in b]
+                            except Exception:
+                                _ids = []
+                            if not _ids or min(_ids) < hist_start or max(_ids) > hist_end:
+                                hist_fut = None
+                    if hist_fut is not None:
+                        hist_fut.set_result(blocks)
+                    else:
+                        await self.node.import_blocks(blocks)
                     if blocks:
                         try:
                             peer.height = max(peer.height, self._bound_peer_height(int(blocks[-1].get('id', 0)) + 1))
@@ -844,10 +873,65 @@ class P2PNode:
                     peer.height = max(peer.height, self._bound_peer_height(new_h))
                     peer.version = status.get('version', 'unknown')
                     bootstrap.logger.debug(f'[P2P] Peer {peer.address} status: height={peer.height}, version={peer.version}')
+                    fut = self._pending_tip_requests.get(peer.address)
+                    if fut and (not fut.done()):
+                        fut.set_result({'height': new_h, 'last_hash': status.get('last_hash', ''), 'version': peer.version})
                     if peer.height > self.node.height:
                         bootstrap.asyncio.create_task(self.sync_with_peers())
                 except Exception as e:
                     bootstrap.logger.debug(f'[P2P] Error handling MSG_STATUS from {peer.address}: {e}')
+            elif msg_type == config.MSG_GET_SNAPSHOT:
+                try:
+                    latest = await self.node.block_repo.get_latest()
+                    if latest is None:
+                        bootstrap.logger.warning('[Sync] Snapshot requested but this node has no blocks yet')
+                    else:
+                        tip_id = int(latest['id'])
+                        tip_hash = str(latest.get('hash', ''))
+                        payload = None
+                        if self._snapshot_cache and self._snapshot_cache[0] == tip_id and (self._snapshot_cache[1] == tip_hash):
+                            payload = self._snapshot_cache[2]
+                            bootstrap.logger.debug(f'[Sync] Serving cached snapshot at height {tip_id}')
+                        if payload is None:
+                            async with await self.node.db.transaction():
+                                latest2 = await self.node.block_repo.get_latest()
+                                if latest2 is None:
+                                    raise RuntimeError('no tip block')
+                                tip2 = int(latest2['id'])
+                                snapshot = None
+                                _sealed = getattr(self.node, '_sealed_snapshot', None)
+                                if isinstance(_sealed, dict) and int(_sealed.get('height', -1)) == tip2 and (str(_sealed.get('state_root', '')) == str(latest2.get('state_root', ''))):
+                                    snapshot = _sealed.get('snapshot')
+                                if snapshot is None:
+                                    try:
+                                        _row = await self.node.db.fetchrow('SELECT state_root, snapshot_data FROM state_snapshots WHERE block_id = ?' if self.node.db.db_type == 'sqlite' else 'SELECT state_root, snapshot_data FROM state_snapshots WHERE block_id = $1', tip2)
+                                    except Exception:
+                                        _row = None
+                                    if _row is not None and str(_row.get('state_root', '')) == str(latest2.get('state_root', '')):
+                                        try:
+                                            snapshot = bootstrap.json.loads(_row.get('snapshot_data') or '{}')
+                                        except Exception:
+                                            snapshot = None
+                                root = db._state_root_from_snapshot(snapshot) if snapshot is not None else ''
+                                if snapshot is None:
+                                    bootstrap.logger.warning(f'[Sync] Snapshot at height {tip2}: no cached seal-time snapshot for the tip — refusing to serve')
+                                elif root != str(latest2.get('state_root', '')):
+                                    bootstrap.logger.warning(f'[Sync] Snapshot at height {tip2}: cached root {root[:16]}... != tip state_root {str(latest2.get('state_root', ''))[:16]}... — refusing to serve')
+                                else:
+                                    genesis_row = await self.node.block_repo.get_by_id(0)
+                                    genesis_hash = genesis_row['hash'] if genesis_row else getattr(self.node, 'genesis_hash', '') or ''
+                                    resp = {'height': tip2, 'genesis_hash': genesis_hash, 'state_root': root, 'snapshot': snapshot, 'tip_block': latest2}
+                                    payload = bootstrap.json.dumps(resp).encode()
+                                    if len(payload) >= 4000000:
+                                        bootstrap.logger.warning(f'[Sync] Snapshot at height {tip2} is {len(payload)} bytes — over the 4MB P2P limit, refusing to send')
+                                        payload = None
+                                    else:
+                                        self._snapshot_cache = (tip2, str(latest2.get('hash', '')), payload)
+                                        bootstrap.logger.info(f'[Sync] Served seal-time snapshot at height {tip2}: {len(payload)} bytes, state_root={root[:16]}...')
+                        if payload is not None:
+                            await self._send_message(peer, config.MSG_SNAPSHOT, payload)
+                except Exception as e:
+                    bootstrap.logger.warning(f'[Sync] Snapshot build failed for {peer.address}: {e}')
             elif msg_type == config.MSG_GET_CHECKPOINT:
                 checkpoint = await self.node.finality_repo.get_latest()
                 resp = {'block_id': checkpoint['block_id'] if checkpoint else 0, 'hash': checkpoint['hash'] if checkpoint else self.node.blocks[0]['hash'] if self.node.blocks else '', 'epoch': checkpoint['epoch'] if checkpoint else 0}
@@ -860,6 +944,14 @@ class P2PNode:
                         fut.set_result(resp)
                 except Exception as e:
                     bootstrap.logger.debug(f'[P2P] MSG_CHECKPOINT error from {peer.address}: {e}')
+            elif msg_type == config.MSG_SNAPSHOT:
+                try:
+                    resp = bootstrap.json.loads(data.decode())
+                    fut = self._pending_snapshot_requests.get(peer.address)
+                    if fut and (not fut.done()):
+                        fut.set_result(resp)
+                except Exception as e:
+                    bootstrap.logger.debug(f'[P2P] MSG_SNAPSHOT error from {peer.address}: {e}')
             elif msg_type == config.MSG_BAN:
                 try:
                     req = bootstrap.json.loads(data.decode())
@@ -953,9 +1045,9 @@ class P2PNode:
 
     @staticmethod
     def _msg_priority(msg_type: int) -> int:
-        if msg_type in (config.MSG_BLOCKS, config.MSG_NEW_BLOCK, config.MSG_CHECKPOINT, config.MSG_GET_CHECKPOINT):
+        if msg_type in (config.MSG_BLOCKS, config.MSG_NEW_BLOCK, config.MSG_CHECKPOINT, config.MSG_GET_CHECKPOINT, config.MSG_SNAPSHOT):
             return 0
-        if msg_type in (config.MSG_PING, config.MSG_PONG, config.MSG_STATUS, config.MSG_GET_STATUS):
+        if msg_type in (config.MSG_PING, config.MSG_PONG, config.MSG_STATUS, config.MSG_GET_STATUS, config.MSG_GET_SNAPSHOT):
             return 1
         if msg_type in (config.MSG_NEW_TX, config.MSG_GET_BLOCKS):
             return 2
@@ -1557,9 +1649,17 @@ class P2PNode:
             bootstrap.logger.debug(f'[REGISTRY] fetch failed: {e}')
             return []
         endpoints = []
+        tunnel_peers = []
         if isinstance(data, dict) and isinstance(data.get('nodes'), list):
             for n in data['nodes']:
                 if not isinstance(n, dict):
+                    continue
+                if n.get('tunnel'):
+                    host = str(n.get('host') or '').strip().lower()
+                    ws_url = str(n.get('ws_url') or '').strip()
+                    if host:
+                        tunnel_peers.append({'host': host, 'ws_url': ws_url})
+                        bootstrap.logger.info(f'[REGISTRY] tunnel peer {host} (WS-only, not P2P-dialled)')
                     continue
                 p2p = n.get('p2p') or ''
                 host, port = parse_ip_port(str(p2p), config.P2P_PORT)
@@ -1568,11 +1668,25 @@ class P2PNode:
                 try:
                     ip = bootstrap.ipaddress.ip_address(host)
                 except ValueError:
-                    continue
+                    try:
+                        resolved = bootstrap.socket.gethostbyname(host)
+                    except Exception:
+                        continue
+                    try:
+                        ip = bootstrap.ipaddress.ip_address(resolved)
+                    except ValueError:
+                        continue
+                    host = resolved
                 if not self.allow_private_peers and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast):
                     continue
                 endpoints.append(f'{host}:{port}' if ':' not in str(host) else f'[{host}]:{port}')
-        return list(dict.fromkeys(endpoints))
+        _seen = set()
+        _deduped = []
+        for _tp in tunnel_peers:
+            if _tp['host'] not in _seen:
+                _seen.add(_tp['host'])
+                _deduped.append(_tp)
+        return (list(dict.fromkeys(endpoints)), _deduped)
 
     async def _fetch_registry_peers(self):
         if not self.registry_enabled or not self.registry_url:
@@ -1583,11 +1697,13 @@ class P2PNode:
         self._registry_last_fetch = now
         try:
             loop = bootstrap.asyncio.get_running_loop()
-            peers = await loop.run_in_executor(None, self._fetch_registry_peers_sync)
+            peers, tunnel_peers = await loop.run_in_executor(None, self._fetch_registry_peers_sync)
         except Exception as e:
             bootstrap.logger.debug(f'[REGISTRY] fetch failed: {e}')
             return list(self._registry_cached_peers)
         self._registry_cached_peers = list(peers)
+        self._registry_tunnel_peers = list(tunnel_peers)
+        bootstrap.logger.debug(f'[REGISTRY] tunnel peers: {[t.get('host', '') for t in tunnel_peers]}')
         return list(peers)
 
     async def _resolve_dns_seeds(self) -> bootstrap.List[str]:
@@ -1759,6 +1875,391 @@ class P2PNode:
                 except Exception:
                     pass
 
+    async def _request_snapshot(self, peer: EncryptedPeer, timeout: float=maze.SNAPSHOT_REQUEST_TIMEOUT) -> bootstrap.Optional[bootstrap.Dict]:
+        loop = bootstrap.asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending_snapshot_requests[peer.address] = fut
+        try:
+            await self._send_message(peer, config.MSG_GET_SNAPSHOT, b'')
+            await bootstrap.asyncio.wait({fut}, timeout=timeout)
+        except Exception as e:
+            bootstrap.logger.warning(f'[Sync] Snapshot request to {peer.address} failed: {e}')
+            return None
+        finally:
+            self._pending_snapshot_requests.pop(peer.address, None)
+        if fut.done() and (not fut.cancelled()) and (not fut.exception()):
+            return fut.result()
+        bootstrap.logger.warning(f'[Sync] Snapshot request to {peer.address} timed out after {timeout}s')
+        return None
+
+    async def _request_tip_quorum(self, peers: bootstrap.List[EncryptedPeer], timeout: float=5.0) -> bootstrap.Optional[bootstrap.Dict]:
+        if not peers:
+            return None
+        loop = bootstrap.asyncio.get_running_loop()
+        futures = {}
+        for p in peers:
+            fut = loop.create_future()
+            self._pending_tip_requests[p.address] = fut
+            futures[p.address] = fut
+        try:
+            for p in peers:
+                try:
+                    await self._send_message(p, config.MSG_GET_STATUS, b'')
+                except Exception as e:
+                    bootstrap.logger.debug(f'[Sync] Tip request to {p.address} failed: {e}')
+            await bootstrap.asyncio.wait(set(futures.values()), timeout=timeout)
+        except Exception as e:
+            bootstrap.logger.debug(f'[Sync] Tip quorum error: {e}')
+        finally:
+            for addr in futures:
+                self._pending_tip_requests.pop(addr, None)
+        votes = {}
+        for addr, fut in futures.items():
+            if fut.done() and (not fut.cancelled()) and (not fut.exception()):
+                r = fut.result()
+                h = int(r.get('height', 0))
+                if h > 0:
+                    key = (h - 1, str(r.get('last_hash', '')))
+                    votes[key] = votes.get(key, 0) + 1
+        if not votes:
+            return None
+        if len(peers) == 1:
+            (bid, hsh), _c = next(iter(votes.items()))
+            bootstrap.logger.warning('[Sync] Only one peer available for tip cross-check — using its tip with a warning')
+            return {'block_id': bid, 'hash': hsh}
+        for (bid, hsh), count in votes.items():
+            if count * 2 > len(peers):
+                return {'block_id': bid, 'hash': hsh}
+        bootstrap.logger.warning(f'[Sync] Tip cross-check: no majority among {len(peers)} peers (votes={votes})')
+        return None
+
+    async def _fetch_snapshot_history(self, H: int, tip: bootstrap.Dict, peer: EncryptedPeer) -> bootstrap.Optional[bootstrap.List[bootstrap.Dict]]:
+        start = max(1, H - maze.SNAPSHOT_WINDOW + 1)
+        end = H - 1
+        if end < start:
+            return []
+        missing = []
+        for bid in range(start, end + 1):
+            row = await self.node.block_repo.get_by_id(bid)
+            if row is None:
+                missing.append(bid)
+        if not missing:
+            return []
+        ranges = []
+        r0 = missing[0]
+        r1 = missing[0]
+        for bid in missing[1:]:
+            if bid == r1 + 1:
+                r1 = bid
+            else:
+                ranges.append((r0, r1))
+                r0 = bid
+                r1 = bid
+        ranges.append((r0, r1))
+        fetched = {}
+        for s, e in ranges:
+            cur = s
+            while cur <= e:
+                chunk_end = min(e, cur + 49)
+                loop = bootstrap.asyncio.get_running_loop()
+                fut = loop.create_future()
+                self._pending_snapshot_history[peer.address] = (cur, chunk_end, fut)
+                try:
+                    payload = bootstrap.json.dumps({'start': cur, 'end': chunk_end}).encode()
+                    await self._send_message(peer, config.MSG_GET_BLOCKS, payload)
+                    await bootstrap.asyncio.wait({fut}, timeout=maze.SNAPSHOT_REQUEST_TIMEOUT)
+                except Exception as ex:
+                    bootstrap.logger.warning(f'[Sync] Snapshot history fetch [{cur},{chunk_end}] from {peer.address} failed: {ex}')
+                    return None
+                finally:
+                    self._pending_snapshot_history.pop(peer.address, None)
+                if not (fut.done() and (not fut.cancelled()) and (not fut.exception())):
+                    bootstrap.logger.warning(f'[Sync] Snapshot history fetch [{cur},{chunk_end}] from {peer.address} timed out')
+                    return None
+                blocks = fut.result() or []
+                for b in blocks:
+                    if isinstance(b, dict) and 'id' in b:
+                        try:
+                            _bid = int(b['id'])
+                        except Exception:
+                            bootstrap.logger.warning(f'[Sync] Snapshot history fetch [{cur},{chunk_end}] from {peer.address} got a block with a bad id — rejecting snapshot')
+                            return None
+                        if _bid < cur or _bid > chunk_end:
+                            bootstrap.logger.warning(f'[Sync] Snapshot history fetch [{cur},{chunk_end}] from {peer.address} got out-of-range block {_bid} — rejecting snapshot')
+                            return None
+                for b in blocks:
+                    if isinstance(b, dict) and 'id' in b:
+                        fetched[int(b['id'])] = b
+                cur = chunk_end + 1
+        got = [fetched[i] for i in sorted(fetched.keys()) if start <= i <= end]
+        for b in got:
+            try:
+                if b.get('hash') != crypto.calculate_block_hash(b):
+                    bootstrap.logger.warning(f'[Sync] Snapshot history: block {b.get('id')} hash mismatch — rejecting snapshot')
+                    return None
+            except Exception as ex:
+                bootstrap.logger.warning(f'[Sync] Snapshot history: block {b.get('id')} hash check failed ({ex}) — rejecting snapshot')
+                return None
+        by_id = {int(b['id']): b for b in got}
+        for bid in sorted(by_id.keys()):
+            if bid == start:
+                continue
+            b = by_id[bid]
+            prev = by_id.get(bid - 1)
+            if prev is None:
+                prev = await self.node.block_repo.get_by_id(bid - 1)
+            if prev is None:
+                bootstrap.logger.warning(f'[Sync] Snapshot history: block {bid} has no predecessor — rejecting snapshot')
+                return None
+            if b.get('phash') != prev.get('hash'):
+                bootstrap.logger.warning(f'[Sync] Snapshot history: block {bid} phash does not match block {bid - 1} hash — rejecting snapshot')
+                return None
+        prev_tip = by_id.get(H - 1)
+        if prev_tip is None:
+            prev_tip = await self.node.block_repo.get_by_id(H - 1)
+        if prev_tip is not None and tip.get('phash') != prev_tip.get('hash'):
+            bootstrap.logger.warning('[Sync] Snapshot history: tip phash does not match block H-1 hash — rejecting snapshot')
+            return None
+        return got
+
+    async def _load_state_snapshot(self, snapshot: bootstrap.Dict, height: int) -> bool:
+        db = self.node.db
+        now = int(bootstrap.time.time())
+        bals = {}
+        toks = {}
+        cst = {}
+        cst2 = {}
+        htlcs = {}
+        mazes = {}
+        tokis = {}
+        convs = {}
+        mazeatts = {}
+        svfregs = {}
+        svfepochs = {}
+        svfcerts = {}
+        for k, v in snapshot.items():
+            if k.startswith('bal:'):
+                bals[k[4:]] = v
+            elif k.startswith('tok:'):
+                rest = k[4:]
+                t, _, w = rest.partition(':')
+                toks[t, w] = v
+            elif k.startswith('cst:'):
+                rest = k[4:]
+                c, _, kk = rest.partition(':')
+                cst[c, kk] = v
+            elif k.startswith('cst2:'):
+                rest = k[5:]
+                c, _, kk = rest.partition(':')
+                cst2[c, kk] = v
+            elif k.startswith('htlc:'):
+                htlcs[k[5:]] = v
+            elif k.startswith('maze:'):
+                mazes[k[5:]] = v
+            elif k.startswith('toki:'):
+                tokis[k[5:]] = v
+            elif k.startswith('conv:'):
+                convs[k[5:]] = v
+            elif k.startswith('mazeatt:'):
+                mazeatts[k[8:]] = v
+            elif k.startswith('svfreg:'):
+                svfregs[k[7:]] = v
+            elif k.startswith('svfepoch:'):
+                svfepochs[k[9:]] = v
+            elif k.startswith('svfcert:'):
+                svfcerts[k[8:]] = v
+            elif k.startswith('height:'):
+                pass
+            else:
+                bootstrap.logger.warning(f'[Sync] Snapshot load: unknown snapshot key {str(k)[:32]} — ignoring')
+
+        def _ins(table, cols):
+            n = len(cols)
+            if db.db_type == 'sqlite':
+                ph = ', '.join(['?'] * n)
+            else:
+                ph = ', '.join(('$%d' % (i + 1) for i in range(n)))
+            return 'INSERT INTO %s (%s) VALUES (%s)' % (table, ', '.join(cols), ph)
+        try:
+            async with await db.transaction():
+                await db.execute_dml('DELETE FROM balances')
+                for wallet, bal in bals.items():
+                    await db.execute_dml(_ins('balances', ['wallet', 'bal']), wallet, int(bal))
+                await db.execute_dml('DELETE FROM token_balances')
+                for (t, w), bal in toks.items():
+                    await db.execute_dml(_ins('token_balances', ['token_address', 'wallet', 'balance']), t, w, int(bal))
+                await db.execute_dml('DELETE FROM contract_state')
+                for (c, kk), val in cst.items():
+                    await db.execute_dml(_ins('contract_state', ['contract_address', 'key', 'value']), c, kk, str(val))
+                await db.execute_dml('DELETE FROM contract_storage_v2')
+                for (c, kk), val in cst2.items():
+                    await db.execute_dml(_ins('contract_storage_v2', ['contract_address', 'key', 'value']), c, kk, str(val))
+                await db.execute_dml('DELETE FROM htlc_contracts')
+                for hid, h in htlcs.items():
+                    await db.execute_dml(_ins('htlc_contracts', ['id', 'sender', 'receiver', 'hashlock', 'timelock', 'amount', 'token_address', 'status', 'created_at', 'claimed_at', 'refunded_at']), hid, h.get('sender', ''), h.get('receiver', ''), h.get('hashlock', ''), int(h.get('timelock', 0)), int(h.get('amount', 0)), h.get('token_address', ''), h.get('status', ''), now, None, None)
+                await db.execute_dml('DELETE FROM tokens')
+                for addr, t in tokis.items():
+                    await db.execute_dml(_ins('tokens', ['address', 'name', 'symbol', 'owner', 'total_supply', 'decimals', 'created_at', 'fee_paid', 'mintable', 'burnable', 'mining_type', 'mining_reward', 'mining_interval', 'mining_difficulty', 'stake_threshold', 'last_mined_block', 'total_mined', 'max_mineable_supply']), addr, t.get('name', ''), t.get('symbol', ''), t.get('owner', ''), int(t.get('total_supply', 0)), int(t.get('decimals', 0)), now, 0, int(t.get('mintable', 0)), int(t.get('burnable', 0)), t.get('mining_type', ''), int(t.get('mining_reward', 0)), int(t.get('mining_interval', 0)), int(t.get('mining_difficulty', 0)), int(t.get('stake_threshold', 0)), int(t.get('last_mined_block', 0)), int(t.get('total_mined', 0)), int(t.get('max_mineable_supply', 0)))
+                await db.execute_dml('DELETE FROM contract_v2')
+                for addr, c in convs.items():
+                    await db.execute_dml(_ins('contract_v2', ['address', 'owner', 'bytecode', 'abi', 'created_at', 'tx_hash', 'storage_root', 'code_hash']), addr, c.get('owner', ''), '', '{}', now, '', '', c.get('code_hash', ''))
+                await db.execute_dml('DELETE FROM maze_attestations')
+                for mid, a in mazeatts.items():
+                    await db.execute_dml(_ins('maze_attestations', ['maze_id', 'last_size', 'last_block', 'last_block_hash', 'pubkey']), mid, int(a.get('last_size', 5)), int(a.get('last_block', 0)), a.get('last_block_hash', ''), a.get('pubkey', ''))
+                await db.execute_dml('DELETE FROM minermazes')
+                maze_cols = ['maze_id', 'minerid', 'size', 'walldensityppm', 'seed', 'posx', 'posy', 'posz', 'goalx', 'goaly', 'goalz', 'movenonce', 'consecutivewallhits', 'turbulenceppm', 'growthcount', 'knowledge', 'lastgoalheight', 'lastactiveheight', 'mazeroot', 'invitedguest', 'guestlock', 'lastknowledgeheight', 'createdat', 'updatedat', 'ghostx', 'ghosty', 'ghostz']
+                for mid, m in mazes.items():
+                    att = mazeatts.get(mid, {})
+                    size = int(att.get('last_size', 5)) if att else 5
+                    await db.execute_dml(_ins('minermazes', maze_cols), mid, m.get('minerid', ''), size, int(m.get('walldensityppm', 0)), str(m.get('seed', '')), 0, 0, 0, int(m.get('goalx', 0)), int(m.get('goaly', 0)), int(m.get('goalz', 0)), 0, 0, 0, 0, 0, 0, height, '', '', '', 0, now, now, 0, 0, 0)
+                await db.execute_dml('DELETE FROM svf_profiles')
+                for tok, reg in svfregs.items():
+                    profile = {'schema_version': svf.SVF_PROFILE_SCHEMA_VERSION, 'family_id': svf.SVF_PROFILE_FAMILY_ID, 'sample_blocks': int(reg.get('sample_blocks', 0)), 'min_distinct_winners': int(reg.get('min_distinct_winners', 0)), 'min_growth_blocks': int(reg.get('min_growth_blocks', 0)), 'min_total_attestation_weight': int(reg.get('min_total_attestation_weight', 0))}
+                    canonical = svf.svf_profile_bytes(profile)
+                    phash = reg.get('profile_hash', '')
+                    await db.execute_dml(_ins('svf_profiles', ['token_address', 'chain_id', 'runtime_code_hash', 'template_id', 'profile_schema_version', 'canonical_profile_bytes', 'profile_hash', 'registrant', 'registration_tx_hash', 'registration_block_height', 'effective_epoch', 'status']), tok, int(reg.get('chain_id', config.CHAIN_ID)), '', '', svf.SVF_PROFILE_SCHEMA_VERSION, canonical.hex(), phash, '', '', 0, 0, 'ACTIVE')
+                await db.execute_dml('DELETE FROM svf_epoch_roots')
+                for epoch_id, e in svfepochs.items():
+                    await db.execute_dml(_ins('svf_epoch_roots', ['epoch_id', 'root_hash', 'record_count', 'complete']), int(epoch_id), e.get('root_hash', ''), int(e.get('record_count', 0)), 1 if int(e.get('record_count', 0)) == svf.SVF_EPOCH_BLOCKS else 0)
+                await db.execute_dml('DELETE FROM svf_certificates')
+                for epoch_id, c in svfcerts.items():
+                    ep = int(epoch_id)
+                    ws = ep * svf.SVF_EPOCH_BLOCKS
+                    await db.execute_dml(_ins('svf_certificates', ['evidence_epoch', 'chain_id', 'committee_epoch', 'window_start_height', 'window_end_height', 'anchor_block_hash', 'evidence_root', 'group_public_key_id', 'threshold_signature', 'inclusion_block', 'usable_from']), ep, config.CHAIN_ID, svf_keys.SVF_COMMITTEE_EPOCH, ws, ws + svf.SVF_EPOCH_BLOCKS - 1, c.get('anchor_block_hash', ''), c.get('evidence_root', ''), '', '', int(c.get('inclusion_block', 0)), int(c.get('usable_from', 0)))
+                if db.db_type == 'sqlite':
+                    await db.execute_dml('INSERT OR REPLACE INTO state_snapshots (block_id, state_root, receipt_root, snapshot_data, created_at) VALUES (?, ?, ?, ?, ?)', height, _db._state_root_from_snapshot(snapshot), '', bootstrap.json.dumps(snapshot), now)
+                else:
+                    await db.execute_dml('INSERT INTO state_snapshots (block_id, state_root, receipt_root, snapshot_data, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (block_id) DO UPDATE SET state_root = EXCLUDED.state_root, receipt_root = EXCLUDED.receipt_root, snapshot_data = EXCLUDED.snapshot_data, created_at = EXCLUDED.created_at', height, _db._state_root_from_snapshot(snapshot), '', bootstrap.json.dumps(snapshot), now)
+            return True
+        except Exception as e:
+            bootstrap.logger.warning(f'[Sync] Snapshot state load failed at height {height}: {e}')
+            return False
+
+    async def _verify_snapshot_response(self, resp: bootstrap.Dict, peer_list: bootstrap.List[EncryptedPeer]) -> bootstrap.Optional[str]:
+        if not isinstance(resp, dict):
+            return 'response is not a dict'
+        H = resp.get('height')
+        snapshot = resp.get('snapshot')
+        tip = resp.get('tip_block')
+        genesis_hash = str(resp.get('genesis_hash') or '')
+        state_root = str(resp.get('state_root') or '')
+        if not isinstance(H, int) or H < 0:
+            return 'bad height in snapshot response'
+        if not isinstance(snapshot, dict) or not isinstance(tip, dict):
+            return 'snapshot or tip_block missing'
+        if int(tip.get('id', -1)) != H:
+            return f'tip block id {tip.get('id')} != snapshot height {H}'
+        try:
+            recomputed = db._state_root_from_snapshot(snapshot)
+        except Exception as e:
+            return f'snapshot root recompute failed: {e}'
+        if recomputed != state_root or recomputed != str(tip.get('state_root', '')):
+            return 'snapshot state root does not match tip block state_root'
+        if not genesis_hash or len(genesis_hash) != 64:
+            return 'genesis_hash missing or not 64 hex chars'
+        pinned = getattr(self.node, 'genesis_hash', '') or ''
+        if pinned and pinned != genesis_hash:
+            return 'genesis_hash does not match pinned genesis'
+        quorum = await self._request_tip_quorum(peer_list)
+        if quorum is None:
+            return 'tip cross-check: no quorum (peers disagree or did not answer)'
+        _qh = int(quorum['block_id'])
+        if _qh < H:
+            return f'tip cross-check: quorum tip {_qh} is behind snapshot tip {H}'
+        if _qh == H and str(quorum['hash']) != str(tip.get('hash', '')):
+            return f'tip cross-check: quorum tip {_qh}/{str(quorum['hash'])[:16]}... != snapshot tip {H}/{str(tip.get('hash', ''))[:16]}...'
+        if _qh - H > maze.SNAPSHOT_WINDOW:
+            return f'tip cross-check: snapshot tip {H} is {_qh - H} blocks behind quorum tip {_qh} (stale)'
+        return None
+
+    async def _apply_snapshot_response(self, resp: bootstrap.Dict, peer: EncryptedPeer) -> bool:
+        H = int(resp['height'])
+        snapshot = resp['snapshot']
+        tip = resp['tip_block']
+        genesis_hash = str(resp.get('genesis_hash') or '')
+        hist = await self._fetch_snapshot_history(H, tip, peer)
+        if hist is None:
+            bootstrap.logger.warning('[Sync] Snapshot sync rejected: last-100 history fetch/verify failed')
+            return False
+        added = []
+        try:
+            for b in hist:
+                if await self.node.block_repo.get_by_id(int(b['id'])) is None:
+                    await self.node.block_repo.create(b)
+                    added.append(int(b['id']))
+            if await self.node.block_repo.get_by_id(H) is None:
+                await self.node.block_repo.create(tip)
+                added.append(H)
+        except Exception as e:
+            bootstrap.logger.warning(f'[Sync] Snapshot sync rejected: storing history/tip failed: {e}')
+            for bid in added:
+                try:
+                    await self.node.db.execute_dml('DELETE FROM blocks WHERE id = ?' if self.node.db.db_type == 'sqlite' else 'DELETE FROM blocks WHERE id = $1', bid)
+                except Exception:
+                    pass
+            return False
+        ok = await self.node.verify_block_proof(tip)
+        if not ok:
+            bootstrap.logger.warning(f'[Sync] Snapshot sync rejected: tip block {H} failed verify_block_proof')
+            for bid in added:
+                try:
+                    await self.node.db.execute_dml('DELETE FROM blocks WHERE id = ?' if self.node.db.db_type == 'sqlite' else 'DELETE FROM blocks WHERE id = $1', bid)
+                except Exception:
+                    pass
+            return False
+        if not getattr(self.node, 'genesis_hash', ''):
+            self.node.genesis_hash = genesis_hash
+        if not await self._load_state_snapshot(snapshot, H):
+            bootstrap.logger.warning('[Sync] Snapshot sync rejected: state load failed')
+            for bid in added:
+                try:
+                    await self.node.db.execute_dml('DELETE FROM blocks WHERE id = ?' if self.node.db.db_type == 'sqlite' else 'DELETE FROM blocks WHERE id = $1', bid)
+                except Exception:
+                    pass
+            return False
+        await self.node._load_state()
+        bootstrap.logger.info(f'[Sync] Snapshot sync complete: height={self.node.height} (tip block {H}), state root verified, last {maze.SNAPSHOT_WINDOW} blocks present. This node is PRUNED (no full history).')
+        return True
+
+    async def _try_snapshot_sync(self, best_peer: EncryptedPeer, peer_list: bootstrap.List[EncryptedPeer]) -> bool:
+        now = bootstrap.time.time()
+        if now - self._snapshot_last_attempt < maze.SNAPSHOT_RETRY_COOLDOWN:
+            bootstrap.logger.info(f'[Sync] Snapshot sync on cooldown ({int(maze.SNAPSHOT_RETRY_COOLDOWN - (now - self._snapshot_last_attempt))}s left) — falling back to full sync')
+            return False
+        if self._snapshot_sync_running:
+            bootstrap.logger.info('[Sync] Snapshot sync already in progress — falling back to full sync')
+            return False
+        self._snapshot_sync_running = True
+        try:
+            self._snapshot_last_attempt = now
+            ordered = sorted(peer_list, key=lambda p: -p.height)
+            seen = set()
+            for peer in ordered:
+                if peer.address in seen:
+                    continue
+                seen.add(peer.address)
+                bootstrap.logger.info(f'[Sync] Snapshot sync: requesting snapshot from {peer.address} (height {peer.height})')
+                resp = await self._request_snapshot(peer)
+                if resp is None:
+                    bootstrap.logger.warning(f'[Sync] Snapshot sync: no snapshot from {peer.address} — trying next peer')
+                    continue
+                reason = await self._verify_snapshot_response(resp, peer_list)
+                if reason is not None:
+                    self._snapshot_consec_failures += 1
+                    bootstrap.logger.warning(f'[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — backing off to full sync')
+                    return False
+                if await self._apply_snapshot_response(resp, peer):
+                    self._snapshot_consec_failures = 0
+                    return True
+                self._snapshot_consec_failures += 1
+                bootstrap.logger.warning(f'[Sync] Snapshot sync: apply failed for {peer.address} — backing off to full sync')
+                return False
+            self._snapshot_consec_failures += 1
+            bootstrap.logger.warning('[Sync] Snapshot sync: no peer offered a snapshot — falling back to full sync')
+            return False
+        finally:
+            self._snapshot_sync_running = False
+
     async def _request_checkpoints(self, peers: bootstrap.List[EncryptedPeer], timeout: float=5.0) -> bootstrap.Optional[bootstrap.Dict]:
         futures = {}
         for peer in peers:
@@ -1819,12 +2320,22 @@ class P2PNode:
             if best_height < self.node.height:
                 continue
             gap = best_height - self.node.height
+            if gap <= maze.SNAPSHOT_SYNC_THRESHOLD:
+                self._snapshot_consec_failures = 0
             bootstrap.logger.info(f'[P2P] Syncing from {best_peer.address}: local={self.node.height}, remote={best_height}')
             if gap > config.CHECKPOINT_SYNC_THRESHOLD:
                 sample_peers = sorted(peer_list, key=lambda p: -p.height)[:5]
                 checkpoint = await self._request_checkpoints(sample_peers)
                 if checkpoint:
                     bootstrap.logger.info(f'[Sync] Quorum-agreed checkpoint at block {checkpoint['block_id']} — anchoring catch-up sync on it')
+            if self.node.height == 0 or gap > maze.SNAPSHOT_SYNC_THRESHOLD:
+                if await self._try_snapshot_sync(best_peer, peer_list):
+                    bootstrap.logger.info('[Sync] Snapshot sync succeeded — resuming normal sync from the new tip')
+                    continue
+                if self._snapshot_consec_failures < 3:
+                    bootstrap.logger.info('[Sync] Snapshot sync did not complete — deferring full sync (snapshot retry pending)')
+                    continue
+                bootstrap.logger.info('[Sync] Snapshot sync did not complete — falling back to full sync')
             max_chunks_this_cycle = 25
             rewound_this_stall = False
             for _ in range(max_chunks_this_cycle):
@@ -1849,6 +2360,10 @@ class P2PNode:
                         await bootstrap.asyncio.sleep(0.25)
                         waited += 0.25
                 if self.node.height <= start:
+                    if await self._try_snapshot_sync(best_peer, peer_list):
+                        self._stuck_cycles = 0
+                        self._stuck_peer = None
+                        break
                     bootstrap.logger.warning(f'[Sync] Stuck at height {self.node.height} — no progress importing [{start},{end}) from {best_peer.address}. Tip is likely below a rejected block. Check logs above for [Verify] rejections; the loop will rotate to another peer and auto-retry after a cooldown.')
                     self._stuck_cycles = getattr(self, '_stuck_cycles', 0) + 1
                     self._stuck_peer = best_peer.address
@@ -1882,6 +2397,11 @@ class P2PNode:
         if not self.peers:
             return
         best_peer = max(self.peers.values(), key=lambda p: p.height)
+        if self.node.height == 0 or best_peer.height - self.node.height > maze.SNAPSHOT_SYNC_THRESHOLD:
+            if await self._try_snapshot_sync(best_peer, list(self.peers.values())):
+                return
+            if self._snapshot_consec_failures < 3:
+                return
         latest = await self.node.block_repo.get_latest()
         if latest is None:
             batch_end = min(best_peer.height, config.SYNC_BATCH_BLOCKS - 1)

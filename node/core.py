@@ -44,6 +44,7 @@ class MicroCoreNode:
         self.height = 0
         self.last_hash = '0' * 64
         self.blocks = []
+        self._sealed_snapshot = None
         self.total_minted = 0
         self.burned_total = 0
         self.miners: bootstrap.Dict[str, bootstrap.Dict] = {}
@@ -91,6 +92,7 @@ class MicroCoreNode:
         self._seen_automation_sigs: bootstrap.Dict[str, float] = {}
         self.state_trie = db.StateTrie(self.db)
         self.rate_limiter = mempool.RateLimiter()
+        self._ws_rate_limit_log: bootstrap.Dict[str, list] = {}
         self.subnet_rate_limiter = mempool.RateLimiter(max_requests=300, window_seconds=60)
         self.register_rate_limiter = mempool.RateLimiter(max_requests=6, window_seconds=60)
         self.rpc_rate_limiter = mempool.RateLimiter(max_requests=30, window_seconds=60)
@@ -319,6 +321,19 @@ class MicroCoreNode:
                 bootstrap.logger.debug(f'[SVF] restored evidence from epoch {earliest_epoch} onward')
             except Exception as _e:
                 bootstrap.logger.warning(f'[SVF] state restore from DB failed: {_e}')
+        try:
+            _tip = await self.block_repo.get_latest()
+            if _tip is not None:
+                _tip_id = int(_tip['id'])
+                _tip_root = str(_tip.get('state_root', ''))
+                _srow = await self.db.fetchrow('SELECT state_root, snapshot_data FROM state_snapshots WHERE block_id = ?' if self.db.db_type == 'sqlite' else 'SELECT state_root, snapshot_data FROM state_snapshots WHERE block_id = $1', _tip_id)
+                if _srow is not None and str(_srow.get('state_root', '')) == _tip_root:
+                    _snap = bootstrap.json.loads(_srow.get('snapshot_data') or '{}')
+                    if isinstance(_snap, dict) and _snap:
+                        self._sealed_snapshot = {'height': _tip_id, 'tip_hash': str(_tip.get('hash', '')), 'state_root': _tip_root, 'snapshot': _snap}
+                        bootstrap.logger.debug(f'[Sync] Restored seal-time snapshot for tip block {_tip_id} from state_snapshots')
+        except Exception as _ss_e:
+            bootstrap.logger.debug(f'[Sync] seal-time snapshot restore failed: {_ss_e}')
 
     async def _live_mazes(self) -> list:
         rows = await self.maze_repo.get_eligible(self.height)
@@ -2053,6 +2068,7 @@ class MicroCoreNode:
             existing['last_ping'] = now
             existing['consecutive_misses'] = 0
             await self.miner_repo.update(existing)
+            self.miners[miner_id] = existing
             bootstrap.logger.info(f'[MINER] Reactivated existing miner {miner_id[:16]}')
             return True
         message = f'{miner_id}{wallet}{timestamp}'
@@ -3394,6 +3410,24 @@ class MicroCoreNode:
                 _post_root = await db._compute_full_state_root(self.db, self, int(block['id']))
                 if _post_root != block.get('state_root'):
                     raise AuxStateError(f'state_root of block {block.get('id')} does not match post-apply state')
+                try:
+                    _seal_snap = await db._state_snapshot_for_block(self.db, self, int(block['id']))
+                    _seal_root = db._state_root_from_snapshot(_seal_snap)
+                    if _seal_root == str(block.get('state_root', '')):
+                        self._sealed_snapshot = {'height': int(block['id']), 'tip_hash': str(block.get('hash', '')), 'state_root': str(block.get('state_root', '')), 'snapshot': bootstrap.copy.deepcopy(_seal_snap)}
+                        _seal_data = bootstrap.json.dumps(_seal_snap, sort_keys=True) if _seal_snap else '{}'
+                        if self.db.db_type == 'sqlite':
+                            await self.db.execute_dml('INSERT OR REPLACE INTO state_snapshots (block_id,state_root,receipt_root,snapshot_data,created_at) VALUES (?,?,?,?,?)', int(block['id']), str(block.get('state_root', '')), '0x' + '00' * 32, _seal_data, int(bootstrap.time.time()))
+                        else:
+                            await self.db.execute_dml('INSERT INTO state_snapshots (block_id,state_root,receipt_root,snapshot_data,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (block_id) DO UPDATE SET state_root=$2,snapshot_data=$4', int(block['id']), str(block.get('state_root', '')), '0x' + '00' * 32, _seal_data, int(bootstrap.time.time()))
+                        if self.db.db_type == 'sqlite':
+                            await self.db.execute_dml('DELETE FROM state_snapshots WHERE block_id < ?', int(block['id']))
+                        else:
+                            await self.db.execute_dml('DELETE FROM state_snapshots WHERE block_id < $1', int(block['id']))
+                    else:
+                        bootstrap.logger.warning(f'[Sync] Seal-time snapshot for block {block.get('id')} root mismatch ({_seal_root[:16]}... != {str(block.get('state_root', ''))[:16]}...) — not cached')
+                except Exception as _se:
+                    bootstrap.logger.warning(f'[Sync] Seal-time snapshot cache for block {block.get('id')} failed: {_se}')
             if _pending_svf_epoch_root is not None:
                 _pe, _pr = _pending_svf_epoch_root
                 self.svf_epoch_roots[_pe] = (_pr, svf.SVF_EPOCH_BLOCKS)
@@ -4140,7 +4174,7 @@ class MicroCoreNode:
         async def websocket_handler(request):
             ws = WebSocketResponse(heartbeat=60)
             await ws.prepare(request)
-            client_ip = request.remote
+            client_ip = request.headers.get('CF-Connecting-IP') or request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or request.remote
             if len(self.ws_sessions) >= config.WS_MAX_CONNECTIONS:
                 bootstrap.logger.warning(f'[WS] Connection from {client_ip} refused: max WS connections ({config.WS_MAX_CONNECTIONS}) reached')
                 await ws.close(code=1013, message=b'too many connections')
@@ -4179,8 +4213,18 @@ class MicroCoreNode:
                                 continue
                             _rate_exempt = msg_type in ('maze_move', 'wall_hit_solve', 'block_signed', 'memory_challenge_response')
                             if not _rate_exempt:
-                                allowed = await self.rate_limiter.is_allowed(client_ip)
+                                _rl_key = client_ip
+                                if session and session.get('authenticated') and session.get('miner_id'):
+                                    _rl_key = 'miner:' + str(session['miner_id'])
+                                allowed = await self.rate_limiter.is_allowed(_rl_key)
                                 if not allowed:
+                                    _rl_entry = self._ws_rate_limit_log.setdefault(_rl_key, [0.0, 0])
+                                    _rl_entry[1] += 1
+                                    _rl_now = bootstrap.time.time()
+                                    if _rl_now - _rl_entry[0] >= 60.0:
+                                        bootstrap.logger.warning(f'[WS] Rate limit exceeded for {_rl_key} ({_rl_entry[1]} refusals in the last 60 s)')
+                                        _rl_entry[0] = _rl_now
+                                        _rl_entry[1] = 0
                                     await ws.send_json({'type': 'error', 'message': 'Rate limit exceeded'})
                                     continue
                             await self._handle_ws_message(ws, data, client_ip)
