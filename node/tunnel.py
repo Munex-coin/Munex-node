@@ -496,6 +496,7 @@ def tunnel_watch_loop(args):
     tunnel_say('so the watcher itself can never eat up the connection bucket.')
     tunnel_say('Press Ctrl-C to stop watching. The tunnel keeps running.')
     failures = {'8080': 0, '8085': 0}
+    registered = set()
     try:
         while True:
             state = tunnel_load_state(args.state)
@@ -523,6 +524,9 @@ def tunnel_watch_loop(args):
                 if good:
                     failures[port] = 0
                     tunnel_say(stamp + ' port ' + port + ' ok')
+                    if port == '8080' and url not in registered:
+                        registered.add(url)
+                        tunnel_register_link(tunnel_host_of(url), state.get('registry_url') or args.registry_url)
                     continue
                 failures[port] += 1
                 tunnel_say(stamp + ' port ' + port + ' failed (' + str(failures[port]) + '/' + str(args.failures) + ')')

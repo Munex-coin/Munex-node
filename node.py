@@ -1113,6 +1113,11 @@ SNAPSHOT_SYNC_THRESHOLD = 100
 SNAPSHOT_WINDOW = 100
 SNAPSHOT_RETRY_COOLDOWN = 60
 SNAPSHOT_REQUEST_TIMEOUT = 30
+# R23: a peer counts as alive for sync if it has sent us a
+# message within this many seconds (last_seen is refreshed
+# on every message). Dead peers go stale and are dropped
+# from sync, so a node only fetches from alive nodes.
+PEER_ALIVE_WINDOW = 300
 CONSENSUS_EXCLUDED_FIELDS = {"hash", "signature", "pqc_signature", "finalized"}
 _BLOCK_PROOF_KEYS = {"winner","producer_pub","signature","state_root","transactions","maze_attestation","reward_wallet","maze_updates","attestation_proof","global_shrink_factor","slashes","maze_state","svf_epoch_certificates","lottery_draw"}
 MAZE_ROW_COLS = frozenset({
@@ -15133,10 +15138,23 @@ class P2PNode:
             (bid, hsh), _c = next(iter(votes.items()))
             logger.warning("[Sync] Only one peer available for tip cross-check — using its tip with a warning")
             return {"block_id": bid, "hash": hsh}
+        # R23: count only the peers that ANSWERED. A node that
+        # knows several peers but can only reach one (the seed
+        # is the only live node; the rest are dead and never
+        # answer) could never reach a majority over ALL known
+        # peers, so its snapshot was always rejected and it
+        # stayed at height 1. One answering peer is trusted
+        # with a warning, exactly like the single-peer case;
+        # a majority is over the answering peers.
+        if len(votes) == 1:
+            (bid, hsh), _c = next(iter(votes.items()))
+            logger.warning("[Sync] Only one peer answered the tip cross-check — using its tip with a warning")
+            return {"block_id": bid, "hash": hsh}
+        total = sum(votes.values())
         for (bid, hsh), count in votes.items():
-            if count * 2 > len(peers):
+            if count * 2 > total:
                 return {"block_id": bid, "hash": hsh}
-        logger.warning(f"[Sync] Tip cross-check: no majority among {len(peers)} peers (votes={votes})")
+        logger.warning(f"[Sync] Tip cross-check: no majority among {total} answering peers (votes={votes})")
         return None
 
     async def _fetch_snapshot_history(self, H: int, tip: Dict, peer: EncryptedPeer) -> Optional[List[Dict]]:
@@ -15472,6 +15490,19 @@ class P2PNode:
         logger.info(f"[Sync] Snapshot sync complete: height={self.node.height} (tip block {H}), state root verified, last {SNAPSHOT_WINDOW} blocks present. This node is PRUNED (no full history).")
         return True
 
+    def _alive_peers(self, peer_list):
+        """R23: peers that have actually talked to us recently.
+        last_seen is refreshed on every message a peer sends,
+        so a peer that never answers (dead, stale, unreachable)
+        goes stale and is dropped from sync. A node only fetches
+        blocks and snapshots from alive peers, never from dead
+        ones that only waste the attempt and pollute the quorum.
+        If none are alive, fall back to the full list so a
+        just-connected peer can still be tried."""
+        now = time.time()
+        alive = [p for p in peer_list if now - getattr(p, "last_seen", 0) <= PEER_ALIVE_WINDOW]
+        return alive or list(peer_list)
+
     async def _try_snapshot_sync(self, best_peer: EncryptedPeer, peer_list: List[EncryptedPeer]) -> bool:
         """R22: attempt a snapshot sync from the best peer. Asks
         ONE peer at a time; a timeout/no-response moves to the
@@ -15571,7 +15602,7 @@ class P2PNode:
             if time.time() < getattr(self, "_sync_paused_until", 0.0):
                 continue
             async with self._lock:
-                peer_list = list(self.peers.values())
+                peer_list = self._alive_peers(list(self.peers.values()))
             if not peer_list:
                 continue
             stuck_peer = getattr(self, "_stuck_peer", None)
@@ -15699,12 +15730,13 @@ class P2PNode:
     async def sync_with_peers(self):
         if not self.peers:
             return
-        best_peer = max(self.peers.values(), key=lambda p: p.height)
+        _sw_peers = self._alive_peers(list(self.peers.values()))
+        best_peer = max(_sw_peers, key=lambda p: p.height)
         # R22: snapshot sync ONLY when far behind or at height 0
         # (see _sync_loop). No full-sync fallback while far
         # behind — wait for a snapshot source instead.
         if self.node.height == 0 or (best_peer.height - self.node.height) > SNAPSHOT_SYNC_THRESHOLD:
-            await self._try_snapshot_sync(best_peer, list(self.peers.values()))
+            await self._try_snapshot_sync(best_peer, _sw_peers)
             return
         latest = await self.node.block_repo.get_latest()
         if latest is None:
@@ -24174,6 +24206,7 @@ def tunnel_watch_loop(args):
     tunnel_say("so the watcher itself can never eat up the connection bucket.")
     tunnel_say("Press Ctrl-C to stop watching. The tunnel keeps running.")
     failures = {"8080": 0, "8085": 0}
+    registered = set()
     try:
         while True:
             state = tunnel_load_state(args.state)
@@ -24201,6 +24234,15 @@ def tunnel_watch_loop(args):
                 if good:
                     failures[port] = 0
                     tunnel_say(stamp + " port " + port + " ok")
+                    if port == "8080" and url not in registered:
+                        # R23: the first registration happens in
+                        # setup, before the node is listening, so
+                        # the registry probe fails and the link is
+                        # never listed. Re-register once the node
+                        # is up and the probe can succeed, so a
+                        # tunnel node shows up in the registry.
+                        registered.add(url)
+                        tunnel_register_link(tunnel_host_of(url), state.get("registry_url") or args.registry_url)
                     continue
                 failures[port] += 1
                 tunnel_say(stamp + " port " + port + " failed (" + str(failures[port]) + "/" + str(args.failures) + ")")

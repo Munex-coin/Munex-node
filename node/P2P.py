@@ -1927,10 +1927,15 @@ class P2PNode:
             (bid, hsh), _c = next(iter(votes.items()))
             bootstrap.logger.warning('[Sync] Only one peer available for tip cross-check — using its tip with a warning')
             return {'block_id': bid, 'hash': hsh}
+        if len(votes) == 1:
+            (bid, hsh), _c = next(iter(votes.items()))
+            bootstrap.logger.warning('[Sync] Only one peer answered the tip cross-check — using its tip with a warning')
+            return {'block_id': bid, 'hash': hsh}
+        total = sum(votes.values())
         for (bid, hsh), count in votes.items():
-            if count * 2 > len(peers):
+            if count * 2 > total:
                 return {'block_id': bid, 'hash': hsh}
-        bootstrap.logger.warning(f'[Sync] Tip cross-check: no majority among {len(peers)} peers (votes={votes})')
+        bootstrap.logger.warning(f'[Sync] Tip cross-check: no majority among {total} answering peers (votes={votes})')
         return None
 
     async def _fetch_snapshot_history(self, H: int, tip: bootstrap.Dict, peer: EncryptedPeer) -> bootstrap.Optional[bootstrap.List[bootstrap.Dict]]:
@@ -2221,6 +2226,11 @@ class P2PNode:
         bootstrap.logger.info(f'[Sync] Snapshot sync complete: height={self.node.height} (tip block {H}), state root verified, last {maze.SNAPSHOT_WINDOW} blocks present. This node is PRUNED (no full history).')
         return True
 
+    def _alive_peers(self, peer_list):
+        now = bootstrap.time.time()
+        alive = [p for p in peer_list if now - getattr(p, 'last_seen', 0) <= maze.PEER_ALIVE_WINDOW]
+        return alive or list(peer_list)
+
     async def _try_snapshot_sync(self, best_peer: EncryptedPeer, peer_list: bootstrap.List[EncryptedPeer]) -> bool:
         now = bootstrap.time.time()
         if now - self._snapshot_last_attempt < maze.SNAPSHOT_RETRY_COOLDOWN:
@@ -2305,7 +2315,7 @@ class P2PNode:
             if bootstrap.time.time() < getattr(self, '_sync_paused_until', 0.0):
                 continue
             async with self._lock:
-                peer_list = list(self.peers.values())
+                peer_list = self._alive_peers(list(self.peers.values()))
             if not peer_list:
                 continue
             stuck_peer = getattr(self, '_stuck_peer', None)
@@ -2394,9 +2404,10 @@ class P2PNode:
     async def sync_with_peers(self):
         if not self.peers:
             return
-        best_peer = max(self.peers.values(), key=lambda p: p.height)
+        _sw_peers = self._alive_peers(list(self.peers.values()))
+        best_peer = max(_sw_peers, key=lambda p: p.height)
         if self.node.height == 0 or best_peer.height - self.node.height > maze.SNAPSHOT_SYNC_THRESHOLD:
-            await self._try_snapshot_sync(best_peer, list(self.peers.values()))
+            await self._try_snapshot_sync(best_peer, _sw_peers)
             return
         latest = await self.node.block_repo.get_latest()
         if latest is None:
