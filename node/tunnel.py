@@ -7,7 +7,9 @@ import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import time
+import types
 import urllib.request
 import urllib.error
 TUNNEL_WS_PORT = 8080
@@ -594,3 +596,63 @@ def tunnel_main(argv):
     if args.tunnel_status:
         return tunnel_status_show(args)
     return tunnel_setup_flow(args)
+
+def tunnel_start_watcher_thread(state_path):
+    args = types.SimpleNamespace(cloudflared=None, node_dir=None, state=state_path, interval=TUNNEL_DEFAULT_INTERVAL, failures=TUNNEL_DEFAULT_FAILURES, registry_url=os.environ.get('MCX_REGISTRY_URL', TUNNEL_DEFAULT_REGISTRY))
+    thread = threading.Thread(target=tunnel_watch_loop, args=(args,), daemon=True, name='tunnel-watcher')
+    thread.start()
+    return thread
+
+def tunnel_startup_prompt():
+    state_path = os.path.join(os.getcwd(), 'tunnel_state.json')
+    choice_path = os.path.join(os.getcwd(), 'tunnel_choice.json')
+    if os.path.isfile(state_path):
+        tunnel_start_watcher_thread(state_path)
+        return
+    if os.path.isfile(choice_path):
+        try:
+            with open(choice_path, encoding='utf-8') as handle:
+                saved = json.load(handle).get('choice')
+        except Exception:
+            saved = None
+        if saved == 'forwarding':
+            return
+        if saved == 'tunnel':
+            tunnel_start_watcher_thread(state_path)
+            return
+    if not sys.stdin.isatty():
+        tunnel_say('This is not an interactive terminal, so I will not ask about the tunnel. The node starts without one.')
+        return
+    tunnel_say('One question before the node starts: how will people reach it?')
+    tunnel_say('I will remember your answer, so I only ask once.')
+    try:
+        answer = tunnel_ask_choice('How will people reach your node?', [('1', 'port forwarding - I forward ports in my router'), ('2', 'Cloudflare Tunnel - no port forwarding, Cloudflare carries it')])
+    except (EOFError, KeyboardInterrupt, SystemExit):
+        tunnel_say('No answer (no input available), continuing without a tunnel.')
+        return
+    if answer == '1':
+        with open(choice_path, 'w', encoding='utf-8') as handle:
+            json.dump({'choice': 'forwarding'}, handle)
+        return
+    cloudflared = tunnel_find_cloudflared(None)
+    if not cloudflared:
+        tunnel_say('cloudflared is not installed yet.')
+        path, error = tunnel_download_cloudflared()
+        if path:
+            tunnel_say('Downloaded cloudflared to ' + path)
+            cloudflared = path
+        else:
+            tunnel_say(error)
+            tunnel_install_instructions()
+            tunnel_say('Tunnel setup did not finish. The node starts without a tunnel; run the setup again with: python node.py --tunnel-setup')
+            return
+    try:
+        ok = tunnel_setup(cloudflared, None, state_path, os.environ.get('MCX_REGISTRY_URL', TUNNEL_DEFAULT_REGISTRY))
+    except SystemExit:
+        ok = False
+    if not ok:
+        tunnel_say('Tunnel setup did not finish. The node starts without a tunnel; run the setup again with: python node.py --tunnel-setup')
+        return
+    with open(choice_path, 'w', encoding='utf-8') as handle:
+        json.dump({'choice': 'tunnel'}, handle)
+    tunnel_start_watcher_thread(state_path)

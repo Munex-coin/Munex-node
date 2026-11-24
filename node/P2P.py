@@ -2224,10 +2224,10 @@ class P2PNode:
     async def _try_snapshot_sync(self, best_peer: EncryptedPeer, peer_list: bootstrap.List[EncryptedPeer]) -> bool:
         now = bootstrap.time.time()
         if now - self._snapshot_last_attempt < maze.SNAPSHOT_RETRY_COOLDOWN:
-            bootstrap.logger.info(f'[Sync] Snapshot sync on cooldown ({int(maze.SNAPSHOT_RETRY_COOLDOWN - (now - self._snapshot_last_attempt))}s left) — falling back to full sync')
+            bootstrap.logger.info(f'[Sync] Snapshot sync on cooldown ({int(maze.SNAPSHOT_RETRY_COOLDOWN - (now - self._snapshot_last_attempt))}s left) — waiting for the cooldown, then retrying snapshot sync')
             return False
         if self._snapshot_sync_running:
-            bootstrap.logger.info('[Sync] Snapshot sync already in progress — falling back to full sync')
+            bootstrap.logger.info('[Sync] Snapshot sync already in progress — waiting for the attempt in progress')
             return False
         self._snapshot_sync_running = True
         try:
@@ -2246,16 +2246,16 @@ class P2PNode:
                 reason = await self._verify_snapshot_response(resp, peer_list)
                 if reason is not None:
                     self._snapshot_consec_failures += 1
-                    bootstrap.logger.warning(f'[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — backing off to full sync')
+                    bootstrap.logger.warning(f'[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — will retry snapshot sync next cycle')
                     return False
                 if await self._apply_snapshot_response(resp, peer):
                     self._snapshot_consec_failures = 0
                     return True
                 self._snapshot_consec_failures += 1
-                bootstrap.logger.warning(f'[Sync] Snapshot sync: apply failed for {peer.address} — backing off to full sync')
+                bootstrap.logger.warning(f'[Sync] Snapshot sync: apply failed for {peer.address} — will retry snapshot sync next cycle')
                 return False
             self._snapshot_consec_failures += 1
-            bootstrap.logger.warning('[Sync] Snapshot sync: no peer offered a snapshot — falling back to full sync')
+            bootstrap.logger.warning('[Sync] Snapshot sync: no peer offered a snapshot — waiting for a snapshot source')
             return False
         finally:
             self._snapshot_sync_running = False
@@ -2332,10 +2332,8 @@ class P2PNode:
                 if await self._try_snapshot_sync(best_peer, peer_list):
                     bootstrap.logger.info('[Sync] Snapshot sync succeeded — resuming normal sync from the new tip')
                     continue
-                if self._snapshot_consec_failures < 3:
-                    bootstrap.logger.info('[Sync] Snapshot sync did not complete — deferring full sync (snapshot retry pending)')
-                    continue
-                bootstrap.logger.info('[Sync] Snapshot sync did not complete — falling back to full sync')
+                bootstrap.logger.info('[Sync] Snapshot sync did not complete — waiting for a snapshot source (no full sync while far behind)')
+                continue
             max_chunks_this_cycle = 25
             rewound_this_stall = False
             for _ in range(max_chunks_this_cycle):
@@ -2398,10 +2396,8 @@ class P2PNode:
             return
         best_peer = max(self.peers.values(), key=lambda p: p.height)
         if self.node.height == 0 or best_peer.height - self.node.height > maze.SNAPSHOT_SYNC_THRESHOLD:
-            if await self._try_snapshot_sync(best_peer, list(self.peers.values())):
-                return
-            if self._snapshot_consec_failures < 3:
-                return
+            await self._try_snapshot_sync(best_peer, list(self.peers.values()))
+            return
         latest = await self.node.block_repo.get_latest()
         if latest is None:
             batch_end = min(best_peer.height, config.SYNC_BATCH_BLOCKS - 1)
@@ -2417,3 +2413,6 @@ class P2PNode:
         payload = bootstrap.json.dumps({'start': self.node.height, 'end': batch_end}).encode()
         await self._send_message(best_peer, config.MSG_GET_BLOCKS, payload)
         await bootstrap.asyncio.sleep(2)
+
+class AuxStateError(Exception):
+    pass

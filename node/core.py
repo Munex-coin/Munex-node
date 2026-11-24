@@ -16,6 +16,7 @@ import mempool
 import vm_host
 import consensus
 import P2P
+import tunnel
 
 def _ws_health_handler(request):
     from aiohttp import web
@@ -25,9 +26,6 @@ def _ws_app_routes(app, websocket_handler):
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/healthz', _ws_health_handler)
     return app
-
-class AuxStateError(Exception):
-    pass
 
 class _StageRollback(Exception):
     pass
@@ -2702,23 +2700,23 @@ class MicroCoreNode:
                 if int(common_height) == 0:
                     _anchor_hash = '0' * 64
                 else:
-                    raise AuxStateError(f'reorg cumulative: no common ancestor at {common_height}')
+                    raise P2P.AuxStateError(f'reorg cumulative: no common ancestor at {common_height}')
             _prev = str(_anchor_hash)
             for _b in adopted:
                 _bid = int(_b.get('id', -1))
                 _row = await self.block_repo.get_by_id(_bid)
                 if not isinstance(_row, dict):
-                    raise AuxStateError(f'reorg cumulative: adopted block {_bid} missing from block_repo')
+                    raise P2P.AuxStateError(f'reorg cumulative: adopted block {_bid} missing from block_repo')
                 if str(_row.get('hash', '')) != str(_b.get('hash', '')):
-                    raise AuxStateError(f'reorg cumulative: adopted block {_bid} hash mismatch repo-vs-branch')
+                    raise P2P.AuxStateError(f'reorg cumulative: adopted block {_bid} hash mismatch repo-vs-branch')
                 if str(_row.get('phash', '')) != _prev:
-                    raise AuxStateError(f'reorg cumulative: adopted block {_bid} not parent-linked')
+                    raise P2P.AuxStateError(f'reorg cumulative: adopted block {_bid} not parent-linked')
                 _prev = str(_b.get('hash', ''))
                 _tip_id, _tip_hash = (_bid, _prev)
             if int(self.height) != _tip_id + 1:
-                raise AuxStateError(f'reorg cumulative: height {self.height} != tip {_tip_id}+1')
+                raise P2P.AuxStateError(f'reorg cumulative: height {self.height} != tip {_tip_id}+1')
             if str(self.last_hash) != str(_tip_hash):
-                raise AuxStateError('reorg cumulative: last_hash != adopted tip hash')
+                raise P2P.AuxStateError('reorg cumulative: last_hash != adopted tip hash')
             _sim = int(pre_minted)
             for _ob in sorted((o for o in orphaned or [] if isinstance(o, dict)), key=lambda x: int(x.get('id', 0))):
                 _om = gas._reorg_base_mint(_ob)
@@ -2730,7 +2728,7 @@ class MicroCoreNode:
             for _b in adopted:
                 _sim += gas._reorg_base_mint(_b)
             if int(self.total_minted) != _sim:
-                raise AuxStateError(f'reorg cumulative: total_minted {self.total_minted} != conserved {_sim} (pre={pre_minted})')
+                raise P2P.AuxStateError(f'reorg cumulative: total_minted {self.total_minted} != conserved {_sim} (pre={pre_minted})')
             for _b in adopted:
                 _bid = int(_b.get('id', -1))
                 _want = set((str(h) for h in _b.get('tx_hashes') or []))
@@ -2740,9 +2738,9 @@ class MicroCoreNode:
                     _rows = await self.db.fetch('SELECT tx_hash FROM transactions WHERE block_id = $1', _bid)
                 _got = set((str(_r.get('tx_hash', '')) for _r in _rows or []))
                 if _got != _want:
-                    raise AuxStateError(f'reorg cumulative: block {_bid} persisted txs {sorted(_got)[:4]} != sealed {sorted(_want)[:4]}')
+                    raise P2P.AuxStateError(f'reorg cumulative: block {_bid} persisted txs {sorted(_got)[:4]} != sealed {sorted(_want)[:4]}')
         elif int(self.height) != int(common_height) + 1:
-            raise AuxStateError(f'reorg cumulative: empty adoption left height {self.height} != common {common_height}+1')
+            raise P2P.AuxStateError(f'reorg cumulative: empty adoption left height {self.height} != common {common_height}+1')
 
     async def _reorg_chain(self, common_height: int, new_blocks: bootstrap.List[bootstrap.Dict]):
         try:
@@ -3203,7 +3201,7 @@ class MicroCoreNode:
     async def _apply_maze_state(self, block: dict) -> None:
         _ms = block.get('maze_state') or []
         if not isinstance(_ms, list):
-            raise AuxStateError(f'malformed maze_state in block {block.get('id')}')
+            raise P2P.AuxStateError(f'malformed maze_state in block {block.get('id')}')
         if not _ms:
             return
         _att = block.get('maze_attestation') or {}
@@ -3211,13 +3209,13 @@ class MicroCoreNode:
         _bid = int(block.get('id', 0))
         for _e in _ms:
             if not isinstance(_e, dict):
-                raise AuxStateError(f'malformed maze_state entry in block {_bid}')
+                raise P2P.AuxStateError(f'malformed maze_state entry in block {_bid}')
             _mid = str(_e.get('maze_id', '') or '')
             if not _mid:
-                raise AuxStateError(f'maze_state entry without maze_id in block {_bid}')
+                raise P2P.AuxStateError(f'maze_state entry without maze_id in block {_bid}')
             if _att_mid and _mid.lower() == _att_mid:
                 if str(_e.get('minerid', '') or '').lower() == _att_mid and (not str(_e.get('minerid', '') or '')):
-                    raise AuxStateError(f'maze_state entry for attested maze has no minerid in block {_bid}')
+                    raise P2P.AuxStateError(f'maze_state entry for attested maze has no minerid in block {_bid}')
             existing = await self.maze_repo.get_by_maze_id(_mid)
             if existing:
                 row = dict(existing)
@@ -3233,11 +3231,11 @@ class MicroCoreNode:
     async def _append_block(self, block: dict):
         _vbase = gas._validated_block_reward(block, self.total_minted)
         if _vbase is None:
-            raise AuxStateError(f'reward/subsidy/supply mismatch in block {block.get('id')}')
+            raise P2P.AuxStateError(f'reward/subsidy/supply mismatch in block {block.get('id')}')
         _vbase = _vbase[0]
         _lok, _lreason = gas._block_limits_ok(block.get('transactions'))
         if not _lok:
-            raise AuxStateError(f'block {block.get('id')} exceeds block limits: {_lreason}')
+            raise P2P.AuxStateError(f'block {block.get('id')} exceeds block limits: {_lreason}')
         async with await self.db.transaction():
             await self.block_repo.create(block)
             _pending_svf_epoch_root = None
@@ -3260,7 +3258,7 @@ class MicroCoreNode:
                 except svf.SVFReject:
                     pass
                 except Exception as _ev_e:
-                    raise AuxStateError(f'SVF evidence extraction failed for block {block['id']}: {_ev_e}') from _ev_e
+                    raise P2P.AuxStateError(f'SVF evidence extraction failed for block {block['id']}: {_ev_e}') from _ev_e
             winner = block.get('winner')
             if not winner:
                 _miners = block.get('miners')
@@ -3271,10 +3269,10 @@ class MicroCoreNode:
             for ev in block.get('slashes') or []:
                 try:
                     await self._apply_slash_event(ev, block['id'])
-                except AuxStateError:
+                except P2P.AuxStateError:
                     raise
                 except Exception as e:
-                    raise AuxStateError(f'slashes of block {block.get('id')}: {e}') from e
+                    raise P2P.AuxStateError(f'slashes of block {block.get('id')}: {e}') from e
             if bool(block.get('transactions', [])) != bool(block.get('tx_hashes', [])):
                 raise RuntimeError(f'transactions/tx_hashes presence mismatch in block {block.get('id')}')
             _replay_error = None
@@ -3334,7 +3332,7 @@ class MicroCoreNode:
                 _mint = _vbase
                 if _mint > 0:
                     if self.total_minted + _mint > config.MAX_SUPPLY:
-                        raise AuxStateError(f'mint of block {block.get('id')} exceeds MAX_SUPPLY')
+                        raise P2P.AuxStateError(f'mint of block {block.get('id')} exceeds MAX_SUPPLY')
                     self.total_minted += _mint
                     await self.network_state_repo.set('total_minted', str(self.total_minted))
             for update in block.get('maze_updates', []):
@@ -3400,16 +3398,16 @@ class MicroCoreNode:
                     continue
                 _row = await self.maze_repo.get_by_maze_id(_mid)
                 if _row is None:
-                    raise AuxStateError(f'maze_state maze {_mid[:16]} missing after apply in block {block.get('id')}')
+                    raise P2P.AuxStateError(f'maze_state maze {_mid[:16]} missing after apply in block {block.get('id')}')
                 for _k in maze._MAZE_STATE_COLUMNS:
                     if _k == 'maze_id':
                         continue
                     if _k in _e and str(_row.get(_k, '')) != str(_e.get(_k, '')):
-                        raise AuxStateError(f'maze_state mismatch for {_mid[:16]} column {_k} in block {block.get('id')}')
+                        raise P2P.AuxStateError(f'maze_state mismatch for {_mid[:16]} column {_k} in block {block.get('id')}')
             if int(block.get('id', 0)) > 0 and block.get('state_root'):
                 _post_root = await db._compute_full_state_root(self.db, self, int(block['id']))
                 if _post_root != block.get('state_root'):
-                    raise AuxStateError(f'state_root of block {block.get('id')} does not match post-apply state')
+                    raise P2P.AuxStateError(f'state_root of block {block.get('id')} does not match post-apply state')
                 try:
                     _seal_snap = await db._state_snapshot_for_block(self.db, self, int(block['id']))
                     _seal_root = db._state_root_from_snapshot(_seal_snap)
@@ -3457,11 +3455,11 @@ class MicroCoreNode:
             if isinstance(_att, dict) and _att.get('maze_id') and (_att.get('size') is not None):
                 _av = config._effective_validators()
                 if _av and config._normalize_validator_key(_att.get('pubkey', '')) not in _av:
-                    raise AuxStateError(f'attestation key not in validator set in block {block.get('id')}')
+                    raise P2P.AuxStateError(f'attestation key not in validator set in block {block.get('id')}')
                 try:
                     await self.maze_attestation_repo.upsert({'maze_id': str(_att['maze_id']), 'last_size': int(_att['size']), 'last_block': int(block['id']), 'last_block_hash': str(block.get('hash', '')), 'pubkey': str(_att.get('pubkey', ''))})
                 except Exception as _e:
-                    raise AuxStateError(f'maze_attestation of block {block.get('id')}: {_e}') from _e
+                    raise P2P.AuxStateError(f'maze_attestation of block {block.get('id')}: {_e}') from _e
             await self.distribute_token_mining_rewards(block['id'])
         if getattr(self, 'mempool', None) is not None:
             for _h in _sealed_hashes:
@@ -5917,3 +5915,91 @@ class MicroCoreNode:
                 await self._ws_task
             except bootstrap.asyncio.CancelledError:
                 pass
+
+async def main():
+    parser = bootstrap.argparse.ArgumentParser(description=f'{_config.NAME} Node v{_config.VERSION}')
+    parser.add_argument('--config', type=str, default=_config.CONFIG_PATH, help='Path to config file')
+    parser.add_argument('--wallet', type=str, help='Wallet address')
+    parser.add_argument('--password', type=str, help='Password for encrypted private key')
+    parser.add_argument('--external-ip', type=str, help='Public IP or hostname for P2P (overrides config)')
+    parser.add_argument('--db-url', type=str, help='Database URL (overrides config)')
+    parser.add_argument('--public-ip', type=str, help='Public IP for P2P (overrides auto-detect)')
+    parser.add_argument('--no-dht', action='store_true', help='Disable DHT')
+    parser.add_argument('--allow-new-genesis', action='store_true', help='DELIBERATE new-chain init (seed node only): create a genesis when none can be synced. NEVER use on joining nodes - they must copy genesis.json from the network instead.')
+    parser.add_argument('--genesis-file', type=str, default=None, help='Path to the intended genesis file (overrides MCX_GENESIS_FILE env, node.genesis_file config, and the genesis.json default)')
+    args = parser.parse_args()
+    config = _config.load_config()
+    if args.config:
+        _config.CONFIG_PATH = args.config
+        config = _config.load_config()
+    if args.external_ip:
+        config['node']['external_ip'] = args.external_ip
+    if args.db_url:
+        config['database'] = {'url': args.db_url}
+    if args.public_ip:
+        bootstrap.os.environ['MCX_PUBLIC_IP'] = args.public_ip
+    if args.wallet:
+        config['wallet'] = args.wallet
+    if args.password:
+        config['password'] = args.password
+        bootstrap.logger.warning('[Node] R4-password-cli: --password exposes the secret via the process list; prefer the MCX_PASSWORD environment variable')
+    if args.no_dht:
+        config['p2p']['dht_enabled'] = False
+    _config.DHT_ENABLED = config['p2p'].get('dht_enabled', True)
+    _node_section = config.setdefault('node', {})
+    if 'mainnet' in _node_section and _node_section.get('mainnet') is not None:
+        if not isinstance(_node_section.get('mainnet'), bool):
+            bootstrap.logger.warning('[CONFIG] node.mainnet is legacy and ignored; non-boolean value discarded')
+            _node_section.pop('mainnet', None)
+        else:
+            bootstrap.logger.info('[CONFIG] node.mainnet is legacy and ignored (no testnet/mainnet mode split)')
+    try:
+        _config.EXPECTED_GENESIS_PIN = _config._expected_genesis_pin(config)
+    except ValueError as _pe:
+        bootstrap.logger.error(f'[CONFIG] {_pe}; refusing to start')
+        bootstrap.sys.exit(1)
+    if _config.EXPECTED_GENESIS_PIN is None:
+        bootstrap.logger.warning('[CONFIG] p2p.expected_genesis_hash is not set: this node will learn genesis from any existing peer that answers. Pin it for any real network.')
+    _gen_src = 'default genesis.json'
+    if args.genesis_file:
+        _gen_src = '--genesis-file CLI'
+    elif (bootstrap.os.environ.get('MCX_GENESIS_FILE', '') or '').strip():
+        _gen_src = 'MCX_GENESIS_FILE env'
+    elif isinstance((config.get('node', {}) or {}).get('genesis_file', ''), str) and ((config.get('node', {}) or {}).get('genesis_file', '') or '').strip():
+        _gen_src = 'node.genesis_file config'
+    _config.GENESIS_FILE = genesis.resolve_genesis_file(config, args.genesis_file)
+    bootstrap.logger.info(f'[GENESIS] Using genesis file {bootstrap.os.path.abspath(_config.GENESIS_FILE)} (source: {_gen_src})')
+    try:
+        _config.validate_validators_config(_config.VALIDATORS)
+        _config.validate_validators_config((config.get('consensus') or {}).get('validators'))
+    except ValueError as _ve:
+        bootstrap.logger.error(f'[CONFIG] {_ve}; refusing to start')
+        bootstrap.sys.exit(1)
+    try:
+        _config.apply_consensus_config(config)
+    except ValueError as _ve:
+        bootstrap.logger.error(f'[CONFIG] {_ve}; refusing to start')
+        bootstrap.sys.exit(1)
+    svf_keys._svf_ensure_key_loaded(config)
+    tunnel.tunnel_startup_prompt()
+    node = MicroCoreNode(config)
+    node._allow_new_genesis = args.allow_new_genesis
+    print(f'\n{'=' * 60}')
+    print(f'{bootstrap.GREEN}{_config.NAME} ({_config.SYMBOL}) COMPLETE NODE v{_config.VERSION}{bootstrap.RESET}')
+    print(f'{'=' * 60}')
+    print(f'Node ID: {node.node_id[:16]}...')
+    print(f'Wallet: {node.wallet}')
+    print(f'Height: {node.height}')
+    print(f'Peers: {(node.p2p.get_peer_count() if node.p2p else 0)}')
+    print(f'Miners: {len(node.miners)}')
+    print(f'{'=' * 60}\n')
+    try:
+        await node.start()
+    except bootstrap.asyncio.CancelledError:
+        bootstrap.logger.info('[Node] Cancelled')
+    except Exception as _run_e:
+        bootstrap.logger.error(f'[Node] Fatal during start: {_run_e}')
+        bootstrap.logger.error(bootstrap.traceback.format_exc())
+        raise
+    finally:
+        await node.shutdown()

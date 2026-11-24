@@ -9,6 +9,7 @@ import svf_keys
 import svf
 import db
 import repos
+import P2P
 import core
 
 class ConsensusRng:
@@ -1528,7 +1529,7 @@ class PoSWConsensus:
                                 self.node.svf_evidence_store.setdefault(_ev_epoch, []).append(None)
                                 bootstrap.logger.debug(f'[SVF] block {_svf_block_id}: no attestation evidence (genesis-like), epoch {_ev_epoch}')
                             except Exception as _ev_e:
-                                raise core.AuxStateError(f'SVF evidence extraction failed for block {_svf_block_id}: {_ev_e}') from _ev_e
+                                raise P2P.AuxStateError(f'SVF evidence extraction failed for block {_svf_block_id}: {_ev_e}') from _ev_e
                             _block_certs = block.get('svf_epoch_certificates') or []
                             if _block_certs:
                                 _cert = _block_certs[0]

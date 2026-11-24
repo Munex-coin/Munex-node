@@ -15473,14 +15473,15 @@ class P2PNode:
         return True
 
     async def _try_snapshot_sync(self, best_peer: EncryptedPeer, peer_list: List[EncryptedPeer]) -> bool:
-        """R20: attempt a snapshot sync from the best peer. Asks
+        """R22: attempt a snapshot sync from the best peer. Asks
         ONE peer at a time; a timeout/no-response moves to the
-        next peer, but a VERIFICATION failure backs off to full
-        sync immediately (no retry of another snapshot) and starts
-        the cooldown. Returns True on success."""
+        next peer, but a VERIFICATION failure stops trying other
+        peers this round and starts the cooldown — the caller
+        retries the snapshot next cycle, never a full sync.
+        Returns True on success."""
         now = time.time()
         if now - self._snapshot_last_attempt < SNAPSHOT_RETRY_COOLDOWN:
-            logger.info(f"[Sync] Snapshot sync on cooldown ({int(SNAPSHOT_RETRY_COOLDOWN - (now - self._snapshot_last_attempt))}s left) — falling back to full sync")
+            logger.info(f"[Sync] Snapshot sync on cooldown ({int(SNAPSHOT_RETRY_COOLDOWN - (now - self._snapshot_last_attempt))}s left) — waiting for the cooldown, then retrying snapshot sync")
             return False
         # R21n: only one snapshot sync may run at a time. The history
         # fetch shares a single future per peer; a second concurrent
@@ -15488,7 +15489,7 @@ class P2PNode:
         # then times out. The cooldown only guards the start time, not
         # an attempt still in progress.
         if self._snapshot_sync_running:
-            logger.info("[Sync] Snapshot sync already in progress — falling back to full sync")
+            logger.info("[Sync] Snapshot sync already in progress — waiting for the attempt in progress")
             return False
         self._snapshot_sync_running = True
         try:
@@ -15507,16 +15508,16 @@ class P2PNode:
                 reason = await self._verify_snapshot_response(resp, peer_list)
                 if reason is not None:
                     self._snapshot_consec_failures += 1
-                    logger.warning(f"[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — backing off to full sync")
+                    logger.warning(f"[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — will retry snapshot sync next cycle")
                     return False
                 if await self._apply_snapshot_response(resp, peer):
                     self._snapshot_consec_failures = 0
                     return True
                 self._snapshot_consec_failures += 1
-                logger.warning(f"[Sync] Snapshot sync: apply failed for {peer.address} — backing off to full sync")
+                logger.warning(f"[Sync] Snapshot sync: apply failed for {peer.address} — will retry snapshot sync next cycle")
                 return False
             self._snapshot_consec_failures += 1
-            logger.warning("[Sync] Snapshot sync: no peer offered a snapshot — falling back to full sync")
+            logger.warning("[Sync] Snapshot sync: no peer offered a snapshot — waiting for a snapshot source")
             return False
         finally:
             self._snapshot_sync_running = False
@@ -15597,22 +15598,19 @@ class P2PNode:
                 if checkpoint:
                     logger.info(f"[Sync] Quorum-agreed checkpoint at block {checkpoint['block_id']} — anchoring catch-up sync on it")
 
-            # R20: snapshot sync first when far behind or at
-            # height 0 — download the state at the tip plus the
-            # tip block instead of every block from genesis.
+            # R22: snapshot sync ONLY when far behind or at
+            # height 0 — the node only ever needs the state
+            # at the tip plus the last 100 blocks, never the
+            # full history from genesis. If no snapshot source
+            # answers, wait and retry next cycle — never burn
+            # a full sync on a chain that may hold a corrupt
+            # block the snapshot would skip.
             if self.node.height == 0 or gap > SNAPSHOT_SYNC_THRESHOLD:
                 if await self._try_snapshot_sync(best_peer, peer_list):
                     logger.info("[Sync] Snapshot sync succeeded — resuming normal sync from the new tip")
                     continue
-                # R21q: while a snapshot is still being retried
-                # (fewer than 3 consecutive failures), do not
-                # burn a full sync on a chain that may hold a
-                # corrupt block the snapshot would skip; wait for
-                # the next cycle's snapshot retry instead.
-                if self._snapshot_consec_failures < 3:
-                    logger.info("[Sync] Snapshot sync did not complete — deferring full sync (snapshot retry pending)")
-                    continue
-                logger.info("[Sync] Snapshot sync did not complete — falling back to full sync")
+                logger.info("[Sync] Snapshot sync did not complete — waiting for a snapshot source (no full sync while far behind)")
+                continue
             max_chunks_this_cycle = 25
             rewound_this_stall = False
             for _ in range(max_chunks_this_cycle):
@@ -15702,14 +15700,12 @@ class P2PNode:
         if not self.peers:
             return
         best_peer = max(self.peers.values(), key=lambda p: p.height)
-        # R20: snapshot sync first when far behind or at height 0.
+        # R22: snapshot sync ONLY when far behind or at height 0
+        # (see _sync_loop). No full-sync fallback while far
+        # behind — wait for a snapshot source instead.
         if self.node.height == 0 or (best_peer.height - self.node.height) > SNAPSHOT_SYNC_THRESHOLD:
-            if await self._try_snapshot_sync(best_peer, list(self.peers.values())):
-                return
-            # R21q: defer the full-sync fallback while a snapshot
-            # retry is still pending (see _sync_loop).
-            if self._snapshot_consec_failures < 3:
-                return
+            await self._try_snapshot_sync(best_peer, list(self.peers.values()))
+            return
         latest = await self.node.block_repo.get_latest()
         if latest is None:
             batch_end = min(best_peer.height, SYNC_BATCH_BLOCKS - 1)
@@ -23568,6 +23564,8 @@ async def main():
 
     _svf_ensure_key_loaded(config)
 
+    tunnel_startup_prompt()
+
     node = MicroCoreNode(config)
     node._allow_new_genesis = args.allow_new_genesis
 
@@ -23611,7 +23609,9 @@ import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import time
+import types
 import urllib.request
 import urllib.error
 
@@ -24277,6 +24277,68 @@ def tunnel_main(argv):
     if args.tunnel_status:
         return tunnel_status_show(args)
     return tunnel_setup_flow(args)
+
+
+def tunnel_start_watcher_thread(state_path):
+    args = types.SimpleNamespace(cloudflared=None, node_dir=None, state=state_path, interval=TUNNEL_DEFAULT_INTERVAL, failures=TUNNEL_DEFAULT_FAILURES, registry_url=os.environ.get("MCX_REGISTRY_URL", TUNNEL_DEFAULT_REGISTRY))
+    thread = threading.Thread(target=tunnel_watch_loop, args=(args,), daemon=True, name="tunnel-watcher")
+    thread.start()
+    return thread
+
+
+def tunnel_startup_prompt():
+    state_path = os.path.join(os.getcwd(), "tunnel_state.json")
+    choice_path = os.path.join(os.getcwd(), "tunnel_choice.json")
+    if os.path.isfile(state_path):
+        tunnel_start_watcher_thread(state_path)
+        return
+    if os.path.isfile(choice_path):
+        try:
+            with open(choice_path, encoding="utf-8") as handle:
+                saved = json.load(handle).get("choice")
+        except Exception:
+            saved = None
+        if saved == "forwarding":
+            return
+        if saved == "tunnel":
+            tunnel_start_watcher_thread(state_path)
+            return
+    if not sys.stdin.isatty():
+        tunnel_say("This is not an interactive terminal, so I will not ask about the tunnel. The node starts without one.")
+        return
+    tunnel_say("One question before the node starts: how will people reach it?")
+    tunnel_say("I will remember your answer, so I only ask once.")
+    try:
+        answer = tunnel_ask_choice("How will people reach your node?", [("1", "port forwarding - I forward ports in my router"), ("2", "Cloudflare Tunnel - no port forwarding, Cloudflare carries it")])
+    except (EOFError, KeyboardInterrupt, SystemExit):
+        tunnel_say("No answer (no input available), continuing without a tunnel.")
+        return
+    if answer == "1":
+        with open(choice_path, "w", encoding="utf-8") as handle:
+            json.dump({"choice": "forwarding"}, handle)
+        return
+    cloudflared = tunnel_find_cloudflared(None)
+    if not cloudflared:
+        tunnel_say("cloudflared is not installed yet.")
+        path, error = tunnel_download_cloudflared()
+        if path:
+            tunnel_say("Downloaded cloudflared to " + path)
+            cloudflared = path
+        else:
+            tunnel_say(error)
+            tunnel_install_instructions()
+            tunnel_say("Tunnel setup did not finish. The node starts without a tunnel; run the setup again with: python node.py --tunnel-setup")
+            return
+    try:
+        ok = tunnel_setup(cloudflared, None, state_path, os.environ.get("MCX_REGISTRY_URL", TUNNEL_DEFAULT_REGISTRY))
+    except SystemExit:
+        ok = False
+    if not ok:
+        tunnel_say("Tunnel setup did not finish. The node starts without a tunnel; run the setup again with: python node.py --tunnel-setup")
+        return
+    with open(choice_path, "w", encoding="utf-8") as handle:
+        json.dump({"choice": "tunnel"}, handle)
+    tunnel_start_watcher_thread(state_path)
 
 # === TUNNEL SECTION END ===
 if __name__ == "__main__":
