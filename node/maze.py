@@ -1,5 +1,6 @@
 import bootstrap
 import config
+import consensus
 
 def _maze_att_weight(size) -> int:
     if isinstance(size, float) and (not bootstrap.math.isfinite(size)):
@@ -57,6 +58,8 @@ SNAPSHOT_INTERVAL = 10000
 SNAPSHOT_SYNC_THRESHOLD = 100
 SNAPSHOT_WINDOW = 100
 SNAPSHOT_RETRY_COOLDOWN = 60
+_R37_POOL_WAIT_S = 5
+_R37_SYNC_IMPORT_DEFER_CAP_S = 300
 SNAPSHOT_REQUEST_TIMEOUT = 30
 PEER_ALIVE_WINDOW = 300
 CONSENSUS_EXCLUDED_FIELDS = {'hash', 'signature', 'pqc_signature', 'finalized'}
@@ -268,7 +271,7 @@ class Maze3DGenerator:
         return [[[False] * size for _ in range(size)] for _ in range(size)]
 
     @staticmethod
-    def is_connected(maze, start: bootstrap.Tuple[int, int, int], goal: bootstrap.Tuple[int, int, int]) -> bool:
+    def is_connected(maze, start: bootstrap.Tuple[int, int, int], goal: bootstrap.Tuple[int, int, int], total_open=None) -> bool:
         if isinstance(maze, SparseMaze):
             size = maze.size
             walls = maze.walls
@@ -285,8 +288,36 @@ class Maze3DGenerator:
                 if 0 <= nx < size and 0 <= ny < size and (0 <= nz < size) and ((nx, ny, nz) not in visited) and (not is_wall(nx, ny, nz)):
                     visited.add((nx, ny, nz))
                     queue.append((nx, ny, nz))
-        total_open = size * size * size - len(walls) if isinstance(maze, SparseMaze) else sum((1 for zz in range(size) for yy in range(size) for xx in range(size) if not maze[zz][yy][xx]))
+        if total_open is None:
+            total_open = size * size * size - len(walls) if isinstance(maze, SparseMaze) else sum((1 for zz in range(size) for yy in range(size) for xx in range(size) if not maze[zz][yy][xx]))
         return len(visited) == total_open
+
+    @staticmethod
+    def _wall_keeps_connected(maze, size, x, y, z):
+        _nbrs = []
+        for _dx, _dy, _dz in DIRS_3D.values():
+            _nx, _ny, _nz = (x + _dx, y + _dy, z + _dz)
+            if 0 <= _nx < size and 0 <= _ny < size and (0 <= _nz < size) and (not maze[_nz][_ny][_nx]):
+                _nbrs.append((_nx, _ny, _nz))
+        if not _nbrs:
+            return Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1))
+        if len(_nbrs) == 1:
+            return True
+        _targets = set(_nbrs[1:])
+        _visited = {_nbrs[0]}
+        _queue = bootstrap.deque([_nbrs[0]])
+        while _queue:
+            _cx, _cy, _cz = _queue.popleft()
+            for _dx, _dy, _dz in DIRS_3D.values():
+                _nx, _ny, _nz = (_cx + _dx, _cy + _dy, _cz + _dz)
+                if 0 <= _nx < size and 0 <= _ny < size and (0 <= _nz < size) and ((_nx, _ny, _nz) not in _visited) and (not maze[_nz][_ny][_nx]):
+                    _visited.add((_nx, _ny, _nz))
+                    if (_nx, _ny, _nz) in _targets:
+                        _targets.discard((_nx, _ny, _nz))
+                        if not _targets:
+                            return True
+                    _queue.append((_nx, _ny, _nz))
+        return False
 
     @staticmethod
     def open_cells(maze) -> bootstrap.List[bootstrap.Tuple[int, int, int]]:
@@ -342,3 +373,111 @@ def _seal_ts_log_due(key: str) -> bool:
         return True
     except Exception:
         return True
+
+def _generate_maze_pure(seed_hex: str, size: int, density_ppm: int, turb_ppm: int) -> SparseMaze:
+    _size = _valid_maze_size(size)
+    if _size is None:
+        raise ValueError(f'refusing to generate maze with invalid size {size!r}')
+    size = _size
+    rng = consensus.ConsensusRng(bytes.fromhex(seed_hex))
+    density = density_ppm / 1000000.0
+    maze = [[[True] * size for _ in range(size)] for _ in range(size)]
+
+    def carve(x0, y0, z0, x1, y1, z1):
+        width, depth, height = (x1 - x0, y1 - y0, z1 - z0)
+        if min(width, depth, height) <= 2:
+            for z in range(z0, z1):
+                for y in range(y0, y1):
+                    for x in range(x0, x1):
+                        maze[z][y][x] = False
+            return
+        axis = 0
+        max_dim = width
+        if depth > max_dim:
+            axis = 1
+            max_dim = depth
+        if height > max_dim:
+            axis = 2
+        bounds = [(x0, x1), (y0, y1), (z0, z1)]
+        low, high = bounds[axis]
+        split = rng.randbelow(high - low - 2) + low + 1
+        bounds_a = [list(b) for b in bounds]
+        bounds_b = [list(b) for b in bounds]
+        bounds_a[axis][1] = split
+        bounds_b[axis][0] = split + 1
+        carve(bounds_a[0][0], bounds_a[1][0], bounds_a[2][0], bounds_a[0][1], bounds_a[1][1], bounds_a[2][1])
+        carve(bounds_b[0][0], bounds_b[1][0], bounds_b[2][0], bounds_b[0][1], bounds_b[1][1], bounds_b[2][1])
+        px = rng.randbelow(x1 - x0) + x0
+        py = rng.randbelow(y1 - y0) + y0
+        pz = rng.randbelow(z1 - z0) + z0
+        passage = [px, py, pz]
+        passage[axis] = split
+        maze[passage[2]][passage[1]][passage[0]] = False
+        adj = list(passage)
+        adj[axis] += 1
+        maze[adj[2]][adj[1]][adj[0]] = False
+    carve(0, 0, 0, size, size, size)
+    maze[0][0][0] = False
+    maze[size - 1][size - 1][size - 1] = False
+    _r35_open = sum((1 for zz in range(size) for yy in range(size) for xx in range(size) if not maze[zz][yy][xx]))
+    if not Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1), total_open=_r35_open):
+        bootstrap.logger.warning(f'[Maze] BSP carve not connected for size={size}, retrying with dense fill fallback')
+        maze = [[[True] * size for _ in range(size)] for _ in range(size)]
+        for z in range(size):
+            for y in range(size):
+                for x in range(size):
+                    maze[z][y][x] = False
+        maze[0][0][0] = False
+        maze[size - 1][size - 1][size - 1] = False
+        _r35_open = size * size * size
+    density_ratio = max(0.25, min(0.9, density_ppm / 1000000.0))
+    open_cells = [(x, y, z) for z in range(size) for y in range(size) for x in range(size) if not maze[z][y][x] and (x, y, z) not in ((0, 0, 0), (size - 1, size - 1, size - 1))]
+    for i in range(len(open_cells) - 1, 0, -1):
+        j = rng.randbelow(i + 1)
+        open_cells[i], open_cells[j] = (open_cells[j], open_cells[i])
+    extra = int(len(open_cells) * density_ratio)
+    for x, y, z in open_cells[:extra]:
+        maze[z][y][x] = True
+        if not Maze3DGenerator._wall_keeps_connected(maze, size, x, y, z):
+            maze[z][y][x] = False
+        else:
+            _r35_open -= 1
+    corridor_threshold = 2
+    corridor_chance = 95
+    for axis in range(3):
+        for a in range(size):
+            for b in range(size):
+                run = 0
+                for c in range(size):
+                    coords = [0, 0, 0]
+                    coords[axis] = c
+                    coords[(axis + 1) % 3] = a
+                    coords[(axis + 2) % 3] = b
+                    x, y, z = coords
+                    if not maze[z][y][x]:
+                        run += 1
+                        if run >= corridor_threshold and rng.randbelow(100) < corridor_chance:
+                            if (x, y, z) not in [(0, 0, 0), (size - 1, size - 1, size - 1)]:
+                                maze[z][y][x] = True
+                                if not Maze3DGenerator._wall_keeps_connected(maze, size, x, y, z):
+                                    maze[z][y][x] = False
+                                else:
+                                    _r35_open -= 1
+                                run = 0
+                    else:
+                        run = 0
+    if not Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1), total_open=_r35_open):
+        bootstrap.logger.warning(f'[Maze] Final connectivity check failed for size={size}, reverting extra walls')
+        maze = [[[False] * size for _ in range(size)] for _ in range(size)]
+        for z in range(size):
+            for y in range(size):
+                for x in range(size):
+                    maze[z][y][x] = False
+        maze[0][0][0] = False
+        maze[size - 1][size - 1][size - 1] = False
+    sparse = dense_to_sparse(maze)
+    return sparse
+
+def _maze_gen_worker(key):
+    seed_hex, size, density_ppm, turb_ppm = key
+    return (key, _generate_maze_pure(seed_hex, size, density_ppm, turb_ppm))

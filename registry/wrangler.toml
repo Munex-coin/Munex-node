@@ -1,0 +1,22 @@
+name = "munex-registry"
+main = "munex-registry-worker-v5.js"
+compatibility_date = "2026-11-19"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+# KV is optional: without it the pool lives in memory per isolate, and the
+# /nodes endpoint rebuilds it on demand (cold-start refresh). With it, the
+# list persists across requests. To bind it:
+#   npx wrangler kv namespace create REGISTRY_KV
+# then uncomment the block below, paste the id, and redeploy.
+# [[kv_namespaces]]
+# binding = "REGISTRY_KV"
+# id = "<your KV namespace id>"
+
+# Deploy layout (same flow as v4): this file is written for a deploy
+# directory that holds the worker next to it, as v4-deliver did:
+#   mkdir -p v5-deliver
+#   cp munex-registry-worker-v5.js v5-deliver/
+#   cp v5/wrangler-v5.toml v5-deliver/wrangler.toml
+#   cd v5-deliver && npx wrangler deploy

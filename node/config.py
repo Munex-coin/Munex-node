@@ -1,6 +1,6 @@
 import bootstrap
 CONFIG_PATH = bootstrap.os.environ.get('MCX_CONFIG', 'config.yaml')
-DEFAULT_CONFIG = {'node': {'ws_port': 8080, 'ws_bind_ip': '0.0.0.0', 'api_port': 8085, 'p2p_port': 8081, 'public_url': None, 'external_ip': '', 'external_port': 8081, 'bind_ip': '0.0.0.0', 'rpc_bind_ip': '0.0.0.0', 'rpc_token': '', 'rpc_trust_loopback': False, 'mainnet': True}, 'database': {'url': None, 'require_postgres': False}, 'consensus': {'block_time': 50, 'min_step_interval': 0, 'max_misses': 3, 'epoch_length': 100, 'prune_blocks': 10000, 'wall_density_3d': 0.55, 'initial_required_knowledge': 10, 'min_required_knowledge': 5, 'max_required_knowledge': 100, 'knowledge_adjustment_interval': 5, 'target_catch_time': 60.0, 'finality_threshold': 0.66, 'commit_reveal_activation_height': 0, 'lottery_scale': 1 << 249, 'attest_fresh_buffer': 5, 'attest_growth_per_block': 5, 'slot_timeout': 30, 'validators': []}, 'fees': {'max_fee': 100000, 'fee_per_byte': 10, 'rbf_increment': 1.1, 'cpfp_min_fee': 100}, 'p2p': {'genesis_node': 'munexseed.duckdns.org', 'dns_seeds': ['munexseed.duckdns.org'], 'bootstrap_nodes': ['munexseed.duckdns.org:8081'], 'dht_bootstrap_nodes': ['munexseed.duckdns.org:8083'], 'fallback_nodes': [], 'max_peers': 50, 'ban_threshold': 5, 'ban_duration': 3600, 'dht_enabled': True, 'discovery_interval': 300, 'discovery_timeout': 60, 'registry_url': 'https://munex-registry.animax-plorer22.workers.dev/nodes', 'registry_enabled': True, 'registry_interval': 300, 'allow_private_peers': False}, 'vm': {'max_state_size': 1024, 'sandbox': True, 'require_sandbox': True, 'timeout_seconds': 5}, 'mempool': {'max_size': 10000, 'expiry': 3600, 'max_tx_per_block': 100}, 'svf': {'key_file': ''}}
+DEFAULT_CONFIG = {'node': {'ws_port': 8080, 'ws_bind_ip': '0.0.0.0', 'api_port': 8085, 'p2p_port': 8081, 'public_url': None, 'external_ip': '', 'external_port': 8081, 'bind_ip': '0.0.0.0', 'rpc_bind_ip': '0.0.0.0', 'rpc_token': '', 'rpc_trust_loopback': False, 'mainnet': True}, 'database': {'url': None, 'require_postgres': False}, 'consensus': {'block_time': 50, 'min_step_interval': 0, 'max_misses': 3, 'epoch_length': 100, 'prune_blocks': 10000, 'wall_density_3d': 0.55, 'initial_required_knowledge': 10, 'min_required_knowledge': 5, 'max_required_knowledge': 100, 'knowledge_adjustment_interval': 5, 'target_catch_time': 60.0, 'finality_threshold': 0.66, 'commit_reveal_activation_height': 0, 'lottery_scale': 1 << 249, 'slot_timeout': 30, 'validators': []}, 'fees': {'max_fee': 100000, 'fee_per_byte': 10, 'rbf_increment': 1.1, 'cpfp_min_fee': 100}, 'p2p': {'genesis_node': 'munexseed.duckdns.org', 'dns_seeds': ['munexseed.duckdns.org'], 'bootstrap_nodes': ['munexseed.duckdns.org:8081'], 'dht_bootstrap_nodes': ['munexseed.duckdns.org:8083'], 'fallback_nodes': [], 'max_peers': 50, 'ban_threshold': 5, 'ban_duration': 3600, 'dht_enabled': True, 'discovery_interval': 300, 'discovery_timeout': 60, 'registry_url': 'https://munex-registry.animax-plorer22.workers.dev/nodes', 'registry_enabled': True, 'registry_interval': 300, 'allow_private_peers': False, 'tunnel_host': ''}, 'vm': {'max_state_size': 1024, 'sandbox': True, 'require_sandbox': True, 'timeout_seconds': 5}, 'mempool': {'max_size': 10000, 'expiry': 3600, 'max_tx_per_block': 100}, 'svf': {'key_file': ''}}
 
 def load_config():
     cfg = bootstrap.copy.deepcopy(DEFAULT_CONFIG)
@@ -130,14 +130,12 @@ SHRINK_INTERVAL = 100
 SHRINK_INTERVAL_SEC = 3600
 ACTIVE_MINER_WINDOW_BLOCKS = 5
 LOTTERY_SCALE = int(CONFIG['consensus'].get('lottery_scale', 1 << 249))
-ATTEST_FRESH_BUFFER = int(CONFIG['consensus'].get('attest_fresh_buffer', 5))
-ATTEST_GROWTH_PER_BLOCK = int(CONFIG['consensus'].get('attest_growth_per_block', 5))
 SLOT_TIMEOUT = int(CONFIG['consensus'].get('slot_timeout', 30))
-CONSENSUS_PARAM_KEYS = ('lottery_scale', 'attest_fresh_buffer', 'attest_growth_per_block', 'slot_timeout')
+CONSENSUS_PARAM_KEYS = ('lottery_scale', 'slot_timeout')
 
 def _consensus_defaults():
     _c = DEFAULT_CONFIG.get('consensus', {})
-    return {'lottery_scale': int(_c.get('lottery_scale', 1 << 249)), 'attest_fresh_buffer': int(_c.get('attest_fresh_buffer', 5)), 'attest_growth_per_block': int(_c.get('attest_growth_per_block', 5)), 'slot_timeout': int(_c.get('slot_timeout', 30))}
+    return {'lottery_scale': int(_c.get('lottery_scale', 1 << 249)), 'slot_timeout': int(_c.get('slot_timeout', 30))}
 
 def _validate_lottery_value(name, v, minimum: int) -> int:
     if isinstance(v, bool) or not isinstance(v, int):
@@ -161,7 +159,7 @@ def _strict_bool(name, v, default=False) -> bool:
 
 def apply_consensus_config(config) -> dict:
     import genesis
-    global LOTTERY_SCALE, ATTEST_FRESH_BUFFER, ATTEST_GROWTH_PER_BLOCK, SLOT_TIMEOUT, VALIDATORS
+    global LOTTERY_SCALE, SLOT_TIMEOUT, VALIDATORS
     global MAX_MISSES, BAN_DURATION, PRUNE_BLOCKS, WALL_DENSITY_3D
     global GAS_PRICE, GAS_LIMIT_DEFAULT, MAX_BYTECODE
     global MAX_BLOCK_GAS, MAX_BLOCK_TXS, HTLC_V1_ENABLED
@@ -169,8 +167,6 @@ def apply_consensus_config(config) -> dict:
     _vals = validate_validators_config(_c.get('validators'))
     rec = genesis._consensus_record_from_config(config)
     LOTTERY_SCALE = rec['lottery_scale']
-    ATTEST_FRESH_BUFFER = rec['attest_fresh_buffer']
-    ATTEST_GROWTH_PER_BLOCK = rec['attest_growth_per_block']
     SLOT_TIMEOUT = rec['slot_timeout']
     VALIDATORS = _vals
     MAX_MISSES = rec['max_misses']
@@ -183,7 +179,7 @@ def apply_consensus_config(config) -> dict:
     MAX_BLOCK_GAS = rec['max_block_gas']
     MAX_BLOCK_TXS = rec['max_block_txs']
     HTLC_V1_ENABLED = rec['htlc_v1_enabled']
-    return {'lottery_scale': LOTTERY_SCALE, 'attest_fresh_buffer': ATTEST_FRESH_BUFFER, 'attest_growth_per_block': ATTEST_GROWTH_PER_BLOCK, 'slot_timeout': SLOT_TIMEOUT, 'validators': sorted(_effective_validators()), 'max_misses': int(MAX_MISSES), 'ban_duration': int(BAN_DURATION), 'prune_blocks': int(PRUNE_BLOCKS), 'wall_density_3d': float(WALL_DENSITY_3D), 'gas_price': int(GAS_PRICE), 'gas_limit_default': int(GAS_LIMIT_DEFAULT), 'max_bytecode': int(MAX_BYTECODE), 'max_block_gas': int(MAX_BLOCK_GAS), 'max_block_txs': int(MAX_BLOCK_TXS), 'htlc_v1_enabled': bool(HTLC_V1_ENABLED)}
+    return {'lottery_scale': LOTTERY_SCALE, 'slot_timeout': SLOT_TIMEOUT, 'validators': sorted(_effective_validators()), 'max_misses': int(MAX_MISSES), 'ban_duration': int(BAN_DURATION), 'prune_blocks': int(PRUNE_BLOCKS), 'wall_density_3d': float(WALL_DENSITY_3D), 'gas_price': int(GAS_PRICE), 'gas_limit_default': int(GAS_LIMIT_DEFAULT), 'max_bytecode': int(MAX_BYTECODE), 'max_block_gas': int(MAX_BLOCK_GAS), 'max_block_txs': int(MAX_BLOCK_TXS), 'htlc_v1_enabled': bool(HTLC_V1_ENABLED)}
 
 def check_consensus_params(config, genesis_data):
     import genesis

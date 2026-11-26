@@ -22,9 +22,11 @@ def _ws_health_handler(request):
     from aiohttp import web
     return web.json_response({'status': 'ok', 'service': 'mcx-miner-ws'})
 
-def _ws_app_routes(app, websocket_handler):
+def _ws_app_routes(app, websocket_handler, p2p_handler=None):
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/healthz', _ws_health_handler)
+    if p2p_handler is not None:
+        app.router.add_get('/p2p', p2p_handler)
     return app
 
 class _StageRollback(Exception):
@@ -92,7 +94,6 @@ class MicroCoreNode:
         self.rate_limiter = mempool.RateLimiter()
         self._ws_rate_limit_log: bootstrap.Dict[str, list] = {}
         self.subnet_rate_limiter = mempool.RateLimiter(max_requests=300, window_seconds=60)
-        self.register_rate_limiter = mempool.RateLimiter(max_requests=6, window_seconds=60)
         self.rpc_rate_limiter = mempool.RateLimiter(max_requests=30, window_seconds=60)
         self.miner_rate_limiters: bootstrap.Dict[str, mempool.RateLimiter] = {}
         self.health_checker = mempool.HealthChecker()
@@ -101,6 +102,8 @@ class MicroCoreNode:
         self.mempool = mempool.Mempool()
         self.memory_mgr = mempool.MemoryChallengeManager()
         self.blockexecutionlock = bootstrap.asyncio.Lock()
+        self._import_lock = bootstrap.asyncio.Lock()
+        self._import_lock_holder = None
         self.ws_sessions = {}
         self.vm_manager = None
         self.p2p = None
@@ -304,6 +307,7 @@ class MicroCoreNode:
                     except Exception:
                         continue
                 bootstrap.logger.debug(f'[SVF] restored {len(self.svf_certificates)} certificates from DB')
+                self.svf_evidence_store = {}
                 tip_h = int(self.height or 0)
                 earliest_epoch = max(0, (tip_h - config.PRUNE_BLOCKS) // svf.SVF_EPOCH_BLOCKS)
                 if self.db.db_type == 'sqlite':
@@ -332,6 +336,101 @@ class MicroCoreNode:
                         bootstrap.logger.debug(f'[Sync] Restored seal-time snapshot for tip block {_tip_id} from state_snapshots')
         except Exception as _ss_e:
             bootstrap.logger.debug(f'[Sync] seal-time snapshot restore failed: {_ss_e}')
+        try:
+            await self._replay_stored_forward_history()
+        except Exception as _r34_e:
+            bootstrap.logger.warning(f'[R34] catch-up replay failed: {_r34_e}')
+
+    async def _replay_stored_forward_history(self) -> bool:
+        _tip = await self.block_repo.get_latest()
+        if _tip is None:
+            return True
+        _tip_id = int(_tip['id'])
+        if _tip_id <= 0:
+            return True
+        try:
+            _maze_n = await self.db.fetchrow('SELECT COUNT(*) AS n FROM minermazes')
+            _miner_n = await self.db.fetchrow('SELECT COUNT(*) AS n FROM miners')
+        except Exception as _e:
+            bootstrap.logger.warning(f'[R34] replay: state check failed ({_e}) — skipping replay')
+            return False
+        _n_maze = 0
+        _n_miner = 0
+        try:
+            _n_maze = int((_maze_n or {}).get('n', 0) or 0)
+            _n_miner = int((_miner_n or {}).get('n', 0) or 0)
+        except Exception:
+            pass
+        if _n_maze > 0 or _n_miner > 0:
+            return True
+        _first = await self.block_repo.get_by_id(1)
+        if _first is None:
+            bootstrap.logger.info('[R34] replay: stored history starts above block 1 — no replay possible, waiting for a snapshot')
+            return False
+        _prev_hash = ''
+        _g0 = await self.block_repo.get_by_id(0)
+        if _g0 is not None:
+            _prev_hash = str(_g0.get('hash', '') or '')
+        if not _prev_hash:
+            try:
+                _gd = genesis.load_genesis_file()
+                if _gd:
+                    _prev_hash = str(_gd.get('hash', '') or '')
+            except Exception:
+                _prev_hash = ''
+        if not _prev_hash:
+            _prev_hash = str(getattr(self, 'genesis_hash', '') or '')
+        if not _prev_hash:
+            bootstrap.logger.info('[R34] replay: no genesis hash available — skipping the block-1 phash anchor check (hash + state-root checks still apply)')
+        _del_q = 'DELETE FROM blocks WHERE id = ?' if self.db.db_type == 'sqlite' else 'DELETE FROM blocks WHERE id = $1'
+        _replayed = 0
+        _bid = 1
+        _ok = True
+        while _bid <= _tip_id:
+            _blk = await self.block_repo.get_by_id(_bid)
+            if _blk is None:
+                bootstrap.logger.info(f'[R34] replay: stored history ends at block {_bid - 1} (gap) — replayed {_replayed} block(s), waiting for a snapshot for the rest')
+                _ok = False
+                break
+            _verified = True
+            try:
+                if str(_blk.get('hash', '') or '') != crypto.calculate_block_hash(_blk):
+                    raise P2P.AuxStateError(f'replay: stored block {_bid} hash mismatch')
+                if _prev_hash and str(_blk.get('phash', '') or '') != _prev_hash:
+                    raise P2P.AuxStateError(f'replay: stored block {_bid} phash does not link to block {_bid - 1}')
+            except Exception as _ve:
+                bootstrap.logger.warning(f'[R34] replay: stored block {_bid} failed hash/link verification ({_ve}) — stopping replay')
+                _verified = False
+            if not _verified:
+                _ok = False
+                break
+            _prev_hash = str(_blk.get('hash', '') or '')
+            try:
+                await self.db.execute_dml(_del_q, _bid)
+                await self._append_block(_blk)
+            except Exception as _ae:
+                try:
+                    await self.block_repo.create(_blk)
+                except Exception as _re:
+                    bootstrap.logger.warning(f'[R34] replay: could not restore stored block {_bid} after failed append ({_re})')
+                bootstrap.logger.warning(f'[R34] replay: block {_bid} failed to apply ({_ae}) — stopping replay, state correct through block {_bid - 1}')
+                _ok = False
+                break
+            _replayed += 1
+            _bid += 1
+        try:
+            _ls = self.height - maze.BLOCK_CACHE_MAX
+            if _ls < 0:
+                _ls = 0
+            self.blocks = await self.block_repo.get_range(_ls, self.height - 1, limit=maze.BLOCK_CACHE_MAX)
+        except Exception:
+            pass
+        if _ok:
+            bootstrap.logger.info(f'[R34] replay: replayed {_replayed} stored block(s), height={self.height}')
+            return True
+        if _replayed > 0:
+            bootstrap.logger.info(f'[R34] replay: replayed {_replayed} stored block(s), height={self.height}')
+        return False
 
     async def _live_mazes(self) -> list:
         rows = await self.maze_repo.get_eligible(self.height)
@@ -417,6 +516,35 @@ class MicroCoreNode:
                 if _sz is not None:
                     return _sz
         return None
+
+    async def _resolve_actual_maze_size(self, att_mid, block, _proven_base=None, _snap_att=None, _reorg_mode=False, _fallback_to_min=True):
+        _mid = str(att_mid or '')
+        if not _mid:
+            return config.MIN_MAZE_SIZE if _fallback_to_min else None
+        _lu = maze._last_updates_by_maze(block.get('maze_updates', []) or [])
+        _lu_e = _lu.get(_mid) or _lu.get(_mid.lower())
+        if isinstance(_lu_e, dict):
+            _sz = maze._valid_maze_size(_lu_e.get('new_size'))
+            if _sz is not None:
+                return int(_sz)
+        if _reorg_mode and (not isinstance(_proven_base, dict)):
+            _psz = None
+        else:
+            try:
+                _psz = await self._proven_update_size(_mid, int(block.get('id', 0)), _proven_base if _reorg_mode else None)
+            except Exception:
+                _psz = None
+        _sz = maze._valid_maze_size(_psz)
+        if _sz is not None:
+            return int(_sz)
+        if isinstance(_snap_att, dict):
+            _sv = _snap_att.get(_mid)
+            if _sv is None:
+                _sv = _snap_att.get(_mid.lower())
+            _sz = maze._valid_maze_size(_sv)
+            if _sz is not None:
+                return int(_sz)
+        return config.MIN_MAZE_SIZE if _fallback_to_min else None
 
     async def execute_transaction(self, tx_data: bootstrap.Dict, block_id: int, block_ts: float=None) -> bootstrap.Tuple[bool, bootstrap.Dict]:
         if block_ts is None:
@@ -1422,7 +1550,7 @@ class MicroCoreNode:
                 return False
         return True
 
-    async def verify_block_proof(self, block: dict, _att_base: dict=None, _maze_base: dict=None, _branch=None, _proven_base: dict=None) -> bool:
+    async def verify_block_proof(self, block: dict, _att_base: dict=None, _maze_base: dict=None, _branch=None, _proven_base: dict=None, _snap_att: dict=None) -> bool:
         if block.get('id') == 0:
             if genesis._node_genesis_hash:
                 return block.get('phash') == '0' * 64 and block.get('hash') == genesis._node_genesis_hash
@@ -1500,18 +1628,12 @@ class MicroCoreNode:
             if _pb >= block.get('id', 0):
                 bootstrap.logger.warning(f'[Verify] Block {block['id']} growth cap unverifiable (local attestation at {_pb} on competing chain) — rejected (ATTEST-CAP-STRICT)')
                 return False
-            else:
-                _cap = int(_prior_att.get('last_size', config.MIN_MAZE_SIZE)) + config.ATTEST_GROWTH_PER_BLOCK * (int(block.get('id', 0)) - _pb)
-                if att_size > _cap:
-                    bootstrap.logger.warning(f'[Verify] Block {block['id']} attestation growth cap exceeded: {att_size} > {_cap} (IDEA5-ATTEST)')
-                    return False
-        else:
-            _cap = config.MIN_MAZE_SIZE + config.ATTEST_FRESH_BUFFER
-            if att_size > _cap:
-                bootstrap.logger.warning(f'[Verify] Block {block['id']} first attestation exceeds cap: {att_size} > {_cap} (ATTEST-FRESH-BUFFER-1)')
-                return False
         if att_size < config.MIN_MAZE_SIZE:
             bootstrap.logger.warning(f'[Verify] Block {block['id']} attestation size {att_size} below floor (must be >= {config.MIN_MAZE_SIZE})')
+            return False
+        _actual_size = await self._resolve_actual_maze_size(att_mid, block, _proven_base=_proven_base, _snap_att=_snap_att, _reorg_mode=_reorg_mode)
+        if _actual_size is None or att_size != int(_actual_size):
+            bootstrap.logger.warning(f'[Verify] Block {block['id']} attested size {att_size} != actual maze size {_actual_size} for {att_mid[:16]} (R28-STRICT-SIZE)')
             return False
         if True:
             _ld = block.get('lottery_draw')
@@ -1580,36 +1702,19 @@ class MicroCoreNode:
                 if str(_lr.get('maze_id', '')).lower() == att_mid.lower():
                     _ld_cand_size = int(_lr.get('size', 0))
                     break
-            if _ld_cand_size is None or att_size > _ld_cand_size:
+            if _ld_cand_size is None or att_size != _ld_cand_size:
                 bootstrap.logger.warning(f'[Verify] Block {block['id']} attested size {att_size} inconsistent with lottery candidate - rejecting')
                 return False
             if _ld_widx != _ld_rank and (not _ld.get('takeover')):
                 bootstrap.logger.warning(f'[Verify] Block {block['id']} lottery winner_index != rank without takeover flag - rejecting')
                 return False
-        if att_size > config.MIN_MAZE_SIZE + config.ATTEST_FRESH_BUFFER:
-            _here = False
-            for _u in list(block.get('maze_updates') or []) + list(block.get('attestation_proof') or []):
-                if not isinstance(_u, dict):
-                    continue
-                _um = str(_u.get('maze_id') or _u.get('miner_id') or '')
-                if _um == att_mid and maze._valid_maze_size(_u.get('new_size')) == att_size:
-                    _here = True
-                    break
-            if not _here:
-                if isinstance(_proven_base, dict):
-                    _pb_sz = _proven_base.get(att_mid)
-                    if _pb_sz is not None and att_size <= int(_pb_sz):
-                        _here = True
-                elif not _reorg_mode:
-                    try:
-                        _pa = await self.maze_attestation_repo.get(att_mid)
-                    except Exception:
-                        _pa = None
-                    if _pa is not None and int(_pa.get('last_size', 0) or 0) >= att_size:
-                        _here = True
-            if not _here:
-                bootstrap.logger.warning(f'[Verify] Block {block['id']} attestation size {att_size} not backed by a proven catch')
-                return False
+            for _clw, _cl in _ld_pos:
+                _cl_mid = str(_cl.get('maze_id', '') or '')
+                _cl_sz = int(_cl.get('size', 0))
+                _cl_actual = await self._resolve_actual_maze_size(_cl_mid, block, _proven_base=_proven_base, _snap_att=_snap_att, _reorg_mode=_reorg_mode, _fallback_to_min=False)
+                if _cl_actual is not None and _cl_sz != int(_cl_actual):
+                    bootstrap.logger.warning(f'[Verify] Block {block['id']} lottery candidate {_cl_mid[:16]} size {_cl_sz} != actual {_cl_actual} (R28-STRICT-SIZE)')
+                    return False
         try:
             _gsf = float(block.get('global_shrink_factor', 1.0))
         except (TypeError, ValueError):
@@ -1660,8 +1765,7 @@ class MicroCoreNode:
             new_size = _new_size
             if seed and new_size > 0:
                 try:
-                    loop = bootstrap.asyncio.get_event_loop()
-                    test_maze = await loop.run_in_executor(self.consensus._move_executor, self.consensus._generate_deterministic_maze, seed, new_size, new_density, new_turbulence, self.height)
+                    test_maze = await self.consensus._ensure_maze_cached(seed, new_size, new_density, new_turbulence)
                     expected_root = self.consensus._calculate_maze_root(test_maze)
                     claimed_root = update.get('mazeroot', '')
                     if claimed_root and expected_root != claimed_root:
@@ -1702,8 +1806,7 @@ class MicroCoreNode:
                     bootstrap.logger.warning(f'[Verify] Block {block['id']} maze growth size jump {parent_size} -> {new_size} != +1 for {mid[:16]}')
                     return False
                 try:
-                    loop = bootstrap.asyncio.get_event_loop()
-                    parent_maze = await loop.run_in_executor(self.consensus._move_executor, self.consensus._generate_deterministic_maze, parent_seed, parent_size, parent_density, parent_turbulence, self.height)
+                    parent_maze = await self.consensus._ensure_maze_cached(parent_seed, parent_size, parent_density, parent_turbulence)
                     actual_parent_root = self.consensus._calculate_maze_root(parent_maze)
                     if parent_mazeroot and actual_parent_root != parent_mazeroot:
                         bootstrap.logger.warning(f'[Verify] Block {block['id']} parent maze root mismatch for {mid[:16]}')
@@ -1752,8 +1855,7 @@ class MicroCoreNode:
             _pturb = _pe.get('turbulenceppm', 0)
             if _pseed and _psz > 0:
                 try:
-                    _ploop = bootstrap.asyncio.get_event_loop()
-                    _ptest = await _ploop.run_in_executor(self.consensus._move_executor, self.consensus._generate_deterministic_maze, _pseed, _psz, _pdens, _pturb, self.height)
+                    _ptest = await self.consensus._ensure_maze_cached(_pseed, _psz, _pdens, _pturb)
                     _pexp = self.consensus._calculate_maze_root(_ptest)
                     _pclaim = _pe.get('mazeroot', '')
                     if _pclaim and _pexp != _pclaim:
@@ -1785,8 +1887,7 @@ class MicroCoreNode:
                     bootstrap.logger.warning(f'[Verify] Block {block['id']} attestation_proof size jump {_ppsz_v} -> {_psz} != +1 — rejected')
                     return False
                 try:
-                    _ploop2 = bootstrap.asyncio.get_event_loop()
-                    _pparent = await _ploop2.run_in_executor(self.consensus._move_executor, self.consensus._generate_deterministic_maze, _pps, _ppsz_v, _ppd, _ppt, self.height)
+                    _pparent = await self.consensus._ensure_maze_cached(_pps, _ppsz_v, _ppd, _ppt)
                     _pactual = self.consensus._calculate_maze_root(_pparent)
                     if _ppm and _pactual != _ppm:
                         bootstrap.logger.warning(f'[Verify] Block {block['id']} attestation_proof parent maze root mismatch — rejected')
@@ -2058,6 +2159,8 @@ class MicroCoreNode:
                 if not crypto.verify_signature(pub_key, message, signature):
                     bootstrap.logger.warning(f'[MINER] Re-registration signature invalid for {miner_id[:16]}')
                     return False
+                if block_signing_pub:
+                    existing['block_signing_pub'] = block_signing_pub
             now = bootstrap.time.time()
             if existing.get('banned_until', 0) > now:
                 bootstrap.logger.info(f'[MINER] Re-registration rejected for {miner_id[:16]}: still banned for {existing['banned_until'] - now:.0f}s')
@@ -2073,9 +2176,10 @@ class MicroCoreNode:
         if not crypto.verify_signature(pub_key, message, signature):
             bootstrap.logger.warning(f'[MINER] First-time registration signature invalid for {miner_id[:16]}')
             return False
-        _expected = 'PC_' + bootstrap.hashlib.sha256(f'{util.pubkey_to_address(pub_key)}_mcx_miner'.encode()).hexdigest()[:32].upper()
+        _signing_pub = block_signing_pub or pub_key
+        _expected = 'PC_' + bootstrap.hashlib.sha256(f'{util.pubkey_to_address(_signing_pub)}_mcx_miner'.encode()).hexdigest()[:32].upper()
         if not (miner_id == _expected or miner_id.startswith(_expected + '_')):
-            bootstrap.logger.warning(f'[MINER] Register rejected: miner_id does not derive from pub_key')
+            bootstrap.logger.warning(f'[MINER] Register rejected: miner_id does not derive from block_signing_pub')
             return False
         miner = {'miner_id': miner_id, 'wallet': wallet, 'pub': pub_key, 'block_signing_pub': block_signing_pub or pub_key, 'rewards': 0, 'blocks': 0, 'slashes': 0, 'uptime': 0, 'today_uptime': 0, 'type': 'web', 'liquidity': 0, 'fees': 0, 'last_ping': bootstrap.time.time(), 'banned_until': 0, 'created_at': bootstrap.time.time(), 'last_block': 0, 'consecutive_misses': 0, 'total_uptime': 0, 'ip_address': '', 'node_id': self.node_id, 'version': config.VERSION, 'active': True, 'confirmed_balance': 0, 'password_hash': '', 'private_key_encrypted': '', 'gas_collected': 0, 'maze_wins': 0}
         await self.miner_repo.create(miner)
@@ -2135,19 +2239,61 @@ class MicroCoreNode:
             except Exception as _re:
                 bootstrap.logger.warning(f'[Relay] Failed to relay verified block {(_blk or {}).get('id')}: {_re}')
 
+    async def _acquire_import_lock(self, what: str):
+        _t0 = bootstrap.time.monotonic()
+        _warned = False
+        while True:
+            if not self._import_lock.locked():
+                await self._import_lock.acquire()
+                _dt = bootstrap.time.monotonic() - _t0
+                if _warned:
+                    bootstrap.logger.info(f'[R35] acquired _import_lock for {what} after {_dt:.1f}s (holder was {self._import_lock_holder})')
+                self._import_lock_holder = what
+                return
+            if not _warned and bootstrap.time.monotonic() - _t0 > 2.0:
+                _warned = True
+                bootstrap.logger.warning(f'[R35] waiting >2s on _import_lock for {what} (holder={self._import_lock_holder})')
+            await bootstrap.asyncio.sleep(0.1)
+
     async def import_blocks(self, blocks_data: bootstrap.List[bootstrap.Dict]):
+        try:
+            _keys = set()
+            for _b in blocks_data or []:
+                if isinstance(_b, dict):
+                    try:
+                        if int(_b.get('id', -1)) > self.height:
+                            _keys |= self.consensus._maze_keys_for_block(_b)
+                    except Exception:
+                        pass
+            if _keys:
+                self.consensus._prewarm_background(_keys)
+        except Exception as _e:
+            bootstrap.logger.warning(f'[R35] import pre-warm failed ({_e}) — verify will generate in-process')
+        _ids = [int(_b.get('id', -1)) for _b in blocks_data or [] if isinstance(_b, dict)]
+        _what = f'import_blocks ids={_ids}'
+        await self._acquire_import_lock(_what)
+        try:
+            return await self._import_blocks_inner(blocks_data)
+        finally:
+            self._import_lock_holder = None
+            self._import_lock.release()
+
+    async def _import_blocks_inner(self, blocks_data: bootstrap.List[bootstrap.Dict]):
         sorted_blocks = sorted(blocks_data, key=lambda x: x['id'])
         for b in sorted_blocks:
             existing = await self.block_repo.get_by_id(b['id'])
             if existing and existing.get('hash') == b.get('hash'):
                 continue
             if b['id'] > self.height:
-                bootstrap.logger.debug(f'[IMPORT] Block {b['id']} above local tip {self.height} with unknown parent; skipping batch')
-                break
+                bootstrap.logger.debug(f'[IMPORT] Block {b['id']} above local tip {self.height} with unknown parent; skipping block')
+                continue
             bid = b['id']
             phash = b.get('phash', '')
             if bid == self.height and phash == self.last_hash:
-                if not await self.verify_block_proof(b):
+                _iv0 = bootstrap.time.time()
+                _iv_ok = await self.verify_block_proof(b)
+                bootstrap.logger.info(f'[IMPORT] verify block {b['id']} took {bootstrap.time.time() - _iv0:.1f}s')
+                if not _iv_ok:
                     bootstrap.logger.warning(f'[IMPORT] Block {b['id']} failed verification')
                     if not self._proof_field_hint_shown:
                         self._proof_field_hint_shown = True
@@ -2206,9 +2352,26 @@ class MicroCoreNode:
                     continue
 
     async def receive_block(self, block_data: bootstrap.Dict) -> str:
+        try:
+            if isinstance(block_data, dict):
+                self.consensus._prewarm_background(self.consensus._maze_keys_for_block(block_data))
+        except Exception as _e:
+            bootstrap.logger.warning(f'[R35] receive pre-warm failed ({_e}) — verify will generate in-process')
+        _what = f'receive_block id={(block_data.get('id') if isinstance(block_data, dict) else '?')}'
+        await self._acquire_import_lock(_what)
+        try:
+            return await self._receive_block_inner(block_data)
+        finally:
+            self._import_lock_holder = None
+            self._import_lock.release()
+
+    async def _receive_block_inner(self, block_data: bootstrap.Dict) -> str:
         _is_clean_append = isinstance(block_data, dict) and block_data.get('id') == self.height and (block_data.get('phash') == self.last_hash)
         if _is_clean_append:
-            if not await self.verify_block_proof(block_data):
+            _rv0 = bootstrap.time.time()
+            _rv_ok = await self.verify_block_proof(block_data)
+            bootstrap.logger.info(f'[IMPORT] verify block {block_data.get('id')} took {bootstrap.time.time() - _rv0:.1f}s')
+            if not _rv_ok:
                 bootstrap.logger.warning(f'[Block] Rejected block {block_data.get('id')} – invalid proof')
                 return 'rejected'
         else:
@@ -3226,7 +3389,11 @@ class MicroCoreNode:
                 row.setdefault('createdat', int(bootstrap.time.time()))
                 await self.maze_repo.upsert(row)
             else:
-                await self.maze_repo.upsert({'maze_id': _mid, 'minerid': _e.get('minerid', _mid), 'size': int(_att.get('size', config.MIN_MAZE_SIZE) or config.MIN_MAZE_SIZE) if _att_mid and _mid.lower() == _att_mid else config.MIN_MAZE_SIZE, 'walldensityppm': _e.get('walldensityppm', maze.MIN_WALL_DENSITY_PPM), 'seed': _e.get('seed', ''), 'posx': 0, 'posy': 0, 'posz': 0, 'goalx': _e.get('goalx', 0), 'goaly': _e.get('goaly', 0), 'goalz': _e.get('goalz', 0), 'movenonce': 0, 'consecutivewallhits': 0, 'turbulenceppm': 0, 'growthcount': 0, 'knowledge': 0, 'lastgoalheight': _bid, 'lastactiveheight': _bid, 'mazeroot': '', 'invitedguest': None, 'guestlock': False, 'lastknowledgeheight': 0, 'createdat': int(bootstrap.time.time()), 'updatedat': int(bootstrap.time.time()), 'ghostx': None, 'ghosty': None, 'ghostz': None})
+                _lu = maze._last_updates_by_maze(block.get('maze_updates', []) or [])
+                _lu_e = _lu.get(_mid) or _lu.get(_mid.lower())
+                _lu_sz = maze._valid_maze_size(_lu_e.get('new_size')) if isinstance(_lu_e, dict) else None
+                _new_size = int(_lu_sz) if _lu_sz is not None else config.MIN_MAZE_SIZE
+                await self.maze_repo.upsert({'maze_id': _mid, 'minerid': _e.get('minerid', _mid), 'size': _new_size, 'walldensityppm': _e.get('walldensityppm', maze.MIN_WALL_DENSITY_PPM), 'seed': _e.get('seed', ''), 'posx': 0, 'posy': 0, 'posz': 0, 'goalx': _e.get('goalx', 0), 'goaly': _e.get('goaly', 0), 'goalz': _e.get('goalz', 0), 'movenonce': 0, 'consecutivewallhits': 0, 'turbulenceppm': 0, 'growthcount': 0, 'knowledge': 0, 'lastgoalheight': _bid, 'lastactiveheight': _bid, 'mazeroot': '', 'invitedguest': None, 'guestlock': False, 'lastknowledgeheight': 0, 'createdat': int(bootstrap.time.time()), 'updatedat': int(bootstrap.time.time()), 'ghostx': None, 'ghosty': None, 'ghostz': None})
 
     async def _append_block(self, block: dict):
         _vbase = gas._validated_block_reward(block, self.total_minted)
@@ -3239,19 +3406,21 @@ class MicroCoreNode:
         async with await self.db.transaction():
             await self.block_repo.create(block)
             _pending_svf_epoch_root = None
+            _r34_pending_evidence: list = []
+            _r34_pending_mint = 0
             if svf.svf_active_at(block['id']):
                 try:
                     _ev = svf.compute_block_evidence(block, block['id'])
                     if _ev is not None:
                         _ev_epoch = block['id'] // svf.SVF_EPOCH_BLOCKS
-                        self.svf_evidence_store.setdefault(_ev_epoch, []).append(_ev)
+                        _r34_pending_evidence.append((_ev_epoch, _ev))
                         _ev_rec = {'epoch_id': _ev_epoch, 'height': _ev.block_id, 'block_hash': _ev.block_hash, 'winner_pubkey': _ev.winner_pubkey, 'attested_size': _ev.attested_size, 'attestation_weight': str(_ev.attestation_weight), 'growth_present': 1 if _ev.growth_present else 0, 'record_hash': _ev.record_hash.hex()}
                         if self.db.db_type == 'sqlite':
                             await self.db.execute_dml('INSERT OR REPLACE INTO svf_evidence (epoch_id, height, block_hash, winner_pubkey, attested_size, attestation_weight, growth_present, record_hash) VALUES (?,?,?,?,?,?,?,?)', _ev_rec['epoch_id'], _ev_rec['height'], _ev_rec['block_hash'], _ev_rec['winner_pubkey'], _ev_rec['attested_size'], _ev_rec['attestation_weight'], _ev_rec['growth_present'], _ev_rec['record_hash'])
                         else:
                             await self.db.execute_dml('INSERT INTO svf_evidence (epoch_id, height, block_hash, winner_pubkey, attested_size, attestation_weight, growth_present, record_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (epoch_id, height) DO UPDATE SET block_hash=$3, winner_pubkey=$4, attested_size=$5, attestation_weight=$6, growth_present=$7, record_hash=$8', _ev_rec['epoch_id'], _ev_rec['height'], _ev_rec['block_hash'], _ev_rec['winner_pubkey'], _ev_rec['attested_size'], _ev_rec['attestation_weight'], _ev_rec['growth_present'], _ev_rec['record_hash'])
                         bootstrap.logger.debug(f'[SVF] block {block['id']}: evidence persisted for epoch {_ev_epoch}')
-                    _epoch_recs = self.svf_evidence_store.get(_ev_epoch, [])
+                    _epoch_recs = list(self.svf_evidence_store.get(_ev_epoch, [])) + [_ev]
                     _root = svf._svf_epoch_root_if_complete(_epoch_recs, _ev_epoch)
                     if _root is not None:
                         _pending_svf_epoch_root = (_ev_epoch, _root)
@@ -3333,8 +3502,8 @@ class MicroCoreNode:
                 if _mint > 0:
                     if self.total_minted + _mint > config.MAX_SUPPLY:
                         raise P2P.AuxStateError(f'mint of block {block.get('id')} exceeds MAX_SUPPLY')
-                    self.total_minted += _mint
-                    await self.network_state_repo.set('total_minted', str(self.total_minted))
+                    await self.network_state_repo.set('total_minted', str(self.total_minted + _mint))
+                    _r34_pending_mint = _mint
             for update in block.get('maze_updates', []):
                 try:
                     mid = update.get('maze_id') or update.get('miner_id')
@@ -3461,6 +3630,10 @@ class MicroCoreNode:
                 except Exception as _e:
                     raise P2P.AuxStateError(f'maze_attestation of block {block.get('id')}: {_e}') from _e
             await self.distribute_token_mining_rewards(block['id'])
+        for _r34_ep, _r34_ev in _r34_pending_evidence:
+            self.svf_evidence_store.setdefault(_r34_ep, []).append(_r34_ev)
+        if _r34_pending_mint:
+            self.total_minted += _r34_pending_mint
         if getattr(self, 'mempool', None) is not None:
             for _h in _sealed_hashes:
                 if _h:
@@ -3891,13 +4064,13 @@ class MicroCoreNode:
                 for _addr, _amt in alloc.items():
                     _amt = int(_amt)
                     cur = await self.balance_repo.get(_addr)
-                    new_bal = cur + _amt
+                    new_bal = max(cur, _amt)
                     await self.balance_repo.set(_addr, new_bal)
                     await self.state_trie.put(f'balance:{_addr}', new_bal)
                     self.balances[_addr] = new_bal
                 gm = int(genesis_data.get('total_minted', config.GENESIS_SUPPLY))
                 cur_m = await self.network_state_repo.get('total_minted')
-                new_m = (int(cur_m) if cur_m else 0) + gm
+                new_m = max(int(cur_m) if cur_m else 0, gm)
                 await self.network_state_repo.set('total_minted', str(new_m))
                 self.total_minted = new_m
                 bootstrap.logger.info(f'{bootstrap.GREEN}[GENESIS]{bootstrap.RESET} Applied genesis alloc (+{gm // config.SUBS} MCX, {len(alloc)} address(es))')
@@ -4071,7 +4244,7 @@ class MicroCoreNode:
                 await self.mempool._cleanup_task
             except bootstrap.asyncio.CancelledError:
                 pass
-        for _rl in (self.rate_limiter, self.subnet_rate_limiter, self.register_rate_limiter, self.rpc_rate_limiter):
+        for _rl in (self.rate_limiter, self.subnet_rate_limiter, self.rpc_rate_limiter):
             _ct = getattr(_rl, '_cleanup_task', None)
             if _ct is not None and (not _ct.done()):
                 _ct.cancel()
@@ -4231,16 +4404,21 @@ class MicroCoreNode:
                         except bootstrap.json.JSONDecodeError:
                             await ws.send_json({'type': 'error', 'message': 'Invalid JSON'})
                         except Exception as e:
-                            if not self._shutdown_flag:
-                                bootstrap.logger.error(f'[WS] Handler error: {e}', exc_info=True)
-                            try:
-                                await ws.send_json({'type': 'error', 'message': str(e)})
-                            except Exception:
-                                pass
+                            if isinstance(e, (ConnectionResetError, BrokenPipeError)) or 'Cannot write to closing transport' in str(e):
+                                bootstrap.logger.debug(f'[WS] Reply to disconnected miner dropped: {e}')
+                            else:
+                                if not self._shutdown_flag:
+                                    bootstrap.logger.error(f'[WS] Handler error: {e}', exc_info=True)
+                                try:
+                                    await ws.send_json({'type': 'error', 'message': str(e)})
+                                except Exception:
+                                    pass
                     elif msg.type == WSMsgType.ERROR:
                         bootstrap.logger.debug(f'[WS] Connection error: {ws.exception()}')
             except Exception as e:
-                if not self._shutdown_flag:
+                if isinstance(e, (ConnectionResetError, BrokenPipeError)) or 'Cannot write to closing transport' in str(e):
+                    bootstrap.logger.debug(f'[WS] Connection dropped: {e}')
+                elif not self._shutdown_flag:
                     bootstrap.logger.error(f'[WS] Connection error: {e}')
             finally:
                 _sess = self.ws_sessions.pop(ws, None)
@@ -4253,7 +4431,89 @@ class MicroCoreNode:
                 if miner_id and self.miner_websockets.get(miner_id) is ws:
                     del self.miner_websockets[miner_id]
             return ws
-        app_ws = _ws_app_routes(Application(middlewares=[cors_middleware]), websocket_handler)
+
+        async def p2p_ws_handler(request):
+            ws = WebSocketResponse(heartbeat=60)
+            await ws.prepare(request)
+            client_ip = request.headers.get('CF-Connecting-IP') or request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or request.remote
+            if self.p2p and self.p2p._is_banned(address=str(client_ip or '')):
+                await ws.close(code=1008, message=b'banned')
+                return ws
+            _host_hdr = (request.headers.get('X-Forwarded-Host') or request.host or '').strip()
+            _scheme = (request.headers.get('X-Forwarded-Proto') or request.scheme or 'http').split(',')[0].strip().lower()
+            _ws_scheme = 'wss' if _scheme in ('https', 'wss') else 'ws'
+            _hh, _hp = P2P.parse_ip_port(_host_hdr, 443 if _ws_scheme == 'wss' else 80)
+            _peername = (_hh or str(client_ip or ''), int(_hp or 0))
+            _p2p_ws = f'{_ws_scheme}://{_host_hdr}/p2p' if _host_hdr else ''
+            reader = P2P._WSByteReader()
+
+            async def _server_close():
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            writer = P2P._WSByteWriter(ws.send_bytes, _server_close, _peername)
+            pump_task = bootstrap.asyncio.create_task(P2P._pump_ws_into_reader(ws, reader))
+            peer = None
+            if self.p2p:
+                _cip = str(client_ip or '')
+                _pend = self.p2p._pending_handshakes.get(_cip, 0)
+                if _pend >= self.p2p._max_pending_handshakes:
+                    bootstrap.logger.info(f'[P2P-WS] Rejecting inbound WS peer {client_ip}: too many pending handshakes ({_pend}/{self.p2p._max_pending_handshakes})')
+                    pump_task.cancel()
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    return ws
+                _now_ts = bootstrap.time.time()
+                _hs = self.p2p._handshake_rate_limiter.setdefault(_cip, [])
+                _hs[:] = [t for t in _hs if _now_ts - t < 60]
+                if len(_hs) >= self.p2p._handshake_rate_limit[0]:
+                    bootstrap.logger.info(f'[P2P-WS] Rejecting inbound WS peer {client_ip}: handshake rate limit ({len(_hs)}/{self.p2p._handshake_rate_limit[0]} per 60 s)')
+                    pump_task.cancel()
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    return ws
+                _hs.append(_now_ts)
+                self.p2p._pending_handshakes[_cip] = _pend + 1
+                try:
+                    peer = await bootstrap.asyncio.wait_for(P2P.perform_handshake(reader, writer, self.node_id, self.height, config.VERSION, self.priv, self.pub, allow_genesis_learn=False), timeout=10.0)
+                except Exception:
+                    peer = None
+                finally:
+                    self.p2p._pending_handshakes[_cip] = max(0, self.p2p._pending_handshakes.get(_cip, 1) - 1)
+                    if self.p2p._pending_handshakes[_cip] == 0:
+                        self.p2p._pending_handshakes.pop(_cip, None)
+            if peer is None:
+                pump_task.cancel()
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return ws
+            peer.transport = 'ws'
+            peer.p2p_ws = _p2p_ws
+            if not self.p2p or not await self.p2p._register_ws_peer(peer, 'in'):
+                pump_task.cancel()
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return ws
+            bootstrap.logger.info(f'[P2P-WS] New peer via WS: {peer.address} (node {peer.node_id[:16]})')
+            try:
+                await pump_task
+            except bootstrap.asyncio.CancelledError:
+                pass
+            return ws
+        app_ws = _ws_app_routes(Application(middlewares=[cors_middleware]), websocket_handler, p2p_ws_handler)
 
         async def rpc_handler(request):
             req_id = None
@@ -4642,11 +4902,24 @@ class MicroCoreNode:
         async def peers_handler(request):
             peers = []
             if self.p2p:
-                for nid, (url, last_seen) in getattr(self.p2p, 'tunnel_peers', {}).items():
-                    peers.append({'node_id': nid, 'url': url, 'last_seen': last_seen})
-                for nid, info in getattr(self.p2p, 'peers', {}).items():
-                    if hasattr(info, 'addr') and info.addr not in [p.get('url', '') for p in peers]:
-                        peers.append({'node_id': nid, 'url': info.addr, 'last_seen': getattr(info, 'last_seen', 0)})
+                for addr, info in getattr(self.p2p, 'peers', {}).items():
+                    _entry = {'node_id': getattr(info, 'node_id', addr), 'url': getattr(info, 'address', addr), 'last_seen': getattr(info, 'last_seen', 0), 'height': int(getattr(info, 'height', 0) or 0), 'transport': getattr(info, 'transport', 'tcp')}
+                    if getattr(info, 'p2p_ws', ''):
+                        _entry['p2p_ws'] = info.p2p_ws
+                    peers.append(_entry)
+                _seen_hosts = {str(_p.get('url', '')).split(':')[0] for _p in peers}
+                for _tp in list(getattr(self.p2p, '_registry_tunnel_peers', []) or []):
+                    if not isinstance(_tp, dict):
+                        continue
+                    _host = str(_tp.get('host') or '')
+                    if not _host or _host in _seen_hosts:
+                        continue
+                    _entry = {'node_id': '', 'url': str(_tp.get('ws_url') or ''), 'last_seen': bootstrap.time.time(), 'transport': 'ws', 'host': _host}
+                    if str(_tp.get('p2p_ws') or ''):
+                        _entry['p2p_ws'] = str(_tp.get('p2p_ws'))
+                    if _tp.get('height') is not None:
+                        _entry['height'] = _tp.get('height')
+                    peers.append(_entry)
             _api_port = self.config.get('node', {}).get('api_port', config.API_PORT)
             peers.append({'node_id': 'self', 'url': f'http://127.0.0.1:{_api_port}/rpc', 'last_seen': bootstrap.time.time(), 'height': self.height})
             return web.json_response({'peers': peers, 'total': len(peers)})
@@ -5162,7 +5435,7 @@ class MicroCoreNode:
                     challenge = self.memory_mgr.generate_challenge(miner_id)
                     session['challenge_sent'] = True
                     session['miner_id'] = miner_id
-                    session['maze_id'] = data.get('maze_id') or miner_id
+                    session['maze_id'] = data.get('maze_id') or block_signing_pub or miner_id
                     await ws.send_json(challenge)
                 else:
                     await ws.send_json({'type': 'registration_failed', 'error': 'Invalid signature or banned'})
@@ -5250,6 +5523,7 @@ class MicroCoreNode:
 
                 async def _run_move(_job):
                     ws, session, miner_id, maze_id, direction, signature, move_nonce = _job
+                    _my_started = bootstrap.time.monotonic()
                     try:
                         if ws.closed:
                             return
@@ -5269,9 +5543,9 @@ class MicroCoreNode:
                             await ws.send_json(state)
                         else:
                             ack = {'type': 'maze_move_ack', 'success': success, 'message': msg, 'state': state}
+                            ack['movenonce'] = move_nonce
                             _ack_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
                             if _ack_row:
-                                ack['movenonce'] = int(_ack_row['movenonce'])
                                 ack['growthcount'] = int(_ack_row['growthcount'])
                             ghost = self.consensus._ghost_tuple(_ack_row)
                             if ghost:
@@ -5290,7 +5564,7 @@ class MicroCoreNode:
                                         ack['start'] = [row['posx'], row['posy'], row['posz']]
                                         ack['goal'] = [row['goalx'], row['goaly'], row['goalz']]
                                         ack['growthcount'] = row['growthcount']
-                                        ack['movenonce'] = row['movenonce']
+                                        ack['movenonce'] = move_nonce
                                 except Exception as e:
                                     bootstrap.logger.error(f'[WS] maze growth send error for {miner_id}: {e}', exc_info=True)
                             if not ws.closed:
@@ -5319,7 +5593,9 @@ class MicroCoreNode:
                             except Exception:
                                 pass
                     finally:
-                        self.consensus._inflight_moves.pop(miner_id, None)
+                        _cur = self.consensus._inflight_moves.get(miner_id)
+                        if _cur is not None and _cur <= _my_started:
+                            self.consensus._inflight_moves.pop(miner_id, None)
                         _q = self.consensus._move_queues.get(miner_id)
                         while _q:
                             _njob = _q.popleft()
@@ -5409,36 +5685,13 @@ class MicroCoreNode:
                                                 idx = (idx + 1) % len(cycle_cells)
                                                 self.consensus._ghost_cycle_idx[maze_id] = idx
                                                 target = cycle_cells[idx]
-                                            for _ in range(3):
-                                                gdx, gdy, gdz = self.consensus._bfs_next_step(mdense, gsize, gpos, target)
-                                                if gdx is None:
-                                                    break
-                                                new_gpos = (gpos[0] + gdx, gpos[1] + gdy, gpos[2] + gdz)
-                                                gpos = new_gpos
-                                                gpos_moved = True
-                                                if new_gpos == (msx, msy, msz):
-                                                    caught = True
-                                                    restart_ev = await self.consensus._restart_position(dict(row), maze_id, row['minerid'], gsize)
-                                                    if restart_ev:
-                                                        await self.consensus.maze_repo.upsert({**dict(row), **restart_ev})
-                                                    break
                                     else:
-                                        for _ in range(3):
-                                            gdx, gdy, gdz = self.consensus._bfs_next_step(mdense, gsize, gpos, (msx, msy, msz))
-                                            if gdx is None:
-                                                break
-                                            new_gpos = (gpos[0] + gdx, gpos[1] + gdy, gpos[2] + gdz)
-                                            gpos = new_gpos
-                                            gpos_moved = True
-                                            if new_gpos == (msx, msy, msz):
-                                                caught = True
-                                                restart_ev = await self.consensus._restart_position(dict(row), maze_id, row['minerid'], gsize)
-                                                if restart_ev:
-                                                    await self.consensus.maze_repo.upsert({**dict(row), **restart_ev})
-                                                break
+                                        pass
                                 if gpos_moved and (not caught):
-                                    self.consensus._set_ghost(row, gpos)
-                                    await self.consensus.maze_repo.upsert(dict(row))
+                                    _fresh_w = await self.consensus.maze_repo.get_for_miner(miner_id, maze_id)
+                                    if _fresh_w is not None:
+                                        self.consensus._set_ghost(_fresh_w, gpos)
+                                        await self.consensus.maze_repo.upsert(_fresh_w)
                         reply = {'type': 'wall_hit_solved', 'accepted': True, 'caught': caught}
                         reply['sealed_walls'] = list(self.consensus._sealed_walls.get(maze_id, set()))
                         reply['ghost'] = None
@@ -5543,6 +5796,12 @@ class MicroCoreNode:
                 size = row['size']
                 loop = bootstrap.asyncio.get_event_loop()
                 sparse_maze = await loop.run_in_executor(self.consensus._move_executor, self.consensus._generate_deterministic_maze, row['seed'], size, int(row['walldensityppm']), int(row['turbulenceppm']), self.height)
+                _fresh_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
+                if _fresh_row is not None:
+                    if _fresh_row.get('seed') != row.get('seed') or int(_fresh_row.get('size', 0)) != int(size) or int(_fresh_row.get('walldensityppm', 0)) != int(row.get('walldensityppm', 0)) or (int(_fresh_row.get('turbulenceppm', 0)) != int(row.get('turbulenceppm', 0))):
+                        size = _fresh_row['size']
+                        sparse_maze = await loop.run_in_executor(self.consensus._move_executor, self.consensus._generate_deterministic_maze, _fresh_row['seed'], size, int(_fresh_row['walldensityppm']), int(_fresh_row['turbulenceppm']), self.height)
+                    row = _fresh_row
                 maze_array = _maze.sparse_to_dense(sparse_maze)
                 sx, sy, sz = (row['posx'], row['posy'], row['posz'])
                 gx, gy, gz = (row['goalx'], row['goaly'], row['goalz'])
@@ -5699,7 +5958,7 @@ class MicroCoreNode:
                 maze_rows = await self.maze_repo.get(miner_id)
                 if maze_rows:
                     for mz in maze_rows:
-                        await self.maze_repo.upsert({**dict(mz), 'updatedat': int(bootstrap.time.time())})
+                        await self.maze_repo.touch_updatedat(mz.get('maze_id'))
                 bootstrap.logger.debug(f'[WS] Uptime ping from {miner_id}: {uptime_seconds}s')
         elif msg_type == 'block_signed':
             miner_id = data.get('miner_id')
@@ -5884,7 +6143,6 @@ class MicroCoreNode:
         await self.mempool.start_cleanup()
         await self.rate_limiter.start_cleanup()
         await self.subnet_rate_limiter.start_cleanup()
-        await self.register_rate_limiter.start_cleanup()
         await self.rpc_rate_limiter.start_cleanup()
         _chain_ready = await self.ensure_genesis()
         if getattr(self, 'genesis_hash', None) and config._expected_genesis_pin(self.config) is None:

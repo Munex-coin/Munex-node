@@ -175,7 +175,7 @@ def _ensure_dependencies() -> None:
 
 
 _ensure_dependencies()
-import sys, io, os, time, json, hashlib, hmac, secrets, random, struct, socket, subprocess, re, argparse, traceback, logging, base64, binascii, ipaddress, math, asyncio, aiohttp, websockets, signal, importlib, warnings, sqlite3, copy
+import sys, io, os, time, json, hashlib, hmac, secrets, random, struct, socket, subprocess, re, argparse, traceback, logging, base64, binascii, ipaddress, math, asyncio, aiohttp, websockets, signal, importlib, warnings, sqlite3, copy, threading
 # CONSENSUS-DETERMINISM: datetime was referenced by _prune_state_loop
 # (datetime.fromtimestamp) but never imported; the NameError was swallowed
 from datetime import datetime
@@ -365,8 +365,6 @@ DEFAULT_CONFIG = {
         'finality_threshold': 0.66,
         'commit_reveal_activation_height': 0,
         'lottery_scale': 1 << 249,
-        'attest_fresh_buffer': 5,
-        'attest_growth_per_block': 5,
         'slot_timeout': 30,
         'validators': [],                # fixed producer set: list of '04'+128-hex pubkeys. MUST be identical on every node of a chain (it is part of genesis identity). [] = open mode (testnet only).
     },
@@ -374,7 +372,7 @@ DEFAULT_CONFIG = {
     # (no protocol min fee; token creation is a flat hardcoded SVF
     # fee). max_fee / fee_per_byte were already dead keys.
     'fees': {'max_fee': 100000, 'fee_per_byte': 10, 'rbf_increment': 1.1, 'cpfp_min_fee': 100},
-    'p2p': {'genesis_node': 'munexseed.duckdns.org', 'dns_seeds': ['munexseed.duckdns.org'], 'bootstrap_nodes': ['munexseed.duckdns.org:8081'], 'dht_bootstrap_nodes': ['munexseed.duckdns.org:8083'], 'fallback_nodes': [], 'max_peers': 50, 'ban_threshold': 5, 'ban_duration': 3600, 'dht_enabled': True, 'discovery_interval': 300, 'discovery_timeout': 60, 'registry_url': 'https://munex-registry.animax-plorer22.workers.dev/nodes', 'registry_enabled': True, 'registry_interval': 300, 'allow_private_peers': False},
+    'p2p': {'genesis_node': 'munexseed.duckdns.org', 'dns_seeds': ['munexseed.duckdns.org'], 'bootstrap_nodes': ['munexseed.duckdns.org:8081'], 'dht_bootstrap_nodes': ['munexseed.duckdns.org:8083'], 'fallback_nodes': [], 'max_peers': 50, 'ban_threshold': 5, 'ban_duration': 3600, 'dht_enabled': True, 'discovery_interval': 300, 'discovery_timeout': 60, 'registry_url': 'https://munex-registry.animax-plorer22.workers.dev/nodes', 'registry_enabled': True, 'registry_interval': 300, 'allow_private_peers': False, 'tunnel_host': ''},
     # GAS-USED-1 / v9.3: gas_price / gas_limit_default / max_block_gas
     # / max_block_txs / max_bytecode are HARDCODED protocol constants
     # now (see the GAS-USED-1 block); a config.yaml that sets them
@@ -557,22 +555,17 @@ SHRINK_INTERVAL_SEC = 3600
 ACTIVE_MINER_WINDOW_BLOCKS = 5  # consensus constant: eligible if active in last K blocks
 
 LOTTERY_SCALE = int(CONFIG['consensus'].get('lottery_scale', 1 << 249))
-ATTEST_FRESH_BUFFER = int(CONFIG['consensus'].get('attest_fresh_buffer', 5))
-ATTEST_GROWTH_PER_BLOCK = int(CONFIG['consensus'].get('attest_growth_per_block', 5))
 SLOT_TIMEOUT = int(CONFIG['consensus'].get('slot_timeout', 30))
 
 # (I-): the consensus parameters that must never
 # config in one process. apply_consensus_config re-derives the globals
 # from the effective config; check_consensus_params binds them to the
-CONSENSUS_PARAM_KEYS = ("lottery_scale", "attest_fresh_buffer",
-                        "attest_growth_per_block", "slot_timeout")
+CONSENSUS_PARAM_KEYS = ("lottery_scale", "slot_timeout")
 
 
 def _consensus_defaults():
     _c = DEFAULT_CONFIG.get('consensus', {})
     return {"lottery_scale": int(_c.get('lottery_scale', 1 << 249)),
-            "attest_fresh_buffer": int(_c.get('attest_fresh_buffer', 5)),
-            "attest_growth_per_block": int(_c.get('attest_growth_per_block', 5)),
             "slot_timeout": int(_c.get('slot_timeout', 30))}
 
 
@@ -581,9 +574,8 @@ def _validate_lottery_value(name, v, minimum: int) -> int:
     genuine ints at or above the protocol minimum are accepted; bools,
     strings, floats, None and out-of-range values raise ValueError with the
     offending value named. Bounds from protocol use: lottery_scale is a
-    positive scale (>= 1); attest buffers are additive caps (>= 0);
-    slot_timeout divides elapsed time in the producer rank ladder
-    (0 would ZeroDivision-crash it), so slot_timeout >= 1."""
+    positive scale (>= 1); slot_timeout divides elapsed time in the
+    producer rank ladder (0 would ZeroDivision-crash it), so slot_timeout >= 1."""
     if isinstance(v, bool) or not isinstance(v, int):
         raise ValueError(f"config consensus.{name} must be an int >= {minimum}, got {v!r}")
     if v < minimum:
@@ -628,7 +620,7 @@ def apply_consensus_config(config) -> dict:
     silent open mode) and applied with the rest. Present-but-invalid values
     raise ValueError (main() exits with a clear message); returns the applied
     mapping (recorded into fresh genesis files for genesis binding)."""
-    global LOTTERY_SCALE, ATTEST_FRESH_BUFFER, ATTEST_GROWTH_PER_BLOCK, SLOT_TIMEOUT, VALIDATORS
+    global LOTTERY_SCALE, SLOT_TIMEOUT, VALIDATORS
     global MAX_MISSES, BAN_DURATION, PRUNE_BLOCKS, WALL_DENSITY_3D
     global GAS_PRICE, GAS_LIMIT_DEFAULT, MAX_BYTECODE
     global MAX_BLOCK_GAS, MAX_BLOCK_TXS, HTLC_V1_ENABLED
@@ -636,8 +628,6 @@ def apply_consensus_config(config) -> dict:
     _vals = validate_validators_config(_c.get('validators'))
     rec = _consensus_record_from_config(config)
     LOTTERY_SCALE = rec["lottery_scale"]
-    ATTEST_FRESH_BUFFER = rec["attest_fresh_buffer"]
-    ATTEST_GROWTH_PER_BLOCK = rec["attest_growth_per_block"]
     SLOT_TIMEOUT = rec["slot_timeout"]
     VALIDATORS = _vals
     MAX_MISSES = rec["max_misses"]
@@ -651,8 +641,6 @@ def apply_consensus_config(config) -> dict:
     MAX_BLOCK_TXS = rec["max_block_txs"]
     HTLC_V1_ENABLED = rec["htlc_v1_enabled"]
     return {"lottery_scale": LOTTERY_SCALE,
-            "attest_fresh_buffer": ATTEST_FRESH_BUFFER,
-            "attest_growth_per_block": ATTEST_GROWTH_PER_BLOCK,
             "slot_timeout": SLOT_TIMEOUT,
             "validators": sorted(_effective_validators()),
             "max_misses": int(MAX_MISSES),
@@ -1112,6 +1100,50 @@ SNAPSHOT_INTERVAL = 10000
 SNAPSHOT_SYNC_THRESHOLD = 100
 SNAPSHOT_WINDOW = 100
 SNAPSHOT_RETRY_COOLDOWN = 60
+# R37 (F4): pool-wait timeout (seconds) for _ensure_maze_cached.
+# Measured on this cell, not assumed. The run-5 blocking key
+# (size 24) costs 29.7 s of solo in-process generation (size 23:
+# 21.6 s), and the sync loop's patience from a stalled verify to
+# a snapshot request is ~36 s worst case (run 5: stall 09:19:01.7
+# -> snapshot request 09:19:37.6 = 8 s chunk wait + ~24 s rewind).
+# So the wait must satisfy wait + ~30 s < ~36 s, i.e. wait < ~6 s:
+# a 15-20 s wait would land at ~45-50 s, past the snapshot. 5 s
+# is used. Its cost is duplicate CPU when the pool would have
+# delivered just after it (solo size 20/21 pool: 8-10 s) - the
+# maze is bit-identical either way, and the in-process side is
+# itself single-flight (R34-a), so concurrent fallbacks for one
+# key generate it once.
+_R37_POOL_WAIT_S = 5
+# R37 (F5): cap (seconds) on how long the sync loop defers its
+# snapshot fallback while an import/verify holds _import_lock.
+# Set from CONTENDED measurements, not solo ones. Run 7 (the
+# first F5 build, cap 120 s tick-counted) proved the solo
+# numbers understate the loaded cell by ~4x: verify of ONE cold
+# maze took 132.6 s (size 25, block 698) and 163.1 s (size 26,
+# block 765), and pool batches took 125-145 s - the pool and the
+# in-process fallback generate the same key concurrently while
+# node A + the miner share 1.5 CPUs (solo: size 23 = 21.6 s,
+# 24 = 29.7 s, 25 = 37.3 s). The 120 s cap therefore EXPIRED
+# on block 765 and the snapshot was requested (10:06:48.037),
+# 4.0 s before the verify finished (10:06:52.034) - run 7's
+# (b) PASS was a race win, not a proof. 300 s covers one
+# contended generation with ~1.8x margin over the worst measured
+# (163.1 s) and a size-28/29 maze at the same contention. A
+# block needing TWO fully-cold mazes under contention could
+# still exceed it; the parent maze is normally warm (it was the
+# tip's maze, generated during the previous growth verify and
+# cached), and if it ever is not, the snapshot fires as designed
+# - fail-safe, not a correctness issue. A lock held longer than
+# the cap with zero height progress is presumed stuck (a bug,
+# not work), so the snapshot fallback must fire - the deferral
+# is bounded, never infinite. Worst case for a genuinely stuck
+# import: about 300 s deferral + 8 s waited, then the snapshot
+# path runs exactly as before. The deferral is measured in
+# WALL-CLOCK seconds (time.monotonic deltas per poll): run 7
+# showed tick-counting runs ~26% slow under load (120 s
+# tick-counted took 151.1 s wall), so a tick-counted cap does
+# not mean what it says.
+_R37_SYNC_IMPORT_DEFER_CAP_S = 300
 SNAPSHOT_REQUEST_TIMEOUT = 30
 # R23: a peer counts as alive for sync if it has sent us a
 # message within this many seconds (last_seen is refreshed
@@ -1202,7 +1234,8 @@ STATE_TREE_EMPTY_HASH = '0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622
 
 def mutate_maze_walls(dense_maze, movenonce: int, size: int, protect=None):
     """Deterministic wall mutation based on movenonce. ~25% of walls toggle per call.
-    Both miner and node call this with the same movenonce to get the same mutated maze.
+    R35: currently no caller in the node or the miners -- the seal safety check
+    used to call it, but it checked the wrong maze; kept for reference.
     protect: set of (x,y,z) positions that must stay open (start/goal).
     After toggling, verifies solvability (BFS from start to goal). If unsolvable,
     reverts all toggles for this movenonce.
@@ -1470,7 +1503,7 @@ GENESIS_IDENTITY_VERSION = 1
 # GAS-USED-1 / v9.3: ruleset v12 — gas schedule + SVF fee schedule
 # bound; min_fee / token_creation_multiplier removed (no protocol
 # min fee; token creation is a flat hardcoded SVF fee).
-GENESIS_CONSENSUS_RULESET_VERSION = 12
+GENESIS_CONSENSUS_RULESET_VERSION = 13
 GENESIS_IDENTITY_FIELDS = (
     "id", "ts", "phash", "miners", "reward", "tx_count", "merkle_root",
     "nonce", "difficulty", "version", "challenge", "coverage",
@@ -1530,8 +1563,7 @@ def _consensus_record_from_config(config) -> dict:
     consensus.{max_misses (ban->eligibility 14895/3573/3563), ban_duration
     via p2p (miner ban length 13799/14890 — shared knob, bound once),
     prune_blocks (reorg bound 14680), wall_density_3d (maze contents 6992),
-    lottery_scale/attest_fresh_buffer/attest_growth_per_block/slot_timeout
-    (R9), htlc_v1_enabled (tx-type/precompile gating),
+    lottery_scale/slot_timeout (R9), htlc_v1_enabled (tx-type/precompile gating),
     validators (MCX79 fixed producer set: sorted canonical pubkeys)},
     fees.{min_fee (fee floor 1707), token_creation_multiplier (1713)},
     vm.{gas_price (BASEFEE/charging), gas_limit_default (execution ceiling +
@@ -1583,8 +1615,6 @@ def _consensus_record_from_config(config) -> dict:
         "max_block_txs": int(MAX_BLOCK_TXS),
         "htlc_v1_enabled": _strict_bool('consensus.htlc_v1_enabled', _c.get('htlc_v1_enabled', _dc.get('htlc_v1_enabled', False))),
         "lottery_scale": _validate_lottery_value('lottery_scale', _c.get('lottery_scale', _dc.get('lottery_scale', 1 << 249)), 1),
-        "attest_fresh_buffer": _validate_lottery_value('attest_fresh_buffer', _c.get('attest_fresh_buffer', _dc.get('attest_fresh_buffer', 5)), 0),
-        "attest_growth_per_block": _validate_lottery_value('attest_growth_per_block', _c.get('attest_growth_per_block', _dc.get('attest_growth_per_block', 5)), 0),
         "slot_timeout": _validate_lottery_value('slot_timeout', _c.get('slot_timeout', _dc.get('slot_timeout', 30)), 1),
         "validators": _validators,
         "code": {"version": str(VERSION), "chain_id": int(CHAIN_ID)},
@@ -1614,8 +1644,6 @@ def _effective_consensus_ruleset() -> dict:
         "max_block_txs": int(MAX_BLOCK_TXS),
         "htlc_v1_enabled": bool(HTLC_V1_ENABLED),
         "lottery_scale": int(LOTTERY_SCALE),
-        "attest_fresh_buffer": int(ATTEST_FRESH_BUFFER),
-        "attest_growth_per_block": int(ATTEST_GROWTH_PER_BLOCK),
         "slot_timeout": int(SLOT_TIMEOUT),
         "validators": sorted(_effective_validators()),
         "code": {"version": str(VERSION), "chain_id": int(CHAIN_ID)},
@@ -4167,11 +4195,13 @@ def _ws_health_handler(request):
     return web.json_response({"status": "ok", "service": "mcx-miner-ws"})
 
 
-def _ws_app_routes(app, websocket_handler):
+def _ws_app_routes(app, websocket_handler, p2p_handler=None):
     """Register the public miner-WS app routes in one place (keeps the
     route table reviewable and unit-testable without booting a node)."""
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/healthz', _ws_health_handler)
+    if p2p_handler is not None:
+        app.router.add_get('/p2p', p2p_handler)
     return app
 
 
@@ -6836,6 +6866,21 @@ class MinerMazeRepo:
             await self.db.execute_dml(
                 "UPDATE minermazes SET minerid=$1, updatedat=$2 WHERE maze_id=$3",
                 miner_id, int(time.time()), maze_id)
+
+    async def touch_updatedat(self, maze_id: str):
+        """R28: targeted updatedat-only touch. The uptime-ping path used
+        to upsert the whole (possibly stale) row, which could revert a
+        newer movenonce written by a concurrent move."""
+        if not maze_id:
+            return
+        if self.db.db_type == "sqlite":
+            await self.db.execute_dml(
+                "UPDATE minermazes SET updatedat=? WHERE maze_id=?",
+                int(time.time()), maze_id)
+        else:
+            await self.db.execute_dml(
+                "UPDATE minermazes SET updatedat=$1 WHERE maze_id=$2",
+                int(time.time()), maze_id)
 
     async def get_by_miner_id(self, miner_id: str):
         query = "SELECT * FROM minermazes WHERE minerid = ?" if self.db.db_type == "sqlite" else "SELECT * FROM minermazes WHERE minerid = $1"
@@ -10113,7 +10158,8 @@ class Maze3DGenerator:
     @staticmethod
     def is_connected(maze,
                       start: Tuple[int, int, int],
-                      goal: Tuple[int, int, int]) -> bool:
+                      goal: Tuple[int, int, int],
+                      total_open=None) -> bool:
         if isinstance(maze, SparseMaze):
             size = maze.size
             walls = maze.walls
@@ -10131,8 +10177,67 @@ class Maze3DGenerator:
                         and (nx, ny, nz) not in visited and not is_wall(nx, ny, nz)):
                     visited.add((nx, ny, nz))
                     queue.append((nx, ny, nz))
-        total_open = size * size * size - len(walls) if isinstance(maze, SparseMaze) else sum(1 for zz in range(size) for yy in range(size) for xx in range(size) if not maze[zz][yy][xx])
+        # R35 (N2b): the caller may pass the open count
+        # (maintained across the generation loops in
+        # _generate_maze_pure) so a full O(N) recount is not
+        # done per call. Default None keeps the old behaviour
+        # for every other caller.
+        if total_open is None:
+            total_open = size * size * size - len(walls) if isinstance(maze, SparseMaze) else sum(1 for zz in range(size) for yy in range(size) for xx in range(size) if not maze[zz][yy][xx])
         return len(visited) == total_open
+
+    @staticmethod
+    def _wall_keeps_connected(maze, size, x, y, z):
+        """R35 (N2): articulation test — does walling the open cell
+        (x, y, z) keep the maze connected? Bit-identical to
+        is_connected(maze, start, goal) AFTER the wall is placed,
+        given the invariant that the maze was connected BEFORE the
+        wall was placed. That invariant holds at every call site in
+        _generate_maze_pure: the carve check (full is_connected) or
+        the fully-open fallback establishes it, and each loop only
+        keeps walls that preserve it (induction over attempts).
+        The cell is never start or goal (both loops exclude them),
+        so start and goal stay open.
+
+        Adding a wall at c disconnects the open-cell graph IFF c is
+        an articulation point of that graph. So: BFS from one open
+        neighbour of c in the graph-without-c, stopping as soon as
+        every other open neighbour of c is visited. In the common
+        (still-connected) case that visits a handful of cells
+        instead of all ~1,700-3,375. Fast path: a cell with exactly
+        one open neighbour is a leaf — no path between two other
+        open cells can pass through it — accept with no BFS. Fall
+        back to the full is_connected check when the invariant
+        cannot hold (0 open neighbours: an isolated open cell cannot
+        occur in a connected maze whose start and goal are open and
+        distinct, so this means the invariant already failed).
+        No RNG is consumed, so the generation stream is untouched.
+        """
+        _nbrs = []
+        for _dx, _dy, _dz in DIRS_3D.values():
+            _nx, _ny, _nz = x + _dx, y + _dy, z + _dz
+            if 0 <= _nx < size and 0 <= _ny < size and 0 <= _nz < size and not maze[_nz][_ny][_nx]:
+                _nbrs.append((_nx, _ny, _nz))
+        if not _nbrs:
+            return Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1))
+        if len(_nbrs) == 1:
+            return True
+        _targets = set(_nbrs[1:])
+        _visited = {_nbrs[0]}
+        _queue = deque([_nbrs[0]])
+        while _queue:
+            _cx, _cy, _cz = _queue.popleft()
+            for _dx, _dy, _dz in DIRS_3D.values():
+                _nx, _ny, _nz = _cx + _dx, _cy + _dy, _cz + _dz
+                if (0 <= _nx < size and 0 <= _ny < size and 0 <= _nz < size
+                        and (_nx, _ny, _nz) not in _visited and not maze[_nz][_ny][_nx]):
+                    _visited.add((_nx, _ny, _nz))
+                    if (_nx, _ny, _nz) in _targets:
+                        _targets.discard((_nx, _ny, _nz))
+                        if not _targets:
+                            return True
+                    _queue.append((_nx, _ny, _nz))
+        return False
 
     @staticmethod
     def open_cells(maze) -> List[Tuple[int, int, int]]:
@@ -10211,6 +10316,140 @@ def _seal_ts_log_due(key: str) -> bool:
         return True
 
 
+def _generate_maze_pure(seed_hex: str, size: int, density_ppm: int, turb_ppm: int) -> SparseMaze:
+    """R31 (F11): the pure maze-generation body of
+    PoSWConsensus._generate_deterministic_maze, extracted verbatim
+    (bit-identical). No self references; safe to run in a worker
+    process. turb_ppm is part of the cache key but does not affect
+    the maze (kept for signature compatibility)."""
+    _size = _valid_maze_size(size)
+    if _size is None:
+        raise ValueError(f"refusing to generate maze with invalid size {size!r}")
+    size = _size
+    rng = ConsensusRng(bytes.fromhex(seed_hex))
+    density = density_ppm / 1_000_000.0
+    maze = [[[True] * size for _ in range(size)] for _ in range(size)]
+
+    def carve(x0, y0, z0, x1, y1, z1):
+        width, depth, height = x1 - x0, y1 - y0, z1 - z0
+        if min(width, depth, height) <= 2:
+            for z in range(z0, z1):
+                for y in range(y0, y1):
+                    for x in range(x0, x1):
+                        maze[z][y][x] = False
+            return
+        axis = 0
+        max_dim = width
+        if depth > max_dim:
+            axis = 1; max_dim = depth
+        if height > max_dim:
+            axis = 2
+        bounds = [(x0, x1), (y0, y1), (z0, z1)]
+        low, high = bounds[axis]
+        split = rng.randbelow(high - low - 2) + low + 1
+        bounds_a = [list(b) for b in bounds]
+        bounds_b = [list(b) for b in bounds]
+        bounds_a[axis][1] = split
+        bounds_b[axis][0] = split + 1
+        carve(bounds_a[0][0], bounds_a[1][0], bounds_a[2][0],
+              bounds_a[0][1], bounds_a[1][1], bounds_a[2][1])
+        carve(bounds_b[0][0], bounds_b[1][0], bounds_b[2][0],
+              bounds_b[0][1], bounds_b[1][1], bounds_b[2][1])
+        px = rng.randbelow(x1 - x0) + x0
+        py = rng.randbelow(y1 - y0) + y0
+        pz = rng.randbelow(z1 - z0) + z0
+        passage = [px, py, pz]
+        passage[axis] = split
+        maze[passage[2]][passage[1]][passage[0]] = False
+        adj = list(passage)
+        adj[axis] += 1
+        maze[adj[2]][adj[1]][adj[0]] = False
+
+    carve(0, 0, 0, size, size, size)
+    maze[0][0][0] = False
+    maze[size - 1][size - 1][size - 1] = False
+
+    # R35 (N2b): running open-cell count, kept exact across the
+    # loops below (-1 per accepted wall) and passed to the full
+    # is_connected calls, instead of a full O(N) recount per call.
+    # The count expression is the dense branch of is_connected.
+    _r35_open = sum(1 for zz in range(size) for yy in range(size) for xx in range(size) if not maze[zz][yy][xx])
+    if not Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1), total_open=_r35_open):
+        logger.warning(f"[Maze] BSP carve not connected for size={size}, retrying with dense fill fallback")
+        maze = [[[True] * size for _ in range(size)] for _ in range(size)]
+        for z in range(size):
+            for y in range(size):
+                for x in range(size):
+                    maze[z][y][x] = False
+        maze[0][0][0] = False
+        maze[size - 1][size - 1][size - 1] = False
+        _r35_open = size * size * size
+
+    density_ratio = max(0.25, min(0.90, density_ppm / 1_000_000.0))
+    open_cells = [(x, y, z) for z in range(size) for y in range(size) for x in range(size)
+                   if not maze[z][y][x] and (x, y, z) not in ((0,0,0), (size-1,size-1,size-1))]
+    for i in range(len(open_cells) - 1, 0, -1):
+        j = rng.randbelow(i + 1)
+        open_cells[i], open_cells[j] = open_cells[j], open_cells[i]
+    extra = int(len(open_cells) * density_ratio)
+    for x, y, z in open_cells[:extra]:
+        maze[z][y][x] = True
+        # R35 (N2): articulation test instead of a full BFS +
+        # recount per attempt (bit-identical decision — see
+        # _wall_keeps_connected). On keep, the running open count
+        # drops by one (N2b).
+        if not Maze3DGenerator._wall_keeps_connected(maze, size, x, y, z):
+            maze[z][y][x] = False
+        else:
+            _r35_open -= 1
+
+    corridor_threshold = 2
+    corridor_chance = 95
+    for axis in range(3):
+        for a in range(size):
+            for b in range(size):
+                run = 0
+                for c in range(size):
+                    coords = [0, 0, 0]
+                    coords[axis] = c
+                    coords[(axis+1)%3] = a
+                    coords[(axis+2)%3] = b
+                    x, y, z = coords
+                    if not maze[z][y][x]:
+                        run += 1
+                        if run >= corridor_threshold and rng.randbelow(100) < corridor_chance:
+                            if (x, y, z) not in [(0, 0, 0), (size-1, size-1, size-1)]:
+                                maze[z][y][x] = True
+                                # R35 (N2/N2b): articulation test;
+                                # running open count drops by one on keep.
+                                if not Maze3DGenerator._wall_keeps_connected(maze, size, x, y, z):
+                                    maze[z][y][x] = False
+                                else:
+                                    _r35_open -= 1
+                                run = 0
+                    else:
+                        run = 0
+
+    if not Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1), total_open=_r35_open):
+        logger.warning(f"[Maze] Final connectivity check failed for size={size}, reverting extra walls")
+        maze = [[[False] * size for _ in range(size)] for _ in range(size)]
+        for z in range(size):
+            for y in range(size):
+                for x in range(size):
+                    maze[z][y][x] = False
+        maze[0][0][0] = False
+        maze[size-1][size-1][size-1] = False
+
+    sparse = dense_to_sparse(maze)
+    return sparse
+
+def _maze_gen_worker(key):
+    """R31 (F11): module-level worker for the maze pre-warm pool.
+    Must be module-level (spawn pickles it by reference). Returns
+    (key, SparseMaze)."""
+    seed_hex, size, density_ppm, turb_ppm = key
+    return key, _generate_maze_pure(seed_hex, size, density_ppm, turb_ppm)
+
 class PoSWConsensus:
     DIRS = DIRS_3D
 
@@ -10279,9 +10518,43 @@ class PoSWConsensus:
         self._ghost_frozen_target: Dict[str, Tuple[int, int, int]] = {}
         self._ghost_cycle: Dict[str, list] = {}
         self._ghost_cycle_idx: Dict[str, int] = {}
+        # R27: movenonce at which the ghost last stepped, per maze.
+        # The ghost steps only when the miner steps (1:1 coupling).
+        self._ghost_step_nonce: Dict[str, int] = {}
+        # R31 (F9): in-flight tick restart tasks, per maze. A ghost
+        # catch schedules the (cold, 16-174 s) maze regeneration as
+        # a background task so production_loop never pauses on it.
+        self._restart_tasks: Dict[str, asyncio.Task] = {}
+        # R34 (a): single-flight maze generation — one in-flight
+        # generation per cache key, shared by all waiters, so a
+        # growth never spawns duplicate cold generations that
+        # stretch each other under the GIL. Guarded by a plain
+        # threading lock: callers run in executor threads.
+        self._maze_gen_lock = threading.Lock()
+        self._maze_gen_inflight: Dict[tuple, threading.Event] = {}
+        # R34 (b): in-flight background ghost-step tasks, per maze
+        # (F9 pattern: the cold generation runs off the tick).
+        self._ghost_step_tasks: Dict[str, asyncio.Task] = {}
+        # R35 (N1): per-maze count of ghost steps skipped because
+        # the per-maze lock was held (see _ghost_step_apply).
+        self._ghost_step_lock_skips: Dict[str, int] = {}
 
         self._maze_cache: OrderedDict = OrderedDict()
         self._maze_cache_max = 256
+        # R31 (F11): the maze pre-warm process pool, created
+        # lazily by _get_maze_pool (None until first use).
+        self._maze_pool = None
+        # R37 (F1): single-flight pre-warm - one in-flight pool
+        # generation per cache key, shared by all waiters (the
+        # _generate_deterministic_maze R34-a pattern, for the pool
+        # path). _prewarm_mazes used to re-submit every key on every
+        # call: 60 MSG_BLOCKS batches re-submitted the same size-20/21
+        # keys to the 4-worker pool, so each batch waited 51-120 s
+        # behind its own duplicates while forward import made zero
+        # progress and the sync loop snapshotted (R36 Forward (b)).
+        self._prewarm_inflight: Dict[tuple, asyncio.Future] = {}
+        # R37 (F1): background pre-warm tasks, kept alive until done.
+        self._prewarm_tasks: set = set()
 
         self._global_avg_size: float = 5.0
 
@@ -10480,11 +10753,11 @@ class PoSWConsensus:
         idx = int.from_bytes(eth_keccak(b"MCXPOGGOALV1" + seed_bytes), "big") % len(open_cells)
         return open_cells[idx]
 
-    def _select_spawn(self, maze, prev_pos: Tuple[int, int, int], seed_bytes: bytes) -> Tuple[int, int, int]:
+    def _select_spawn(self, maze, prev_pos, seed_bytes: bytes) -> Tuple[int, int, int]:
         open_cells = Maze3DGenerator.open_cells(maze)
         if not open_cells:
             return (0, 0, 0)
-        if prev_pos in open_cells:
+        if prev_pos is not None and prev_pos in open_cells:
             return prev_pos
         return open_cells[int.from_bytes(eth_keccak(b"MCXPOGSPAWNV1" + seed_bytes), "big") % len(open_cells)]
 
@@ -10495,114 +10768,46 @@ class PoSWConsensus:
             raise ValueError(f"refusing to generate maze with invalid size {size!r}")
         size = _size
         cache_key = (seed_hex, size, density_ppm, turb_ppm)
-        if cache_key in self._maze_cache:
-            self._maze_cache.move_to_end(cache_key)
-            return self._maze_cache[cache_key]
-
-        rng = ConsensusRng(bytes.fromhex(seed_hex))
-        density = density_ppm / 1_000_000.0
-        maze = [[[True] * size for _ in range(size)] for _ in range(size)]
-
-        def carve(x0, y0, z0, x1, y1, z1):
-            width, depth, height = x1 - x0, y1 - y0, z1 - z0
-            if min(width, depth, height) <= 2:
-                for z in range(z0, z1):
-                    for y in range(y0, y1):
-                        for x in range(x0, x1):
-                            maze[z][y][x] = False
-                return
-            axis = 0
-            max_dim = width
-            if depth > max_dim:
-                axis = 1; max_dim = depth
-            if height > max_dim:
-                axis = 2
-            bounds = [(x0, x1), (y0, y1), (z0, z1)]
-            low, high = bounds[axis]
-            split = rng.randbelow(high - low - 2) + low + 1
-            bounds_a = [list(b) for b in bounds]
-            bounds_b = [list(b) for b in bounds]
-            bounds_a[axis][1] = split
-            bounds_b[axis][0] = split + 1
-            carve(bounds_a[0][0], bounds_a[1][0], bounds_a[2][0],
-                  bounds_a[0][1], bounds_a[1][1], bounds_a[2][1])
-            carve(bounds_b[0][0], bounds_b[1][0], bounds_b[2][0],
-                  bounds_b[0][1], bounds_b[1][1], bounds_b[2][1])
-            px = rng.randbelow(x1 - x0) + x0
-            py = rng.randbelow(y1 - y0) + y0
-            pz = rng.randbelow(z1 - z0) + z0
-            passage = [px, py, pz]
-            passage[axis] = split
-            maze[passage[2]][passage[1]][passage[0]] = False
-            adj = list(passage)
-            adj[axis] += 1
-            maze[adj[2]][adj[1]][adj[0]] = False
-
-        carve(0, 0, 0, size, size, size)
-        maze[0][0][0] = False
-        maze[size - 1][size - 1][size - 1] = False
-
-        if not Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1)):
-            logger.warning(f"[Maze] BSP carve not connected for size={size}, retrying with dense fill fallback")
-            maze = [[[True] * size for _ in range(size)] for _ in range(size)]
-            for z in range(size):
-                for y in range(size):
-                    for x in range(size):
-                        maze[z][y][x] = False
-            maze[0][0][0] = False
-            maze[size - 1][size - 1][size - 1] = False
-
-        density_ratio = max(0.25, min(0.90, density_ppm / 1_000_000.0))
-        open_cells = [(x, y, z) for z in range(size) for y in range(size) for x in range(size)
-                       if not maze[z][y][x] and (x, y, z) not in ((0,0,0), (size-1,size-1,size-1))]
-        for i in range(len(open_cells) - 1, 0, -1):
-            j = rng.randbelow(i + 1)
-            open_cells[i], open_cells[j] = open_cells[j], open_cells[i]
-        extra = int(len(open_cells) * density_ratio)
-        for x, y, z in open_cells[:extra]:
-            maze[z][y][x] = True
-            if not Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1)):
-                maze[z][y][x] = False
-
-        corridor_threshold = 2
-        corridor_chance = 95
-        for axis in range(3):
-            for a in range(size):
-                for b in range(size):
-                    run = 0
-                    for c in range(size):
-                        coords = [0, 0, 0]
-                        coords[axis] = c
-                        coords[(axis+1)%3] = a
-                        coords[(axis+2)%3] = b
-                        x, y, z = coords
-                        if not maze[z][y][x]:
-                            run += 1
-                            if run >= corridor_threshold and rng.randbelow(100) < corridor_chance:
-                                if (x, y, z) not in [(0, 0, 0), (size-1, size-1, size-1)]:
-                                    maze[z][y][x] = True
-                                    if not Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1)):
-                                        maze[z][y][x] = False
-                                    run = 0
-                        else:
-                            run = 0
-
-        if not Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1)):
-            logger.warning(f"[Maze] Final connectivity check failed for size={size}, reverting extra walls")
-            maze = [[[False] * size for _ in range(size)] for _ in range(size)]
-            for z in range(size):
-                for y in range(size):
-                    for x in range(size):
-                        maze[z][y][x] = False
-            maze[0][0][0] = False
-            maze[size-1][size-1][size-1] = False
-
-        sparse = dense_to_sparse(maze)
-
-        if len(self._maze_cache) >= self._maze_cache_max:
-            self._maze_cache.popitem(last=False)
-        self._maze_cache[cache_key] = sparse
-        return sparse
+        # R34 (a): single-flight. The cache check-and-set races
+        # across executor threads: after a growth, the catch path,
+        # the ghost step and every following move each submitted
+        # the same uncached key and each ran a full cold generation
+        # (2-3x stretch under the GIL). Now the first caller is the
+        # leader and the rest wait on its event, then read the cached
+        # result. The cached maze for a key is bit-identical either
+        # way (generation is deterministic), so waiters get exactly
+        # what they would have generated themselves.
+        _leader_ev = None
+        while True:
+            with self._maze_gen_lock:
+                if cache_key in self._maze_cache:
+                    self._maze_cache.move_to_end(cache_key)
+                    return self._maze_cache[cache_key]
+                _ev = self._maze_gen_inflight.get(cache_key)
+                if _ev is None:
+                    _ev = threading.Event()
+                    self._maze_gen_inflight[cache_key] = _ev
+                    _leader_ev = _ev
+                    break
+            _ev.wait()
+        # R31 (F11): the generation body is _generate_maze_pure
+        # (bit-identical, extracted verbatim); this method only
+        # adds the cache.
+        try:
+            sparse = _generate_maze_pure(seed_hex, size, density_ppm, turb_ppm)
+        except Exception:
+            with self._maze_gen_lock:
+                self._maze_gen_inflight.pop(cache_key, None)
+            raise
+        else:
+            with self._maze_gen_lock:
+                if len(self._maze_cache) >= self._maze_cache_max:
+                    self._maze_cache.popitem(last=False)
+                self._maze_cache[cache_key] = sparse
+                self._maze_gen_inflight.pop(cache_key, None)
+            return sparse
+        finally:
+            _leader_ev.set()
 
     def _calculate_maze_root(self, maze) -> str:
         if isinstance(maze, SparseMaze):
@@ -10687,6 +10892,9 @@ class PoSWConsensus:
 
             expected_nonce = int(row["movenonce"]) + 1
             if move_nonce is not None and move_nonce != expected_nonce:
+                # R31: count -1 desyncs explicitly (got == expected-1).
+                if move_nonce == expected_nonce - 1:
+                    logger.warning(f"[DESYNC] -1 nonce mismatch: miner {miner_id[:16]} expected {expected_nonce}, got {move_nonce}")
                 return False, f"Nonce mismatch: expected {expected_nonce}, got {move_nonce}", {}
             move_nonce = expected_nonce
 
@@ -10715,9 +10923,18 @@ class PoSWConsensus:
 
             maze_seed = bytes.fromhex(row["seed"])
             loop = asyncio.get_event_loop()
+            # R34 (d): instrument the per-move generation
+            # (hit/miss + elapsed) so a late gap decomposes
+            # exactly. Logged only when over 1s.
+            _r34_k = (row["seed"], size, int(row["walldensityppm"]), int(row["turbulenceppm"]))
+            _r34_hit = _r34_k in self._maze_cache
+            _r34_t0 = time.monotonic()
             maze = await loop.run_in_executor(
                 None, self._generate_deterministic_maze,
                 row["seed"], size, int(row["walldensityppm"]), int(row["turbulenceppm"]), self.node.height)
+            _r34_dt = time.monotonic() - _r34_t0
+            if _r34_dt > 1.0:
+                logger.info(f"[R34] per-move gen size={size} hit={_r34_hit} took {_r34_dt:.1f}s")
 
             if not (0 <= nx < size and 0 <= ny < size and 0 <= nz < size):
                 return False, "Out of bounds", {}
@@ -10741,7 +10958,15 @@ class PoSWConsensus:
                         self._set_ghost(row, new_gpos)
                         await self.maze_repo.upsert({**dict(row), "updatedat": int(time.time())})
                         if new_gpos == (sx, sy, sz):
-                            restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
+                            _r31_rt = self._restart_tasks.get(maze_id)
+                            if _r31_rt is not None and not _r31_rt.done():
+                                # R31 (F9): a tick restart is already in
+                                # flight for this maze — do not generate a
+                                # second maze; the tick task commits it.
+                                logger.info(f"[F9] tick restart already in flight for {maze_id[:16]} — skipping duplicate process_move restart")
+                                restart_ev = None
+                            else:
+                                restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
                             if restart_ev:
                                 self._set_ghost(row, self._ghost_tuple(restart_ev))
                                 await self.maze_repo.upsert({**dict(row), **restart_ev})
@@ -10760,9 +10985,13 @@ class PoSWConsensus:
                                 }
                                 self._pending_maze_updates.append(ghost_update)
                 resp_ghost = self._ghost_tuple(row)
+                # R27: the wall-hit reply carries the attempted nonce
+                # (move_nonce), not the un-incremented row nonce.
+                # The miner's guard rejects sent_nonce-1, so the old
+                # reply never resolved the in-flight wait (30 s timeout).
                 return False, "Wall hit", {"type": "wall_hit", "seed": wall_seed, "difficulty": difficulty,
                     "ghost": list(resp_ghost) if resp_ghost else None,
-                    "position": [sx, sy, sz], "size": size, "movenonce": int(row["movenonce"]),
+                    "position": [sx, sy, sz], "size": size, "movenonce": move_nonce,
                     "growthcount": int(row["growthcount"])}
 
             gx, gy, gz = int(row["goalx"]), int(row["goaly"]), int(row["goalz"])
@@ -10792,6 +11021,13 @@ class PoSWConsensus:
             elif (nx, ny, nz) != (sx, sy, sz):
                 self._oscillating_mazes.discard(maze_id)
 
+            # R30: the pending-update appends below are deferred until
+            # after the row upsert (see the append block after the
+            # upsert). Appending before the upsert let a catch land
+            # between the append and the upsert, so the seal read a
+            # pending update the DB row did not yet reflect.
+            _r30_catch_update = None
+            _r30_ghost_update = None
             caught = (nx == gx and ny == gy and nz == gz)
             state_info = {
                 "type": "mazemove",
@@ -10803,13 +11039,23 @@ class PoSWConsensus:
             if caught:
                 new_params = self._compute_new_maze_params(dict(row), self.node.height, eth_keccak(direction.encode() + move_nonce.to_bytes(8, "big")))
                 updated.update(new_params)
-                knowledge_val = int(row.get("knowledge", 0)) + max(1, int(size * 0.5))
-                new_density_ppm = min(900000, int(row.get("walldensityppm", MIN_WALL_DENSITY_PPM)) + (knowledge_val * 15000) + (size * 4000))
-                updated["knowledge"] = knowledge_val
-                updated["walldensityppm"] = new_density_ppm
+                # R26: on a catch the density resets to _compute_new_maze_params
+                # (~500k); the old knowledge*15000 ratchet pinned it at 900k.
+                updated["knowledge"] = 0
+                # R24: the catch maze generation runs on the
+                # same bounded _move_executor as every other
+                # generation, not the shared default executor.
+                # R34 (d): instrument the catch-path
+                # generation (hit/miss + elapsed).
+                _r34_ck = (new_params["seed"], new_params["size"], new_params["walldensityppm"], new_params["turbulenceppm"])
+                _r34_chit = _r34_ck in self._maze_cache
+                _r34_ct0 = time.monotonic()
                 new_maze = await loop.run_in_executor(
-                    None, self._generate_deterministic_maze,
-                    new_params["seed"], new_params["size"], new_density_ppm, new_params["turbulenceppm"], self.node.height)
+                    self._move_executor, self._generate_deterministic_maze,
+                    new_params["seed"], new_params["size"], new_params["walldensityppm"], new_params["turbulenceppm"], self.node.height)
+                _r34_cdt = time.monotonic() - _r34_ct0
+                if _r34_cdt > 1.0:
+                    logger.info(f"[R34] catch gen size={new_params['size']} hit={_r34_chit} took {_r34_cdt:.1f}s")
                 new_root = self._calculate_maze_root(new_maze)
                 new_spawn = self._select_spawn(new_maze, (nx, ny, nz), bytes.fromhex(new_params["seed"]))
                 new_goal = self._select_open_cell(new_maze, bytes.fromhex(new_params["seed"]), exclude=new_spawn)
@@ -10829,10 +11075,10 @@ class PoSWConsensus:
                     "old_size": size,
                     "new_size": new_params["size"],
                     "old_density": int(row.get("walldensityppm", MIN_WALL_DENSITY_PPM)),
-                    "new_density": new_density_ppm,
+                    "new_density": new_params["walldensityppm"],
                     "old_growthcount": int(row["growthcount"]),
                     "new_growthcount": new_params.get("growthcount", int(row["growthcount"])),
-                    "knowledge": knowledge_val,
+                    "knowledge": 0,
                     "seed": new_params["seed"],
                     "mazeroot": new_root,
                     "goal": list(new_goal),
@@ -10850,7 +11096,7 @@ class PoSWConsensus:
                     "parent_pos_attested": [int(row["posx"]), int(row["posy"]), int(row["posz"])],
                     "parent_movenonce": int(row["movenonce"]),
                 }
-                self._pending_maze_updates.append(maze_update_event)
+                _r30_catch_update = maze_update_event
                 new_maze_id = row.get("maze_id") or miner_id
                 self._maze_visited.pop(new_maze_id, None)
                 self._goal_prev_pos.pop(new_maze_id, None)
@@ -10892,94 +11138,31 @@ class PoSWConsensus:
                 ghost_pos = self._ghost_tuple(row)
                 if ghost_pos and ghost_pos != (gx, gy, gz):
                     if ghost_pos == (nx, ny, nz):
-                        restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
+                        _r31_rt = self._restart_tasks.get(maze_id)
+                        if _r31_rt is not None and not _r31_rt.done():
+                            # R31 (F9): a tick restart is already in
+                            # flight for this maze — do not generate a
+                            # second maze; the tick task commits it.
+                            logger.info(f"[F9] tick restart already in flight for {maze_id[:16]} — skipping duplicate process_move restart")
+                            restart_ev = None
+                        else:
+                            restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
                         if restart_ev:
                             updated.update(restart_ev)
                             state_info["caught"] = True
-                    else:
-                        if maze_id in self._oscillating_mazes:
-                            if maze_id not in self._ghost_cycle:
-                                cycle_cells = []
-                                for p in self._pos_history.get(maze_id, []):
-                                    if p not in cycle_cells:
-                                        cycle_cells.append(p)
-                                def _manh(a, b):
-                                    return abs(a[0]-b[0]) + abs(a[1]-b[1]) + abs(a[2]-b[2])
-                                farthest_idx = max(range(len(cycle_cells)),
-                                                   key=lambda i: _manh(ghost_pos, cycle_cells[i]))
-                                self._ghost_cycle[maze_id] = cycle_cells
-                                self._ghost_cycle_idx[maze_id] = farthest_idx
-                                self._ghost_frozen_target[maze_id] = cycle_cells[farthest_idx]
-
-                            cycle_cells = self._ghost_cycle[maze_id]
-                            idx = self._ghost_cycle_idx[maze_id]
-                            target = cycle_cells[idx]
-
-                            if ghost_pos == target:
-                                idx = (idx + 1) % len(cycle_cells)
-                                self._ghost_cycle_idx[maze_id] = idx
-                                target = cycle_cells[idx]
-
-                            moved = False
-                            for _ in range(2):
-                                gdx, gdy, gdz = self._bfs_next_step(maze, size, ghost_pos, target)
-                                if gdx is None:
-                                    break
-                                ghost_pos = (ghost_pos[0]+gdx, ghost_pos[1]+gdy, ghost_pos[2]+gdz)
-                                self._set_ghost(updated, ghost_pos)
-                                self._set_ghost(row, ghost_pos)
-                                moved = True
-                                if ghost_pos == (nx, ny, nz):
-                                    break
-                            if moved:
-                                state_info["ghost"] = ghost_pos
-                            if ghost_pos == (nx, ny, nz):
-                                restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
-                                if restart_ev:
-                                    updated.update(restart_ev)
-                                    state_info["caught"] = True
-                                    ghost_update = {
-                                        "maze_id": row.get("maze_id") or miner_id,
-                                        "miner_id": miner_id, "height": self.node.height,
-                                        "old_size": size, "new_size": restart_ev.get("size", size),
-                                        "old_density": int(row.get("walldensityppm", MIN_WALL_DENSITY_PPM)),
-                                        "new_density": restart_ev.get("walldensityppm", int(row.get("walldensityppm", MIN_WALL_DENSITY_PPM))),
-                                        "seed": restart_ev.get("seed", row["seed"]),
-                                        "mazeroot": restart_ev.get("mazeroot", row.get("mazeroot", "")),
-                                        "goal": [restart_ev.get("goalx", row["goalx"]), restart_ev.get("goaly", row["goaly"]), restart_ev.get("goalz", row["goalz"])],
-                                        "spawn": [restart_ev.get("posx", row["posx"]), restart_ev.get("posy", row["posy"]), restart_ev.get("posz", row["posz"])],
-                                        "turbulenceppm": restart_ev.get("turbulenceppm", 0),
-                                    }
-                                    self._pending_maze_updates.append(ghost_update)
-                        else:
-                            self._ghost_frozen_target.pop(maze_id, None)
-                            self._ghost_cycle.pop(maze_id, None)
-                            self._ghost_cycle_idx.pop(maze_id, None)
-
-                            gdx, gdy, gdz = self._bfs_next_step(maze, size, ghost_pos, (nx, ny, nz))
-                            if gdx is not None:
-                                new_ghost = (ghost_pos[0]+gdx, ghost_pos[1]+gdy, ghost_pos[2]+gdz)
-                                self._set_ghost(updated, new_ghost)
-                                self._set_ghost(row, new_ghost)
-                                state_info["ghost"] = new_ghost
-                                if new_ghost == (nx, ny, nz):
-                                    restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
-                                    if restart_ev:
-                                        updated.update(restart_ev)
-                                        state_info["caught"] = True
-                                        ghost_update = {
-                                            "maze_id": row.get("maze_id") or miner_id,
-                                            "miner_id": miner_id, "height": self.node.height,
-                                            "old_size": size, "new_size": restart_ev.get("size", size),
-                                            "old_density": int(row.get("walldensityppm", MIN_WALL_DENSITY_PPM)),
-                                            "new_density": restart_ev.get("walldensityppm", int(row.get("walldensityppm", MIN_WALL_DENSITY_PPM))),
-                                            "seed": restart_ev.get("seed", row["seed"]),
-                                            "mazeroot": restart_ev.get("mazeroot", row.get("mazeroot", "")),
-                                            "goal": [restart_ev.get("goalx", row["goalx"]), restart_ev.get("goaly", row["goaly"]), restart_ev.get("goalz", row["goalz"])],
-                                            "spawn": [restart_ev.get("posx", row["posx"]), restart_ev.get("posy", row["posy"]), restart_ev.get("posz", row["posz"])],
-                                            "turbulenceppm": restart_ev.get("turbulenceppm", 0),
-                                        }
-                                        self._pending_maze_updates.append(ghost_update)
+                            ghost_update = {
+                                "maze_id": row.get("maze_id") or miner_id,
+                                "miner_id": miner_id, "height": self.node.height,
+                                "old_size": size, "new_size": restart_ev.get("size", size),
+                                "old_density": int(row.get("walldensityppm", MIN_WALL_DENSITY_PPM)),
+                                "new_density": restart_ev.get("walldensityppm", int(row.get("walldensityppm", MIN_WALL_DENSITY_PPM))),
+                                "seed": restart_ev.get("seed", row["seed"]),
+                                "mazeroot": restart_ev.get("mazeroot", row.get("mazeroot", "")),
+                                "goal": [restart_ev.get("goalx", row["goalx"]), restart_ev.get("goaly", row["goaly"]), restart_ev.get("goalz", row["goalz"])],
+                                "spawn": [restart_ev.get("posx", row["posx"]), restart_ev.get("posy", row["posy"]), restart_ev.get("posz", row["posz"])],
+                                "turbulenceppm": restart_ev.get("turbulenceppm", 0),
+                            }
+                            _r30_ghost_update = ghost_update
 
                 # never on the miner's position itself.
                 if size > 6:
@@ -10998,16 +11181,13 @@ class PoSWConsensus:
                         sealed = 0
                         temp_blocked = set()
                         dense_maze = sparse_to_dense(maze)
-                        mutated_maze = [row_layer[:] for row_layer in dense_maze]
-                        mutate_maze_walls(mutated_maze, int(row["movenonce"]), size,
-                                          {(nx, ny, nz), (gx, gy, gz)})
                         for (cx, cy, cz) in seal_candidates:
                             if sealed >= 1:
                                 break
                             seal_key = eth_keccak(f"SEALV1{row['seed']}{cx}{cy}{cz}{move_nonce}".encode()).hex()
                             if int(seal_key[:8], 16) % 100 < 25:
                                 test_blocked = sealed_set | temp_blocked | {(cx, cy, cz)}
-                                if self._path_exists(mutated_maze, size, (nx, ny, nz), (gx, gy, gz), test_blocked):
+                                if self._path_exists(dense_maze, size, (nx, ny, nz), (gx, gy, gz), test_blocked):
                                     sealed_set.add((cx, cy, cz))
                                     temp_blocked.add((cx, cy, cz))
                                     sealed += 1
@@ -11031,6 +11211,26 @@ class PoSWConsensus:
                                         sealed_set.discard((ox, oy, oz))
                                         state_info.setdefault("opened_walls", []).append([ox, oy, oz])
             await self.maze_repo.upsert(updated)
+            # R34 (c): pre-warm the committed maze key so the ghost
+            # step's first call is a cache hit. The catch path above
+            # already generated it (cache hit in the common case);
+            # this is the safety net for an evicted or otherwise
+            # uncached key. Fire-and-forget on the process pool
+            # (true parallelism); _prewarm_mazes skips cached keys
+            # and swallows its own failures.
+            if state_info.get("caught"):
+                _r34_nk = (updated.get("seed", ""), int(updated.get("size", 0)), int(updated.get("walldensityppm", 0)), int(updated.get("turbulenceppm", 0)))
+                if _r34_nk not in self._maze_cache:
+                    asyncio.create_task(self._prewarm_mazes([_r34_nk]))
+            # R30: append AFTER the upsert, no await between. The seal
+            # reads _pending_maze_updates; the row and the pending list
+            # are now consistent (a catch landing between the append
+            # and the upsert used to stamp an attestation smaller than
+            # the actual sealed size).
+            if _r30_catch_update is not None:
+                self._pending_maze_updates.append(_r30_catch_update)
+            if _r30_ghost_update is not None:
+                self._pending_maze_updates.append(_r30_ghost_update)
             return True, "Move accepted", state_info
 
     def _maybe_flee_goal(self, maze, miner_pos, goal_pos, maze_id, size, move_nonce) -> Optional[Tuple[int, int, int]]:
@@ -11153,7 +11353,7 @@ class PoSWConsensus:
             return None
         shrink_amount = current_size - new_size
         old_density = int(row.get("walldensityppm", MIN_WALL_DENSITY_PPM))
-        new_density = old_density + shrink_amount * 6000
+        new_density = min(900000, old_density + shrink_amount * 6000)
         new_turb = int(row.get("turbulenceppm", 0)) + shrink_amount * 8000
         move_nonce = int(row.get("movenonce", 0))
         seed = eth_keccak(b"SHRINKGHOSTV2" + bytes.fromhex(row["mazeroot"]) + move_nonce.to_bytes(8, "big") + new_size.to_bytes(4, "big")).hex()
@@ -11188,6 +11388,294 @@ class PoSWConsensus:
             "ghostz": ghost_start[2] if new_size > 5 else None,
         }
 
+    def _schedule_tick_restart(self, mid, miner_id, base, base_size):
+        """R31 (F9): schedule a tick ghost-catch restart in the
+        background. Returns True (a task is scheduled or already
+        in flight). The restart (cold generation) runs off
+        production_loop; the commit step re-reads under the
+        per-maze lock and applies the R30 stale guards. The
+        check-and-set is synchronous (no await between), so in
+        the single-threaded event loop it is atomic against a
+        second tick scheduling the same maze."""
+        _task = self._restart_tasks.get(mid)
+        if _task is not None and not _task.done():
+            logger.info(f"[F9] tick restart already in flight for {mid[:16]} — skipping duplicate")
+            return True
+        self._restart_tasks[mid] = asyncio.create_task(
+            self._tick_restart_task(mid, miner_id, dict(base), int(base_size)))
+        return True
+
+    async def _tick_restart_task(self, mid, miner_id, base, base_size):
+        """R31 (F9): background ghost-catch restart. Generate
+        lock-free, then commit under the per-maze lock with the
+        R30 stale guards (re-read, upsert + pending append with
+        no await between). On failure the row is untouched and
+        the next move re-triggers the restart."""
+        try:
+            restart_ev = await self._restart_position(base, mid, miner_id, base_size)
+            if not restart_ev:
+                return
+            async with self._lock_for(mid):
+                _fresh2 = await self.maze_repo.get_for_miner(miner_id, mid)
+                if _fresh2 is not None and (_fresh2.get("seed") != base.get("seed") or int(_fresh2.get("size", 0)) != base_size):
+                    logger.info(f"[R30] tick restart stale for {mid[:16]} (maze changed during generation) — skipping")
+                    return
+                await self.maze_repo.upsert({**dict(_fresh2), **restart_ev} if _fresh2 is not None else {**dict(base), **restart_ev})
+                # R29: seal the tick shrink (same shape as the tick
+                # sites). old/new sizes come from the same _fresh2 /
+                # restart_ev pair as the upsert.
+                _tick_base = _fresh2 if _fresh2 is not None else base
+                _tick_old_size = int(_fresh2["size"]) if _fresh2 is not None else base_size
+                _tick_update = {
+                    "maze_id": mid,
+                    "miner_id": miner_id, "height": self.node.height,
+                    "old_size": _tick_old_size, "new_size": restart_ev.get("size", _tick_old_size),
+                    "old_density": int(_tick_base.get("walldensityppm", MIN_WALL_DENSITY_PPM)),
+                    "new_density": restart_ev.get("walldensityppm", int(_tick_base.get("walldensityppm", MIN_WALL_DENSITY_PPM))),
+                    "seed": restart_ev.get("seed", _tick_base["seed"]),
+                    "mazeroot": restart_ev.get("mazeroot", _tick_base.get("mazeroot", "")),
+                    "goal": [restart_ev.get("goalx", _tick_base["goalx"]), restart_ev.get("goaly", _tick_base["goaly"]), restart_ev.get("goalz", _tick_base["goalz"])],
+                    "spawn": [restart_ev.get("posx", _tick_base["posx"]), restart_ev.get("posy", _tick_base["posy"]), restart_ev.get("posz", _tick_base["posz"])],
+                    "turbulenceppm": restart_ev.get("turbulenceppm", 0),
+                }
+                self._pending_maze_updates.append(_tick_update)
+            # Reset the ghost-step gate so the next tick adopts the
+            # nonce without double-stepping (same as first sight).
+            self._ghost_step_nonce.pop(mid, None)
+        except Exception as _e:
+            logger.error(f"[F9] tick restart task failed for {mid[:16]}: {_e}", exc_info=True)
+        finally:
+            if self._restart_tasks.get(mid) is asyncio.current_task():
+                self._restart_tasks.pop(mid, None)
+
+    def _maze_keys_for_block(self, block: dict) -> set:
+        """R31 (F11): the (seed, size, density, turb) keys that
+        verify_block_proof will need for this block, read from the
+        block bytes already in hand. maze_updates and
+        attestation_proof entries each name a new maze and, when
+        caught_at_nonce is set, the parent maze they grew from."""
+        _keys = set()
+        for _src in (block.get("maze_updates") or [], block.get("attestation_proof") or []):
+            for _entry in _src:
+                if not isinstance(_entry, dict):
+                    continue
+                _seed = _entry.get("seed")
+                _size = _entry.get("new_size")
+                _dens = _entry.get("new_density")
+                _turb = _entry.get("turbulenceppm", 0)
+                if _seed is not None and _size is not None and _dens is not None:
+                    _keys.add((_seed, int(_size), int(_dens), int(_turb)))
+                if _entry.get("caught_at_nonce") is not None:
+                    _pseed = _entry.get("parent_seed")
+                    _psize = _entry.get("parent_size")
+                    _pdens = _entry.get("parent_density")
+                    _pturb = _entry.get("parent_turbulence", 0)
+                    if _pseed is not None and _psize is not None and _pdens is not None:
+                        _keys.add((_pseed, int(_psize), int(_pdens), int(_pturb)))
+        return _keys
+
+    def _get_maze_pool(self):
+        """R31 (F11): the maze pre-warm process pool, created
+        lazily. Spawn (following the VM pool pattern) so workers
+        start from a clean interpreter; max 4 workers. A broken
+        pool is rebuilt on next use."""
+        if getattr(self, "_maze_pool", None) is None:
+            self._maze_pool = ProcessPoolExecutor(max_workers=4, mp_context=mp.get_context("spawn"))
+        return self._maze_pool
+
+    async def _prewarm_mazes(self, keys):
+        """R31 (F11): generate the mazes verify will need,
+        concurrently in the process pool, and put them in
+        _maze_cache. Keys already cached are skipped.
+        verify_block_proof is untouched — it still recomputes
+        every root and runs every check; it just finds the mazes
+        in the cache. On any pool failure, fall back to sequential
+        generation (current behaviour).
+        R37 (F1): single-flight - a key already being generated is
+        waited on, never re-submitted (see the claim block below).
+        Callers on the import path start this in the background and
+        never await it; verify awaits the pool single-flight for a
+        cold key (_ensure_maze_cached, R37 F3) and generates
+        in-process only if the pool did not fill the cache, so a
+        slow generation can delay one block's verify but can never
+        park the whole import behind a batch of mazes."""
+        _keys = [k for k in (keys or []) if k not in self._maze_cache]
+        if not _keys:
+            return
+        # R35 (N3): log entry (keys, sizes, whether the pool was
+        # just created) and completion time — the R34 epoch stall
+        # was a pre-warm under the import lock with no log line at
+        # all, so nothing showed what the lock holder was doing.
+        _r35_pool_new = getattr(self, "_maze_pool", None) is None
+        _r35_t0 = time.monotonic()
+        _r35_desc = [(k[1], k[0][:16]) for k in _keys]
+        logger.info(f"[R35] pre-warm start: {len(_keys)} key(s) sizes/seeds={_r35_desc} pool_new={_r35_pool_new}")
+        # R37 (F1): single-flight. Claim only the keys no other
+        # pre-warm is already generating; the rest are in flight
+        # and this call waits on their futures instead of
+        # re-submitting the same mazes to the 4-worker pool (R36:
+        # 60 MSG_BLOCKS batches re-submitted the same size-20/21
+        # keys, each batch then waited 51-120 s behind its own
+        # duplicates while forward import made zero progress).
+        # The claim loop runs with no await inside it, so two
+        # concurrent calls cannot claim the same key. A claimer
+        # resolves its own futures BEFORE awaiting any shared one,
+        # so no two calls can wait on each other.
+        _r37_loop = asyncio.get_running_loop()
+        _mine = []
+        _futures = []
+        for _k in _keys:
+            _f = self._prewarm_inflight.get(_k)
+            if _f is None:
+                _f = _r37_loop.create_future()
+                self._prewarm_inflight[_k] = _f
+                _mine.append(_k)
+            _futures.append(_f)
+
+        def _r37_resolve_mine():
+            for _k in _mine:
+                _f = self._prewarm_inflight.pop(_k, None)
+                if _f is not None and not _f.done():
+                    _f.set_result(None)
+        try:
+            _pool = self._get_maze_pool()
+            _loop = asyncio.get_running_loop()
+            try:
+                _results = await asyncio.gather(
+                    *[_loop.run_in_executor(_pool, _maze_gen_worker, _k) for _k in _mine],
+                    return_exceptions=True)
+            except asyncio.CancelledError:
+                _r37_resolve_mine()
+                raise
+            for _k, _r in zip(_mine, _results):
+                if isinstance(_r, Exception):
+                    logger.warning(f"[Verify] pre-warm failed for {_k}: {_r} — generating sequentially")
+                    try:
+                        _sparse = _generate_maze_pure(_k[0], _k[1], _k[2], _k[3])
+                    except Exception as _e2:
+                        logger.warning(f"[Verify] pre-warm sequential fallback failed for {_k}: {_e2}")
+                        continue
+                    if len(self._maze_cache) >= self._maze_cache_max:
+                        self._maze_cache.popitem(last=False)
+                    self._maze_cache[_k] = _sparse
+                    continue
+                _key2, _sparse = _r
+                if len(self._maze_cache) >= self._maze_cache_max:
+                    self._maze_cache.popitem(last=False)
+                self._maze_cache[_key2] = _sparse
+        except Exception as _e:
+            logger.warning(f"[Verify] pre-warm pool failed ({_e}) — generating sequentially")
+            if getattr(self, "_maze_pool", None) is not None:
+                try:
+                    self._maze_pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                self._maze_pool = None
+            for _k in _mine:
+                if _k in self._maze_cache:
+                    continue
+                try:
+                    _sparse = _generate_maze_pure(_k[0], _k[1], _k[2], _k[3])
+                except Exception as _e2:
+                    logger.warning(f"[Verify] pre-warm sequential fallback failed for {_k}: {_e2}")
+                    continue
+                if len(self._maze_cache) >= self._maze_cache_max:
+                    self._maze_cache.popitem(last=False)
+                self._maze_cache[_k] = _sparse
+
+        # R37 (F1): resolve this call's own futures (waiters proceed
+        # even on a cache miss - verify falls back to in-process
+        # generation, R37 F3), then wait for any keys another call
+        # is generating.
+        _r37_resolve_mine()
+        if _futures:
+            await asyncio.gather(*_futures, return_exceptions=True)
+        # R35 (N3): completion log (both the pool path and the
+        # sequential-fallback path end here).
+        logger.info(f"[R35] pre-warm done: {len(_keys)} key(s) took {time.monotonic() - _r35_t0:.1f}s")
+
+    def _prewarm_background(self, keys):
+        """R37 (F1): start _prewarm_mazes as a background task.
+        The import path (import_blocks, receive_block) uses this
+        and never awaits the pre-warm: awaiting it parked the
+        whole import behind a batch of mazes at sizes 17-21
+        (R36 Forward (b)). The task is tracked so it stays alive
+        until done; verify awaits the pool single-flight for a cold
+        key (_ensure_maze_cached, R37 F3), so nothing is skipped if
+        the background task is slow."""
+        _task = asyncio.create_task(self._prewarm_mazes(keys))
+        self._prewarm_tasks.add(_task)
+        _task.add_done_callback(self._prewarm_task_done)
+        return _task
+
+    def _prewarm_task_done(self, task):
+        """R37 (F1): drop the finished background pre-warm task;
+        surface an unexpected error (pre-warm itself already
+        swallows pool failures into warnings, so this only fires
+        for a bug - and verify still generates in-process)."""
+        self._prewarm_tasks.discard(task)
+        try:
+            _exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if _exc is not None:
+            logger.warning(f"[R37] background pre-warm failed ({_exc}) - verify will use the pool single-flight, then in-process")
+
+    async def _ensure_maze_cached(self, seed_hex, size, density_ppm, turb_ppm):
+        """R37 (F3): return the maze for a (seed, size, density, turb)
+        key, generating it in the process pool - single-flight with
+        the import-path pre-warm - when it is not cached yet. Falls
+        back to in-process generation (single-flight
+        _generate_deterministic_maze) only if the pool did not fill
+        the cache. R37 run 3 showed why verify must not generate
+        in-process first: for a growth block it needs TWO mazes (new
+        + parent) sequentially under _import_lock, about 33 s of CPU
+        solo at sizes 22/23 (48 s+ under pool contention), while the
+        pool was generating the SAME keys in the background - duplicate
+        work that also clogged the pool. The pool generates the two
+        keys concurrently and verify awaits the shared futures, so
+        no maze is ever generated twice and the lock is held only
+        for the pool parallel time. The maze returned is
+        bit-identical either way (deterministic _generate_maze_pure,
+        same key); verify still recomputes every root and runs every
+        check - only the execution venue changes."""
+        _key = (seed_hex, size, density_ppm, turb_ppm)
+        _cached = self._maze_cache.get(_key)
+        if _cached is not None:
+            return _cached
+        # R37 (F4): race the pool with a timeout. Run 5 proved the
+        # unbounded wait fails: B2 stalled on block 521's one cold
+        # maze (24, b2b13b0b...), the pool delivered it at 37.5 s,
+        # but the sync loop had already requested a snapshot at
+        # 35.9 s, so the key landed ~1.6 s too late. The pool task
+        # is SHIELDED, never cancelled: wrapping the bare
+        # _prewarm_mazes coroutine in wait_for would cancel it on
+        # timeout, and cancelling a call that is only WAITING on
+        # another call's shared _prewarm_inflight future would
+        # cancel that shared future (asyncio.gather propagates
+        # cancellation to its children) and poison single-flight
+        # for every other waiter. With shield the pool keeps
+        # generating in the background and fills the cache when
+        # done; the key is never claimed twice - the timeout is on
+        # WAITING for the pool, not on claiming it. On timeout (or
+        # any pool-wait error) fall through to the cache check and
+        # then to in-process generation exactly as before.
+        _r37_task = asyncio.create_task(self._prewarm_mazes([_key]))
+        self._prewarm_tasks.add(_r37_task)
+        _r37_task.add_done_callback(self._prewarm_task_done)
+        try:
+            await asyncio.wait_for(asyncio.shield(_r37_task), timeout=_R37_POOL_WAIT_S)
+        except asyncio.TimeoutError:
+            logger.warning(f"[R37] pool slow for maze size={_key[1]} seed={_key[0][:16]} - waited {_R37_POOL_WAIT_S}s, generating in-process (pool keeps running in background)")
+        except Exception as _r37_e:
+            logger.warning(f"[R37] pool wait failed for maze size={_key[1]} seed={_key[0][:16]} ({_r37_e}) - generating in-process")
+        _cached = self._maze_cache.get(_key)
+        if _cached is not None:
+            return _cached
+        _loop = asyncio.get_running_loop()
+        return await _loop.run_in_executor(
+            self._move_executor, self._generate_deterministic_maze,
+            seed_hex, size, density_ppm, turb_ppm, self.node.height)
     def get_state(self, miner_id: str) -> Optional[dict]:
         return getattr(self, '_cached_states', {}).get(miner_id)
 
@@ -11227,28 +11715,27 @@ class PoSWConsensus:
     async def _load_or_create_maze(self, miner_id: str, maze_id: str = None) -> dict:
         if not maze_id:
             maze_id = miner_id
-        # R14 (Xaver 2026-11-23: one wallet holds many miners,
-        # like Bitcoin): a second miner on the same wallet gets
-        # its OWN maze, not a rejection. The wallet maze row is
-        # keyed by the wallet pubkey, so a second miner needs a
-        # distinct maze id, derived deterministically from
-        # (wallet, miner) so every node agrees. A miner that
-        # already owns a maze (first or second on its wallet)
-        # keeps it across reconnects.
+        # R24 (Xaver 2026-11-24: every miner seals, 2nd/100th/1e6th):
+        # a maze id MUST be a real pubkey the miner can sign
+        # with (verify requires maze_id == attestation pubkey
+        # == producer_pub). The R14 keccak-hash remap made a
+        # second miner's maze id a hash no key can ever equal,
+        # so it could never seal. No hash maze ids, ever: a
+        # miner that needs a distinct maze generates its own
+        # maze keypair and registers with it. A miner that
+        # already owns a maze keeps it across reconnects, but
+        # only if the owned maze id is a valid pubkey; a
+        # legacy hash row is ignored, so the miner rotates
+        # to a fresh key instead of sealing from a hash.
         _owned = await self.maze_repo.get_by_miner_id(miner_id)
         if _owned:
-            maze_id = str(_owned[0].get("maze_id") or maze_id)
-        else:
-            _wallet_row = await self.maze_repo.get_by_maze_id(maze_id)
-            if _wallet_row:
-                _prev = _wallet_row.get("minerid")
-                if _prev and _prev != miner_id:
-                    _prev_ws = self.node.miner_websockets.get(_prev)
-                    if _prev_ws is not None:
-                        maze_id = eth_keccak(
-                            b"MCXMAZEV2" + maze_id.encode() + b"|" + miner_id.encode()
-                        ).hex()
-                        logger.info(f"[MAZE] new maze {maze_id[:16]} for second miner {miner_id[:16]} on shared wallet")
+            _owned_mid = str(_owned[0].get("maze_id") or "")
+            try:
+                _owned_pk = bytes.fromhex(_owned_mid)
+            except (TypeError, ValueError):
+                _owned_pk = b""
+            if len(_owned_pk) == 65 and _owned_pk[0] == 0x04:
+                maze_id = _owned_mid
         existing = await self.maze_repo.get_by_maze_id(maze_id)
         if existing:
             row = dict(existing)
@@ -11297,7 +11784,7 @@ class PoSWConsensus:
                         int(row["turbulenceppm"]), self.node.height)
                     _seed_b = bytes.fromhex(row["seed"])
                     _new_spawn = self._select_spawn(
-                        _maze_h, (_px, _py, _pz) if (_inb(_px) and _inb(_py) and _inb(_pz)) else (0, 0, 0),
+                        _maze_h, (_px, _py, _pz) if (_inb(_px) and _inb(_py) and _inb(_pz)) else None,
                         _seed_b)
                     _new_goal = self._select_open_cell(_maze_h, _seed_b, exclude=_new_spawn)
                     row["posx"], row["posy"], row["posz"] = _new_spawn
@@ -11327,7 +11814,7 @@ class PoSWConsensus:
             self._generate_deterministic_maze, seed, MIN_MAZE_SIZE, MIN_WALL_DENSITY_PPM, 0, self.node.height
         )
         root = self._calculate_maze_root(maze)
-        spawn = self._select_spawn(maze, (0, 0, 0), bytes.fromhex(seed))
+        spawn = self._select_spawn(maze, None, bytes.fromhex(seed))
         goal = self._select_open_cell(maze, bytes.fromhex(seed), exclude=spawn)
         now = int(time.time())
         row = {
@@ -11838,99 +12325,92 @@ class PoSWConsensus:
                 logger.warning(f"[SEAL-SELF-VERIFY-1] block {block_id} local attestation for {str(winner)[:16]} already at {int(_prev_att.get('last_block', -1))} (>= id) — peers reject (ATTEST-CAP-STRICT), skipping")
                 self.node._next_block_time = time.time() + BLOCK_TIME
                 return False
-            if _prev_att:
-                _att_cap = int(_prev_att.get("last_size", MIN_MAZE_SIZE)) + ATTEST_GROWTH_PER_BLOCK * (block_id - int(_prev_att["last_block"]))
-            else:
-                _att_cap = MIN_MAZE_SIZE + ATTEST_FRESH_BUFFER
+            # R29: seal-path consistency -- re-resolve EVERY candidate's
+            # size from the live row at seal time and rebuild the draw
+            # from those sizes (same ticket inputs, weights recomputed),
+            # so the attestation and the sealed lottery candidates carry
+            # the SAME size and cannot disagree with the strict size
+            # check. The election sizes above go stale the moment a
+            # catch/shrink lands between election and staging. If the
+            # re-resolved sizes change the draw winner, the seal aborts
+            # for this round (stale-election miss) -- never seal a block
+            # whose attestation and lottery disagree. No new limit, no
+            # ruleset change, no check weakened.
+            _seal_sizes = {}
+            try:
+                for _r in (await self.maze_repo.get_all() or []):
+                    try:
+                        _seal_sizes[str(_r.get("maze_id", ""))] = int(_r.get("size", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+            except Exception:
+                _seal_sizes = {}
+            _r29_pos = []
+            for _row in candidate_rows:
+                _rmid = str(_row.get("maze_id", ""))
+                _rsz = _seal_sizes.get(_rmid)
+                if _rsz is None:
+                    try:
+                        _rsz = int(_row.get("size", 0) or 0)
+                    except (TypeError, ValueError):
+                        _rsz = 0
+                _rw = _maze_att_weight(_rsz)
+                if _rw > 0:
+                    _r29_row = dict(_row)
+                    _r29_row["size"] = _rsz
+                    _r29_pos.append((_rw, _r29_row))
+            _r29_total_w = sum(_w for _w, _ in _r29_pos)
+            _r29_passing = []
+            if _r29_total_w > 0:
+                _r29_remaining = sorted(_r29_pos, key=lambda p: str(p[1].get("maze_id", "")))
+                _r29_rem_w = _r29_total_w
+                _r29_k = 0
+                while _r29_remaining:
+                    _r29_draw = _maze_ticket(prev_hash, block_id, f"__draw__{_r29_k}", _stamped_ts) % _r29_rem_w
+                    _r29_acc = 0
+                    _r29_pick = len(_r29_remaining) - 1
+                    for _r29_i, (_r29_w, _r29_row) in enumerate(_r29_remaining):
+                        _r29_acc += _r29_w
+                        if _r29_draw < _r29_acc:
+                            _r29_pick = _r29_i
+                            break
+                    _r29_w_pick, _r29_row_pick = _r29_remaining.pop(_r29_pick)
+                    _r29_rem_w -= _r29_w_pick
+                    _r29_passing.append((_r29_k, _r29_row_pick))
+                    _r29_k += 1
+            _r29_passing.sort(key=lambda p: p[0])
+            _r29_takeover = (str(passing[rank][1].get("maze_id", "")) != str(winner)) if 0 <= rank < len(passing) else False
+            _r29_rank_winner = str(_r29_passing[rank][1].get("maze_id", "")) if 0 <= rank < len(_r29_passing) else None
+            _r29_winner_in = any(str(_rr[1].get("maze_id", "")) == str(winner) for _rr in _r29_passing)
+            if not _r29_passing or not _r29_winner_in or (_r29_rank_winner != str(winner) and not _r29_takeover):
+                logger.warning(f"[SEAL-STALE-ELECT-1] block {block_id}: re-resolved sizes change the draw (winner {str(winner)[:16]} rank-winner {_r29_rank_winner}) — stale election, skipping round")
+                self.node._next_block_time = time.time() + BLOCK_TIME
+                return False
+            _pos = _r29_pos
+            passing = _r29_passing
+            for _t, _rr in passing:
+                if str(_rr.get("maze_id", "")) == str(winner):
+                    winner_row = _rr
+                    break
+            winner = winner_row["maze_id"]
+            winner_elect_size = int(winner_row["size"])
+            # R29: the attestation size is the ONE re-resolved winner
+            # size -- the same value the rebuilt lottery candidate
+            # carries. The old two-value pick is gone.
             maze_attestation = {
                 "maze_id": winner,
                 "pubkey": winner,
-                "size": min(max(int(winner_row["size"]), winner_elect_size), _att_cap),
+                "size": int(winner_row["size"]),
                 "block": block_id,
             }
-            logger.info(f"[IDEA5-ATTEST] {str(winner)[:16]} size={maze_attestation['size']} cap={_att_cap} prior={'none' if not _prev_att else _prev_att.get('last_block')}")
+            logger.info(f"[IDEA5-ATTEST] {str(winner)[:16]} size={maze_attestation['size']} prior={'none' if not _prev_att else _prev_att.get('last_block')}")
             if int(maze_attestation["size"]) < MIN_MAZE_SIZE:
                 logger.warning(f"[SEAL-SELF-VERIFY-1] block {block_id} sealed attestation size {maze_attestation['size']} < {MIN_MAZE_SIZE} — peers would reject, skipping")
                 self.node._next_block_time = time.time() + BLOCK_TIME
                 return False
 
-            # B1: growth beyond the fresh-claim cap must be backed by a
-            # prior attestation of the same size (maze_attestations, never
-            # pruned). Validity never reads pruned block history, so the
-            # producer must not either: the proof comes from this seal's
+            # R28: no cap, so no work-proof/clamp. attestation_proof stays empty.
             _att_proof = []
-            try:
-                _att_sz = int(maze_attestation["size"])
-                if _att_sz > MIN_MAZE_SIZE + ATTEST_FRESH_BUFFER:
-                    _prov_entry = None
-                    for _u in (self._pending_maze_updates or []):
-                        if not isinstance(_u, dict):
-                            continue
-                        _um = str(_u.get("maze_id") or _u.get("miner_id") or "")
-                        if _um == str(winner) and _valid_maze_size(_u.get("new_size")) == _att_sz:
-                            _prov_entry = dict(_u)
-                            break
-                    _stored_entry = None
-                    try:
-                        _pr = await self.node.maze_proof_repo.get_for_size(str(winner), _att_sz)
-                        if _pr:
-                            _pj = _pr.get("proof_json", "") if isinstance(_pr, dict) else ""
-                            _stored_entry = json.loads(_pj) if isinstance(_pj, str) and _pj else None
-                    except Exception:
-                        _stored_entry = None
-                    if _prov_entry is None and isinstance(_stored_entry, dict) and _valid_maze_size(_stored_entry.get("new_size")) == _att_sz:
-                        _prov_entry = _stored_entry
-                    # (maze_attestations is never pruned), so the claim is
-                    _is_reattest = False
-                    if _prov_entry is None:
-                        try:
-                            _pa = await self.maze_attestation_repo.get(str(winner))
-                        except Exception:
-                            _pa = None
-                        if _pa is not None and int(_pa.get("last_size", 0) or 0) >= _att_sz:
-                            _is_reattest = True
-                    if _prov_entry is not None:
-                        _att_proof = [_prov_entry]
-                    elif _is_reattest:
-                        _att_proof = []
-                    else:
-                        _clamp = MIN_MAZE_SIZE + ATTEST_FRESH_BUFFER
-                        if isinstance(_stored_entry, dict):
-                            _ps = _valid_maze_size(_stored_entry.get("new_size"))
-                            if _ps is not None:
-                                _clamp = max(_clamp, int(_ps))
-                        if _att_sz > _clamp:
-                            logger.warning(
-                                f"[SEAL-WORK-PROOF-1] block {block_id} clamp attestation "
-                                f"size {_att_sz} -> {_clamp} (no proven catch in pending/proof store)"
-                            )
-                            maze_attestation["size"] = int(_clamp)
-                            _att_sz = int(_clamp)
-                            if isinstance(_stored_entry, dict) and _valid_maze_size(_stored_entry.get("new_size")) == _att_sz:
-                                _att_proof = [_stored_entry]
-                            else:
-                                # The clamped size has its own catch record
-                                # in the store; attach it so the block stays
-                                # self-contained (section 3).
-                                try:
-                                    _cp = await self.node.maze_proof_repo.get_for_size(str(winner), _att_sz)
-                                    if _cp:
-                                        _cpj = _cp.get("proof_json", "") if isinstance(_cp, dict) else ""
-                                        _centry = json.loads(_cpj) if isinstance(_cpj, str) and _cpj else None
-                                        if isinstance(_centry, dict) and _valid_maze_size(_centry.get("new_size")) == _att_sz:
-                                            _att_proof = [_centry]
-                                except Exception:
-                                    pass
-                            if int(maze_attestation["size"]) < MIN_MAZE_SIZE:
-                                logger.warning(
-                                    f"[SEAL-WORK-PROOF-1] block {block_id} attestation size below floor after clamp — skipping"
-                                )
-                                self.node._next_block_time = time.time() + BLOCK_TIME
-                                return False
-            except Exception as _wp_e:
-                logger.warning(f"[SEAL-WORK-PROOF-1] block {block_id} check failed ({_wp_e}) — skipping seal")
-                self.node._next_block_time = time.time() + BLOCK_TIME
-                return False
 
             # FIX 2 (growth without a catch proof): every block must carry
             # the catch proof for every growth event it contains, in the
@@ -12150,8 +12630,72 @@ class PoSWConsensus:
 
             # TX-LOCK-RELEASE-1 Stage 2: re-stage inside a fresh transaction with
             # exactly the Stage 1 txs, verify the re-staged state root matches the
-            # signed block, then run the post-signing checks, self-verify, and
-            # seal — all inside this transaction (the seal stays nested).
+            # signed block, then run the post-signing checks and seal — all
+            # inside this transaction (the seal stays nested). R30: the
+            # tamper check and the self-verify ran lock-free just above,
+            # so this transaction holds the lock only for the fast
+            # re-stage + seal, never for a maze generation.
+            # R30: tamper check + self-verify run BEFORE the Stage-2
+            # transaction, lock-free. verify_block_proof is a pure
+            # function of the block bytes + the maze cache + immutable
+            # sealed history: its only live-row reads are
+            # get_by_maze_id(miner_id), which can never match a maze_id
+            # (miner ids are PC_..., maze ids are pubkeys), so they
+            # always return None; the growth check reduces to a
+            # block-bytes predicate and the provenance comparison never
+            # runs. The signed_blocks / miner_repo reads are stable (no
+            # concurrent seal under blockexecutionlock) and the proven
+            # walk is historical. A move landing during verify therefore
+            # cannot change the outcome. Running verify inside the tx
+            # held _sqlite_lock for 17-240 s on a cold cache (one maze
+            # generation is 16 s at size 15, 54-72 s at 19, ~120 s at
+            # 22), blocking every move's DB access past the 30 s move
+            # timeout. The re-stage state-root check below stays inside
+            # the tx and still guards the seal. No check is weakened
+            # or reordered past the seal — verify runs first, seal
+            # second, exactly as before, only the lock is free during
+            # verify. On failure here there is nothing to roll back
+            # (no tx open yet) — same skip as the in-tx path.
+            if signed_block and signed_block.get("hash") == block_hash and verify_signature_bytes(signed_block.get("producer_pub", ""), bytes.fromhex(block_hash), signed_block.get("signature", "")):
+                _compare_fields = ("id", "phash", "ts", "transactions", "state_root", "maze_updates", "maze_attestation", "reward_wallet", "reward", "winner", "miners", "slashes")
+                tampered = False
+                for _fk in _compare_fields:
+                    if signed_block.get(_fk) != unsigned_block.get(_fk):
+                        logger.warning(f"[PoSW] Miner returned altered block — rejecting (field '{_fk}' differs)")
+                        tampered = True
+                        break
+                if tampered:
+                    self.node._next_block_time = time.time() + BLOCK_TIME
+                    await _rollback_producer_credit()
+                    return False
+                block = signed_block
+                block["finalized"] = False
+                block_signed = True
+                logger.info(f"[PoSW] Received valid signed block from miner {winner_miner_id[:16]}")
+            else:
+                logger.warning(f"[PoSW] Signed block from {winner_miner_id[:16]} failed validation — skipping block {block_id}")
+                self.node._next_block_time = time.time() + BLOCK_TIME
+                await _rollback_producer_credit()
+                return False
+            # run the same consensus verify followers use
+            try:
+                if not await self.node.verify_block_proof(block):
+                    logger.warning(
+                        f"[SEAL-SELF-VERIFY-1] block {block_id} failed verify_block_proof — "
+                        f"not sealing (followers would reject)"
+                    )
+                    self.node._next_block_time = time.time() + BLOCK_TIME
+                    await _rollback_producer_credit()
+                    return False
+            except Exception as _sv_e:
+                logger.error(
+                    f"[SEAL-SELF-VERIFY-1] block {block_id} verify raised "
+                    f"{type(_sv_e).__name__}: {_sv_e} — not sealing"
+                )
+                self.node._next_block_time = time.time() + BLOCK_TIME
+                await _rollback_producer_credit()
+                return False
+
             try:
                 async with await self.node.db.transaction():
                     staged2 = await self._stage_block_candidate(
@@ -12221,49 +12765,9 @@ class PoSWConsensus:
                         await self.db.execute_dml(
                             "INSERT INTO signed_blocks (miner_id, block_id, block_hash, signed_at) VALUES ($1,$2,$3,$4) ON CONFLICT (miner_id, block_id) DO UPDATE SET block_hash=$3, signed_at=$4",
                             winner_miner_id, block_id, block_hash, time.time())
-                    if signed_block and signed_block.get("hash") == block_hash and verify_signature_bytes(signed_block.get("producer_pub", ""), bytes.fromhex(block_hash), signed_block.get("signature", "")):
-                        _compare_fields = ("id", "phash", "ts", "transactions", "state_root", "maze_updates", "maze_attestation", "reward_wallet", "reward", "winner", "miners", "slashes")
-                        tampered = False
-                        for _fk in _compare_fields:
-                            if signed_block.get(_fk) != unsigned_block.get(_fk):
-                                logger.warning(f"[PoSW] Miner returned altered block — rejecting (field '{_fk}' differs)")
-                                tampered = True
-                                break
-                        if tampered:
-                            self.node._next_block_time = time.time() + BLOCK_TIME
-                            await self.node.db.rollback()
-                            await _rollback_producer_credit()
-                            return False
-                        block = signed_block
-                        block["finalized"] = False
-                        block_signed = True
-                        logger.info(f"[PoSW] Received valid signed block from miner {winner_miner_id[:16]}")
-                    else:
-                        logger.warning(f"[PoSW] Signed block from {winner_miner_id[:16]} failed validation — skipping block {block_id}")
-                        self.node._next_block_time = time.time() + BLOCK_TIME
-                        await self.node.db.rollback()
-                        await _rollback_producer_credit()
-                        return False
-                    # run the same consensus verify followers use
-                    try:
-                        if not await self.node.verify_block_proof(block):
-                            logger.warning(
-                                f"[SEAL-SELF-VERIFY-1] block {block_id} failed verify_block_proof — "
-                                f"not sealing (followers would reject)"
-                            )
-                            await self.node.db.rollback()
-                            await _rollback_producer_credit()
-                            self.node._next_block_time = time.time() + BLOCK_TIME
-                            return False
-                    except Exception as _sv_e:
-                        logger.error(
-                            f"[SEAL-SELF-VERIFY-1] block {block_id} verify raised "
-                            f"{type(_sv_e).__name__}: {_sv_e} — not sealing"
-                        )
-                        await self.node.db.rollback()
-                        await _rollback_producer_credit()
-                        self.node._next_block_time = time.time() + BLOCK_TIME
-                        return False
+                    # R30: the tamper check and the self-verify already ran
+                    # lock-free before this transaction (block / block_signed
+                    # set there). Nothing to re-check here.
 
                     try:
                         _svf_block_id = int(block.get("id", 0))
@@ -12546,6 +13050,217 @@ class PoSWConsensus:
         await self.block_repo.mark_finalized(block_id)
         logger.info(f"[PoSW] Finality checkpoint at block {block_id} (epoch {self.epoch})")
 
+    async def _ghost_step_apply(self, mz, maze_arr):
+        """R34 (b) / R35 (N1): apply one ghost step for maze row mz using the
+        already-generated maze_arr. Shared by the tick path (cache
+        hit) and the background step task (cold generation). The body
+        is the R25/R30 tick step, moved verbatim: oscillating-cycle
+        branch, plain BFS branch, ghost-catch restart via F9, and the
+        R28/R30 re-read-under-lock ghost write. Returns True when the
+        step was applied (or nothing was owed / the maze went stale /
+        a restart was scheduled) and the caller may consume the
+        movenonce gate; False when the step was skipped because the
+        per-maze lock was held — the gate stays and the step is
+        retried on a later tick."""
+        mid = mz["maze_id"]
+        sz = int(mz["size"])
+        gpos = self._ghost_tuple(mz)
+        mx, my, mz_pos = int(mz["posx"]), int(mz["posy"]), int(mz["posz"])
+        miner_pos = (mx, my, mz_pos)
+        if gpos is None or gpos == miner_pos:
+            return True
+        # R35 (N1): try-lock-and-skip. process_move holds this lock
+        # across the whole catch-generation (minutes at size 15), and
+        # the tick used to park on it here, chaining waits across
+        # mazes (R34 soak: 231.8 s span). If the lock is held, skip
+        # this step for THIS tick iteration without consuming the
+        # movenonce gate (return False) — the step is retried on a
+        # later tick when the lock is free: deferred, never lost,
+        # never double-counted. Sound: no await runs between here
+        # and the lock acquisitions below (BFS and the cycle math
+        # are synchronous), so the lock cannot become held in
+        # between in the single-threaded event loop.
+        if self._lock_for(mid).locked():
+            _r35_n = self._ghost_step_lock_skips.get(mid, 0) + 1
+            self._ghost_step_lock_skips[mid] = _r35_n
+            logger.info(f"[R35] ghost step skipped: lock held for {mid[:16]} (skips={_r35_n})")
+            return False
+        ghost_moved = False
+        ghost_caught = False
+        if mid in self._oscillating_mazes:
+            if mid not in self._ghost_cycle:
+                cycle_cells = []
+                for p in self._pos_history.get(mid, []):
+                    if p not in cycle_cells:
+                        cycle_cells.append(p)
+                if cycle_cells:
+                    def _manh(a, b):
+                        return abs(a[0]-b[0]) + abs(a[1]-b[1]) + abs(a[2]-b[2])
+                    farthest_idx = max(range(len(cycle_cells)),
+                                       key=lambda i: _manh(gpos, cycle_cells[i]))
+                    self._ghost_cycle[mid] = cycle_cells
+                    self._ghost_cycle_idx[mid] = farthest_idx
+                    self._ghost_frozen_target[mid] = cycle_cells[farthest_idx]
+            if mid in self._ghost_cycle:
+                cycle_cells = self._ghost_cycle[mid]
+                idx = self._ghost_cycle_idx[mid]
+                target = cycle_cells[idx]
+                if gpos == target:
+                    idx = (idx + 1) % len(cycle_cells)
+                    self._ghost_cycle_idx[mid] = idx
+                    target = cycle_cells[idx]
+                gdx, gdy, gdz = self._bfs_next_step(maze_arr, sz, gpos, target)
+                if gdx is not None:
+                    gpos = (gpos[0]+gdx, gpos[1]+gdy, gpos[2]+gdz)
+                    ghost_moved = True
+                if gpos == miner_pos:
+                    # R30: re-read under the per-maze lock,
+                    # release it across the cold generation
+                    # (holding it 16-120 s would block the
+                    # miner's moves for this maze and create
+                    # a new choke path), then re-take it and
+                    # re-read before the upsert, so a move
+                    # that landed during the generation cannot
+                    # be reverted by a stale-row upsert (the
+                    # R29 block-100 14->15 revert).
+                    # restart_ev carries no movenonce, so
+                    # merging it into the FRESH row preserves
+                    # the fresh nonce. If the maze changed
+                    # since the tick read it (a catch landed),
+                    # the ghost step / restart is stale and
+                    # is skipped (ghost_moved=False so no
+                    # stale ghost coords are written).
+                    async with self._lock_for(mid):
+                        _fresh_c = await self.maze_repo.get_for_miner(mz["minerid"], mid)
+                    _restart_base = dict(_fresh_c) if _fresh_c is not None else dict(mz)
+                    _restart_size = int(_fresh_c["size"]) if _fresh_c is not None else sz
+                    if _fresh_c is not None and (_fresh_c.get("seed") != mz.get("seed") or int(_fresh_c.get("size", 0)) != sz):
+                        logger.info(f"[R30] tick ghost step stale for {mid[:16]} (maze changed since tick read) — skipping")
+                        ghost_caught = False
+                        ghost_moved = False
+                    else:
+                        # R31 (F9): background the restart so
+                        # production_loop never pauses on the
+                        # cold generation. The task commits
+                        # under the per-maze lock with the R30
+                        # stale guards.
+                        self._schedule_tick_restart(mid, mz["minerid"], _restart_base, _restart_size)
+                        ghost_caught = True
+                        ghost_moved = False
+        else:
+            gdx, gdy, gdz = self._bfs_next_step(maze_arr, sz, gpos, miner_pos)
+            if gdx is not None:
+                new_gpos = (gpos[0]+gdx, gpos[1]+gdy, gpos[2]+gdz)
+                gpos = new_gpos
+                ghost_moved = True
+                if new_gpos == miner_pos:
+                    # R30: re-read under the per-maze lock,
+                    # release it across the cold generation
+                    # (holding it 16-120 s would block the
+                    # miner's moves for this maze and create
+                    # a new choke path), then re-take it and
+                    # re-read before the upsert, so a move
+                    # that landed during the generation cannot
+                    # be reverted by a stale-row upsert (the
+                    # R29 block-100 14->15 revert).
+                    # restart_ev carries no movenonce, so
+                    # merging it into the FRESH row preserves
+                    # the fresh nonce. If the maze changed
+                    # since the tick read it (a catch landed),
+                    # the ghost step / restart is stale and
+                    # is skipped (ghost_moved=False so no
+                    # stale ghost coords are written).
+                    async with self._lock_for(mid):
+                        _fresh_c = await self.maze_repo.get_for_miner(mz["minerid"], mid)
+                    _restart_base = dict(_fresh_c) if _fresh_c is not None else dict(mz)
+                    _restart_size = int(_fresh_c["size"]) if _fresh_c is not None else sz
+                    if _fresh_c is not None and (_fresh_c.get("seed") != mz.get("seed") or int(_fresh_c.get("size", 0)) != sz):
+                        logger.info(f"[R30] tick ghost step stale for {mid[:16]} (maze changed since tick read) — skipping")
+                        ghost_caught = False
+                        ghost_moved = False
+                    else:
+                        # R31 (F9): background the restart so
+                        # production_loop never pauses on the
+                        # cold generation. The task commits
+                        # under the per-maze lock with the R30
+                        # stale guards.
+                        self._schedule_tick_restart(mid, mz["minerid"], _restart_base, _restart_size)
+                        ghost_caught = True
+                        ghost_moved = False
+        if ghost_moved and not ghost_caught:
+            # R28: re-read under the per-maze lock. The tick
+            # read mz before the maze regen; moves keep being
+            # accepted meanwhile, and upserting the stale row
+            # whole would revert the DB movenonce (+1 desync).
+            # process_move holds the same lock, so the
+            # re-read + ghost write + upsert are atomic
+            # against moves. No await between the re-read
+            # and the upsert.
+            async with self._lock_for(mid):
+                _fresh = await self.maze_repo.get_for_miner(mz["minerid"], mid)
+                if _fresh is not None:
+                    self._set_ghost(_fresh, gpos)
+                    await self.maze_repo.upsert(_fresh)
+        # R35 (N1): applied (or nothing was owed / the maze went
+        # stale / a restart was scheduled) — the caller may consume
+        # the movenonce gate. Only a lock-held skip returns False.
+        # Log once per skip burst so the deferred step is visible.
+        if self._ghost_step_lock_skips.get(mid, 0):
+            _r35_sk = self._ghost_step_lock_skips.pop(mid)
+            logger.info(f"[R35] ghost step applied for {mid[:16]} after {_r35_sk} lock skip(s)")
+        return True
+    def _schedule_ghost_step(self, mid, miner_id, base, base_size, step_nonce):
+        """R34 (b): schedule a background ghost step for one maze
+        (F9 pattern). The cold generation runs off production_loop;
+        the task applies the step when the maze lands. The
+        check-and-set is synchronous (no await between), so in the
+        single-threaded event loop it is atomic against a second
+        tick scheduling the same maze. Returns True when a task is
+        scheduled or already in flight."""
+        _task = self._ghost_step_tasks.get(mid)
+        if _task is not None and not _task.done():
+            return True
+        self._ghost_step_tasks[mid] = asyncio.create_task(
+            self._ghost_step_task(mid, miner_id, dict(base), int(base_size), int(step_nonce)))
+        return True
+
+    async def _ghost_step_task(self, mid, miner_id, base, base_size, step_nonce):
+        """R34 (b): background ghost step. Generate lock-free (the
+        single-flight cache shares the generation with any other
+        waiter for the same key), then re-read under the per-maze
+        lock and apply the step only if the maze is unchanged and
+        no newer step has already accounted for this nonce. On a
+        stale maze the gate is left alone — the next tick sees the
+        new maze and steps or backgrounds anew. On failure the row
+        is untouched and the next move re-triggers the step."""
+        try:
+            loop = asyncio.get_event_loop()
+            maze_arr = await loop.run_in_executor(
+                self._move_executor,
+                self._generate_deterministic_maze,
+                base["seed"], base_size, int(base["walldensityppm"]),
+                int(base["turbulenceppm"]), self.node.height)
+            async with self._lock_for(mid):
+                _fresh = await self.maze_repo.get_for_miner(miner_id, mid)
+            if _fresh is None:
+                return
+            if _fresh.get("seed") != base.get("seed") or int(_fresh.get("size", 0)) != base_size:
+                logger.info(f"[R34] ghost step stale for {mid[:16]} (maze changed during generation) — skipping")
+                return
+            if self._ghost_step_nonce.get(mid, -1) >= step_nonce:
+                return
+            # R35 (N1): consume the gate only when the step was
+            # actually applied. On a lock-held skip the gate stays
+            # and the next tick retries the step.
+            if await self._ghost_step_apply(_fresh, maze_arr):
+                self._ghost_step_nonce[mid] = int(_fresh.get("movenonce", step_nonce))
+        except Exception as _e:
+            logger.error(f"[R34] ghost step task failed for {mid[:16]}: {_e}", exc_info=True)
+        finally:
+            if self._ghost_step_tasks.get(mid) is asyncio.current_task():
+                self._ghost_step_tasks.pop(mid, None)
+
+
     async def _shrink_and_ghost_chase(self, block_id: int):
         """Shrink and ghost chase OUTSIDE blockexecutionlock.
         Uses run_in_executor for CPU-heavy maze generation so the event
@@ -12561,66 +13276,76 @@ class PoSWConsensus:
             if sz > 5:
                 gpos = self._ghost_tuple(mz)
                 if gpos:
+                    # R27: the ghost steps only when the miner steps.
+                    # Speed must not decide the race; the ghost's edge
+                    # is its BFS finding technique. Gate the tick on
+                    # movenonce: one ghost step per miner move, never
+                    # one per clock tick.
+                    _cur_nonce = int(mz["movenonce"])
+                    # R31 (F9): a restart is already in flight for
+                    # this maze — do not consume this step; the
+                    # restart commit resets the gate and the next
+                    # move re-triggers it.
+                    _rt = self._restart_tasks.get(mid)
+                    if _rt is not None and not _rt.done():
+                        continue
+                    _last_nonce = self._ghost_step_nonce.get(mid)
+                    if _last_nonce is None:
+                        # First sight (or after a restart): adopt the
+                        # current nonce without stepping, so a restart
+                        # never double-steps the ghost for one move.
+                        self._ghost_step_nonce[mid] = _cur_nonce
+                        continue
+                    if _cur_nonce == _last_nonce:
+                        continue
                     mx, my, mz_pos = int(mz["posx"]), int(mz["posy"]), int(mz["posz"])
                     miner_pos = (mx, my, mz_pos)
                     if gpos != miner_pos:
-                        ghost_moved = False
-                        ghost_caught = False
+                        # R34 (b): never await a cold generation on the
+                        # tick. If the maze for this row is not cached
+                        # and no generation is in flight for it, the
+                        # step is backgrounded the way F9 backgrounds
+                        # the restart, and this tick is skipped — the
+                        # task applies the step when the maze lands.
+                        # The gate is left alone: the task accounts for
+                        # its nonce on commit, so a step is never lost
+                        # or double-counted.
+                        _r34_key = (mz["seed"], sz, int(mz["walldensityppm"]), int(mz["turbulenceppm"]))
+                        # R35 (N1): never await a generation on the
+                        # tick — cached or in flight, a miss is
+                        # backgrounded. R34 only backgrounded when no
+                        # generation was in flight, so a tick arriving
+                        # while the catch path generated still parked
+                        # on the single-flight wait. The gate is left
+                        # alone: the task accounts for its nonce on
+                        # commit, so a step is never lost or
+                        # double-counted.
+                        if _r34_key not in self._maze_cache:
+                            self._schedule_ghost_step(mid, mz["minerid"], dict(mz), sz, _cur_nonce)
+                            continue
+                        _r34_hit = _r34_key in self._maze_cache
+                        _r34_t0 = time.monotonic()
                         maze_arr = await loop.run_in_executor(
                             self._move_executor,
                             self._generate_deterministic_maze,
                             mz["seed"], sz, int(mz["walldensityppm"]),
                             int(mz["turbulenceppm"]), self.node.height
                         )
-                        if mid in self._oscillating_mazes:
-                            if mid not in self._ghost_cycle:
-                                cycle_cells = []
-                                for p in self._pos_history.get(mid, []):
-                                    if p not in cycle_cells:
-                                        cycle_cells.append(p)
-                                if cycle_cells:
-                                    def _manh(a, b):
-                                        return abs(a[0]-b[0]) + abs(a[1]-b[1]) + abs(a[2]-b[2])
-                                    farthest_idx = max(range(len(cycle_cells)),
-                                                       key=lambda i: _manh(gpos, cycle_cells[i]))
-                                    self._ghost_cycle[mid] = cycle_cells
-                                    self._ghost_cycle_idx[mid] = farthest_idx
-                                    self._ghost_frozen_target[mid] = cycle_cells[farthest_idx]
-                            if mid in self._ghost_cycle:
-                                cycle_cells = self._ghost_cycle[mid]
-                                idx = self._ghost_cycle_idx[mid]
-                                target = cycle_cells[idx]
-                                if gpos == target:
-                                    idx = (idx + 1) % len(cycle_cells)
-                                    self._ghost_cycle_idx[mid] = idx
-                                    target = cycle_cells[idx]
-                                for _ in range(2):
-                                    gdx, gdy, gdz = self._bfs_next_step(maze_arr, sz, gpos, target)
-                                    if gdx is None:
-                                        break
-                                    gpos = (gpos[0]+gdx, gpos[1]+gdy, gpos[2]+gdz)
-                                    ghost_moved = True
-                                    if gpos == miner_pos:
-                                        break
-                                if gpos == miner_pos:
-                                    restart_ev = await self._restart_position(dict(mz), mid, mz["minerid"], sz)
-                                    if restart_ev:
-                                        ghost_caught = True
-                                        await self.maze_repo.upsert({**dict(mz), **restart_ev})
-                        else:
-                            gdx, gdy, gdz = self._bfs_next_step(maze_arr, sz, gpos, miner_pos)
-                            if gdx is not None:
-                                new_gpos = (gpos[0]+gdx, gpos[1]+gdy, gpos[2]+gdz)
-                                gpos = new_gpos
-                                ghost_moved = True
-                                if new_gpos == miner_pos:
-                                    restart_ev = await self._restart_position(dict(mz), mid, mz["minerid"], sz)
-                                    if restart_ev:
-                                        ghost_caught = True
-                                        await self.maze_repo.upsert({**dict(mz), **restart_ev})
-                        if ghost_moved and not ghost_caught:
-                            self._set_ghost(mz, gpos)
-                            await self.maze_repo.upsert(dict(mz))
+                        _r34_dt = time.monotonic() - _r34_t0
+                        if _r34_dt > 1.0:
+                            logger.info(f"[R34] ghost-step gen size={sz} hit={_r34_hit} took {_r34_dt:.1f}s")
+                        # R35 (N1): consume the movenonce gate only
+                        # when the step was actually applied.
+                        # _ghost_step_apply returns False when it
+                        # skipped on a held per-maze lock — the gate
+                        # stays, and the next tick retries the step.
+                        if await self._ghost_step_apply(mz, maze_arr):
+                            self._ghost_step_nonce[mid] = _cur_nonce
+                    else:
+                        # Ghost already on the miner: no step is owed.
+                        # Adopt the nonce (the gate-set used to run
+                        # unconditionally above).
+                        self._ghost_step_nonce[mid] = _cur_nonce
             await asyncio.sleep(0)
 
     async def _update_global_shrink_factor(self):
@@ -12667,10 +13392,19 @@ class PoSWConsensus:
 
                 await self.produce_block()
 
+                # R34 (d): instrument the tick so a late draw
+                # decomposes exactly: log when the shrink/ghost
+                # step (the only remaining await between the
+                # draw gate and the next iteration) takes over
+                # a second.
+                _r34_pl0 = time.monotonic()
                 try:
                     await self._shrink_and_ghost_chase(self.node.height)
                 except Exception as e:
                     logger.error(f"[PoSW] Shrink/ghost error: {e}")
+                _r34_pl1 = time.monotonic() - _r34_pl0
+                if _r34_pl1 > 1.0:
+                    logger.info(f"[R34] production_loop shrink/ghost took {_r34_pl1:.1f}s (height {self.node.height})")
 
                 now = time.time()
                 if now - last_height_broadcast >= BLOCK_TIME and self.node.miner_websockets:
@@ -12776,6 +13510,8 @@ class EncryptedPeer:
     version: str
     last_seen: float
     p2p_port: int = 8081
+    transport: str = "tcp"
+    p2p_ws: str = ""
     score: int = 0
     banned: bool = False
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -12861,6 +13597,181 @@ def _dial_dup_action(local_id, remote_id, direction, loopback, has_existing) -> 
     else:
         keeper = _mutual_dial_keep(local_id, remote_id)
     return 'replace_existing' if keeper else 'close_new'
+
+
+# --- TUNNEL-P2P-WS: P2P over WebSocket -------------------------------------
+# A Cloudflare Tunnel forwards HTTP/WebSocket but NOT raw TCP, so a tunnel
+# node cannot be P2P-dialled on 8081. Its P2P runs over a WebSocket instead:
+# wss://<host>/p2p on the WS port (8080). The framed P2P bytes are EXACTLY
+# the same as on raw TCP (same P2P_MAGIC, same handshake, same 4-byte
+# length + AES-GCM ciphertext frames), so perform_handshake, _peer_loop and
+# _peer_writer run unchanged -- they only ever touch reader.readexactly,
+# writer.write/drain/close/wait_closed and writer.get_extra_info('peername').
+# The two adapters below present a WS connection with that exact interface:
+# each writer.drain() flushes as ONE binary WS message (one framed chunk),
+# and the reader reassembles the incoming binary messages into a byte
+# stream. No consensus code, no message handling, no check is touched.
+# A tunnel hostname is NOT an IP: the raw-TCP SSRF filter must never see
+# it. _ws_dial_allowed (P2PManager) resolves the hostname and judges the
+# resolved IPs by the same rule as registry IP endpoints (public always,
+# private/loopback only with allow_private_peers).
+
+
+class _WSByteReader:
+    """StreamReader-compatible byte source fed by WS binary messages."""
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._need = asyncio.Event()
+        self._closed = False
+
+    def feed(self, data: bytes):
+        if data:
+            self._buf += data
+            self._need.set()
+
+    def set_closed(self):
+        self._closed = True
+        self._need.set()
+
+    async def readexactly(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            if self._closed:
+                raise asyncio.IncompleteReadError(partial=bytes(self._buf), expected=n)
+            self._need.clear()
+            if len(self._buf) >= n or self._closed:
+                continue
+            await self._need.wait()
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+
+class _WSByteWriter:
+    """StreamWriter-compatible byte sink: each drain() sends one binary
+    WS message. close()/wait_closed() mirror the TCP writer (close is
+    sync and idempotent; wait_closed awaits the close task)."""
+
+    def __init__(self, send_bytes, close_ws, peername):
+        self._send_bytes = send_bytes
+        self._close_ws = close_ws
+        self._peername = peername
+        self._buf = bytearray()
+        self._closed = False
+        self._close_task = None
+        self._close_event = asyncio.Event()
+
+    def write(self, data: bytes):
+        if not self._closed:
+            self._buf += data
+
+    async def drain(self):
+        if self._buf:
+            chunk = bytes(self._buf)
+            self._buf.clear()
+            await self._send_bytes(chunk)
+
+    def get_extra_info(self, name):
+        if name == 'peername':
+            return self._peername
+        return None
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._close_event.set()
+            return
+
+        async def _do_close():
+            try:
+                r = self._close_ws()
+                if asyncio.iscoroutine(r):
+                    await r
+            except Exception:
+                pass
+            finally:
+                self._close_event.set()
+
+        self._close_task = loop.create_task(_do_close())
+
+    async def wait_closed(self):
+        if not self._closed:
+            return
+        if self._close_task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._close_task), timeout=5)
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(self._close_event.wait(), timeout=5)
+        except Exception:
+            pass
+
+
+def _p2p_ws_from_ws_url(ws_url):
+    """Derive the /p2p URL from a miner WS URL (contract fallback when a
+    registry / MSG_PEERS entry carries ws_url but no p2p_ws)."""
+    try:
+        text = str(ws_url or "").strip()
+        if not text:
+            return ""
+        u = urlparse(text)
+        if not u.scheme:
+            u = urlparse("ws://" + text)
+        scheme = {"http": "ws", "https": "wss"}.get(u.scheme, u.scheme) or "ws"
+        host = u.hostname or ""
+        if not host:
+            return ""
+        port = u.port
+        default = 443 if scheme == "wss" else 80
+        if port and port != default:
+            netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        elif ":" in host:
+            netloc = f"[{host}]"
+        else:
+            netloc = host
+        return f"{scheme}://{netloc}/p2p"
+    except Exception:
+        return ""
+
+
+def _ws_client_close(ws, session):
+    """Close callable for an outbound (aiohttp client) WS: close the WS,
+    then its session. Returned callable is what _WSByteWriter awaits."""
+
+    async def _close():
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        try:
+            await session.close()
+        except Exception:
+            pass
+
+    return _close
+
+
+async def _pump_ws_into_reader(ws, reader):
+    """Feed WS binary messages into a _WSByteReader until the WS closes.
+    Text frames are ignored (the P2P protocol is binary-only); any close
+    or error marks the reader closed so _peer_loop's readexactly raises
+    IncompleteReadError and tears the peer down, exactly like a TCP reset."""
+    from aiohttp import WSMsgType as _WMT
+    try:
+        async for _msg in ws:
+            if _msg.type == _WMT.BINARY:
+                reader.feed(_msg.data)
+            elif _msg.type in (_WMT.CLOSE, _WMT.CLOSED, _WMT.ERROR):
+                break
+    except Exception:
+        pass
+    finally:
+        reader.set_closed()
 
 
 async def perform_handshake(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -13285,8 +14196,14 @@ class P2PNode:
             "invalid_message": -2,
             "decrypt_failed": -5,
             "oversized_message": -10,
-            "protocol_violation": -15,
-            "invalid_block": -20,
+            "protocol_violation": -2,  # R24 (F2): one bad message must not ban (threshold is -5); three bad messages still can
+            "invalid_block": -2,  # R24-fix (2026-11-24): -20 banned a
+            # legitimate syncing follower on ONE rejected block
+            # (T-Seal: node A banned follower B at 11:31:18 with
+            # score -20, so B could never reconnect and stalled
+            # at height 9). A single "rejected" can be benign
+            # (a relayed duplicate/fork during sync), so one
+            # bad block must not ban; three still can.
             "invalid_tx": -15,
         }
         self.score_decay_interval = 3600
@@ -13297,7 +14214,7 @@ class P2PNode:
             MSG_PING: (30, 60),
             MSG_GET_PEERS: (10, 60),
             MSG_GET_BLOCKS: (60, 60),
-            MSG_GET_STATUS: (30, 60),
+            MSG_GET_STATUS: (60, 60),  # R24 (F6): discovery sends ~30/min with zero headroom; one extra tip-quorum GET_STATUS tipped it over into a ban
             MSG_GET_CHECKPOINT: (10, 60),
             MSG_GET_SNAPSHOT: (5, 60),
             MSG_NEW_BLOCK: (100, 60),
@@ -13309,6 +14226,10 @@ class P2PNode:
         self._seen_block_hashes: OrderedDict = OrderedDict()
         self._seen_tx_hashes: OrderedDict = OrderedDict()
         self._seen_max = 8192
+        # R24 (F11): rejected block hashes, with an expiry —
+        # a block that failed verification is not re-verified
+        # when a peer re-sends it within 60 s.
+        self._rejected_block_hashes: Dict[str, float] = {}
         self._bootstrap_cooldown_log_ts: Dict[str, float] = {}
 
         self.peer_subnets: Dict[str, str] = {}
@@ -13364,6 +14285,24 @@ class P2PNode:
         p2p_cfg = getattr(self.node, 'config', {}).get('p2p', {}) if self.node else CONFIG.get('p2p', {})
         (self.genesis_node, self.dns_seeds, self.bootstrap_nodes,
          self.dht_bootstrap_nodes) = resolve_seed_lists(p2p_cfg)
+        # R24 (F5): the seed/bootstrap exemption compared an
+        # IP against a hostname string, so it never matched
+        # and the seed could be banned for a full hour like
+        # any peer. Resolve the seed/bootstrap hostnames to
+        # IPs once at startup and compare resolved IPs.
+        self._bootstrap_ips = set()
+        for _b in list(self.bootstrap_nodes) + [self.genesis_node]:
+            try:
+                _bh, _ = parse_ip_port(str(_b), P2P_PORT)
+            except Exception:
+                continue
+            self._bootstrap_ips.add(_bh)
+            try:
+                for _fam, _typ, _proto, _canon, _sa in socket.getaddrinfo(_bh, None):
+                    if _sa and _sa[0]:
+                        self._bootstrap_ips.add(str(_sa[0]))
+            except Exception:
+                pass
         self.registry_url = str(p2p_cfg.get('registry_url', REGISTRY_URL_DEFAULT)).strip()
         self.registry_enabled = _strict_bool(
             'p2p.registry_enabled', p2p_cfg.get('registry_enabled', True))
@@ -13375,6 +14314,16 @@ class P2PNode:
         # wholesale on each registry refresh so a changed
         # tunnel link drops the stale host.
         self._registry_tunnel_peers = []
+        # TUNNEL-P2P-WS: this node's own tunnel hostname, when it has
+        # one. Sources (first wins): p2p.tunnel_host / node.tunnel_host
+        # config, MCX_TUNNEL_HOST env, the tunnel helper's
+        # munex_tunnel.json state file (hosts["8080"] /
+        # hostnames["8080"]). Empty = not a tunnel node: no periodic
+        # re-register happens. Read once at startup; a tunnel started
+        # later is picked up on restart (the tunnel watcher also
+        # re-registers on its own).
+        self._tunnel_host = self._resolve_tunnel_host(p2p_cfg)
+        self._tunnel_last_register = 0.0
         self.fallback_nodes = list(p2p_cfg.get('fallback_nodes', []))
         self.dht_port = int(p2p_cfg.get('dht_port', DHT_PORT))
         self.allow_private_peers = _strict_bool(
@@ -13500,6 +14449,10 @@ class P2PNode:
         ip_only = addr[0]
         pending = self._pending_handshakes.get(ip_only, 0)
         if pending >= self._max_pending_handshakes:
+            # R24 (F9): handshake refusals were silent — log
+            # the reason, or a legitimate node behind a NAT
+            # fails to connect with no trace anywhere.
+            logger.info(f"[P2P] Rejecting inbound peer {addr_str}: too many pending handshakes ({pending}/{self._max_pending_handshakes})")
             writer.close()
             await writer.wait_closed()
             return
@@ -13507,6 +14460,7 @@ class P2PNode:
         hs_timestamps = self._handshake_rate_limiter.setdefault(ip_only, [])
         hs_timestamps[:] = [t for t in hs_timestamps if now_ts - t < 60]
         if len(hs_timestamps) >= self._handshake_rate_limit[0]:
+            logger.info(f"[P2P] Rejecting inbound peer {addr_str}: handshake rate limit ({len(hs_timestamps)}/{self._handshake_rate_limit[0]} per 60 s)")
             writer.close()
             await writer.wait_closed()
             return
@@ -13577,7 +14531,7 @@ class P2PNode:
 
             peer_ip = parse_ip_port(peer.address, P2P_PORT)[0]
             ip_conns = self._conn_per_ip.get(peer_ip, 0)
-            is_bootstrap = any(peer_ip in b for b in self.bootstrap_nodes) or peer_ip == self.genesis_node
+            is_bootstrap = peer_ip in self._bootstrap_ips or peer_ip == self.genesis_node
             if not is_bootstrap and ip_conns >= self._max_conn_per_ip:
                 logger.info(f"[P2P] Rejecting inbound peer {peer.address}: per-IP cap ({ip_conns}/{self._max_conn_per_ip})")
                 writer.close()
@@ -13635,8 +14589,13 @@ class P2PNode:
                 data = plaintext[1:]
                 self._metrics["messages_received"] += 1
                 self._metrics["bytes_received"] += len(plaintext)
-                await self._process_message(peer, msg_type, data)
+                # R31 (F10): dispatch handling as a tracked task so
+                # a slow verify never parks this read loop
+                # (head-of-line blocking). last_seen refreshes on
+                # READ, so a peer that is answering is never timed
+                # out while a handler is still running.
                 peer.last_seen = time.time()
+                self._track_task(asyncio.create_task(self._process_message_safe(peer, msg_type, data)))
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             pass
         except Exception as e:
@@ -13678,9 +14637,23 @@ class P2PNode:
             claimed = int(claimed)
         except (TypeError, ValueError):
             return 0
+        # R24 (F1): clamp to local+101, not local — a peer
+        # more than 100 ahead must stay VISIBLE as a sync
+        # target (the gap saturates just above the snapshot
+        # threshold), or the sync loop sees best==local and
+        # never starts syncing.
         if claimed > self.node.height + 100:
-            return self.node.height
+            return self.node.height + 101
         return max(0, claimed)
+
+    async def _process_message_safe(self, peer: EncryptedPeer, msg_type: int, data: bytes):
+        """R31 (F10): guard for a dispatched _process_message
+        task. An exception must be logged, never silently dropped
+        as an unretrieved task exception."""
+        try:
+            await self._process_message(peer, msg_type, data)
+        except Exception as _e:
+            logger.error(f"[P2P] _process_message failed for {peer.address}: {_e}", exc_info=True)
 
     async def _process_message(self, peer: EncryptedPeer, msg_type: int, data: bytes):
         peer.last_seen = time.time()
@@ -13716,10 +14689,26 @@ class P2PNode:
             elif msg_type == MSG_GET_PEERS:
                 async with self._lock:
                     peers_list = []
+                    tunnel_list = []
                     for p in self.peers.values():
+                        # TUNNEL-P2P-WS: only raw-TCP peers go in
+                        # "peers" -- a WS peer's p2p_port (8081) is
+                        # NOT diallable through its tunnel, so
+                        # advertising it as host:8081 would send
+                        # diallers at a dead port. WS peers (and
+                        # registry tunnel peers) go in
+                        # "tunnel_peers" with their /p2p URL.
+                        if getattr(p, "transport", "tcp") == "ws":
+                            if getattr(p, "p2p_ws", ""):
+                                tunnel_list.append({"host": parse_ip_port(p.address)[0], "p2p_ws": p.p2p_ws, "height": int(getattr(p, "height", 0) or 0)})
+                            continue
                         h = parse_ip_port(p.address)[0]
                         peers_list.append(f"[{h}]:{p.p2p_port}" if ":" in str(h) else f"{h}:{p.p2p_port}")
-                payload = json.dumps({"peers": peers_list[:100]}).encode()
+                    for _tp in list(self._registry_tunnel_peers):
+                        _pw = str(_tp.get("p2p_ws") or "")
+                        if _pw and all(_pw != str(_t.get("p2p_ws") or "") for _t in tunnel_list):
+                            tunnel_list.append({"host": str(_tp.get("host") or ""), "ws_url": str(_tp.get("ws_url") or ""), "p2p_ws": _pw, "height": _tp.get("height")})
+                payload = json.dumps({"peers": peers_list[:100], "tunnel_peers": tunnel_list[:100]}).encode()
                 await self._send_message(peer, MSG_PEERS, payload)
             elif msg_type == MSG_PEERS:
                 try:
@@ -13737,6 +14726,22 @@ class P2PNode:
                                 break
                             _spawned += 1
                             self._track_task(asyncio.create_task(self._connect_to_peer(addr)))
+                    # TUNNEL-P2P-WS: tunnel peers learned from
+                    # another node are dialled over WS, never TCP.
+                    for _tp in data_json.get("tunnel_peers", []) or []:
+                        if not isinstance(_tp, dict):
+                            continue
+                        _pw = str(_tp.get("p2p_ws") or "")
+                        if not _pw:
+                            _wu = str(_tp.get("ws_url") or "")
+                            _pw = _p2p_ws_from_ws_url(_wu) if _wu else ""
+                        if not _pw or _pw in _seen_eps:
+                            continue
+                        _seen_eps.add(_pw)
+                        if _spawned >= 32:
+                            break
+                        _spawned += 1
+                        self._track_task(asyncio.create_task(self._connect_to_peer_ws(_pw)))
                 except Exception as e:
                     logger.debug(f"[P2P] MSG_PEERS error from {peer.address}: {e}")
             elif msg_type == MSG_GET_BLOCKS:
@@ -13791,6 +14796,12 @@ class P2PNode:
                                 _ids = []
                             if not _ids or min(_ids) < hist_start or max(_ids) > hist_end:
                                 hist_fut = None
+                    # R35 (N3): log receipt BEFORE import_blocks, so
+                    # receipt vs import-queueing are distinguishable
+                    # (the R34 epoch stall showed replies arriving
+                    # while the import lock was held, with no line).
+                    _r35_ids = [int(b.get("id", -1)) for b in blocks if isinstance(b, dict)]
+                    logger.info(f"[R35] MSG_BLOCKS from {peer.address}: {len(blocks)} blocks ids={_r35_ids} received; importing")
                     if hist_fut is not None:
                         hist_fut.set_result(blocks)
                     else:
@@ -13820,9 +14831,31 @@ class P2PNode:
                         pass
                     if not self._mark_seen_block(str(block_data.get("hash", ""))):
                         return
+                    # R24 (F11): a block rejected within the
+                    # last 60 s is dropped without re-verifying
+                    # it, or a peer can force unlimited
+                    # re-verification by re-sending the same
+                    # bad block.
+                    _bh = str(block_data.get("hash", ""))
+                    _rej_until = self._rejected_block_hashes.get(_bh, 0.0)
+                    if _rej_until and time.time() < _rej_until:
+                        return
+                    # R35 (N3): log receipt before receive_block.
+                    logger.info(f"[R35] MSG_NEW_BLOCK from {peer.address}: block {block_data.get('id')} hash={str(block_data.get('hash', ''))[:16]} received")
                     _status = await self.node.receive_block(block_data)
+                    if _status == "ok":
+                        # R24 (F2): a verified block earns
+                        # reputation, so good behaviour counts
+                        # (it never did before).
+                        self._update_reputation(peer, "valid_block")
                     if _status == "rejected":
-                        # : invalid payloads must not
+                        # R24 (F2): an actually-invalid block
+                        # costs reputation (it never did
+                        # before); invalid payloads must not
+                        # be re-relayed.
+                        self._update_reputation(peer, "invalid_block")
+                        # R24 (F11): remember the rejection for 60 s.
+                        self._rejected_block_hashes[str(block_data.get("hash", ""))] = time.time() + 60.0
                         self._unmark_seen_block(str(block_data.get("hash", "")))
                     # full consensus verification. "disconnected" and
                     # tail fetch below. "rejected" is never relayed.
@@ -13959,7 +14992,22 @@ class P2PNode:
                                     logger.warning(f"[Sync] Snapshot at height {tip2}: cached root {root[:16]}... != tip state_root {str(latest2.get('state_root', ''))[:16]}... — refusing to serve")
                                 else:
                                     genesis_row = await self.node.block_repo.get_by_id(0)
-                                    genesis_hash = genesis_row["hash"] if genesis_row else (getattr(self.node, "genesis_hash", "") or "")
+                                    # R37 (F2): third fallback - the module-global
+                                    # genesis hash from genesis.json, set on every
+                                    # startup by load_genesis_file. A restarted node
+                                    # with block 0 pruned has self.genesis_hash ==
+                                    # "" (the restart path only sets it when block
+                                    # 0 exists, and _bind_genesis_to_db returns
+                                    # early when it is pruned), so it used to serve
+                                    # genesis_hash "" and every joiner rejected the
+                                    # snapshot ("genesis_hash missing or not 64 hex
+                                    # chars"). The global is already the identity
+                                    # this node advertises in its handshake, so
+                                    # serving it keeps the snapshot consistent with
+                                    # the handshake. If the global is empty too,
+                                    # "" is served and the requester still rejects
+                                    # - fail-closed, no check touched.
+                                    genesis_hash = genesis_row["hash"] if genesis_row else (getattr(self.node, "genesis_hash", "") or _node_genesis_hash or "")
                                     resp = {"height": tip2, "genesis_hash": genesis_hash,
                                             "state_root": root, "snapshot": snapshot, "tip_block": latest2}
                                     payload = json.dumps(resp).encode()
@@ -14125,7 +15173,11 @@ class P2PNode:
                     try:
                         encrypted = peer.encrypt_message(plaintext)
                         peer.writer.write(struct.pack(">I", len(encrypted)) + encrypted)
-                        await peer.writer.drain()
+                        # R24 (F10): a peer that stops reading
+                        # must not stall this writer forever —
+                        # time the drain out and tear the peer
+                        # down instead.
+                        await asyncio.wait_for(peer.writer.drain(), timeout=10)
                         self._metrics["messages_sent"] += 1
                         self._metrics["bytes_sent"] += len(plaintext)
                     except (ConnectionResetError, BrokenPipeError, OSError) as e:
@@ -14152,8 +15204,11 @@ class P2PNode:
         try:
             peer.send_queue.put_nowait((prio, peer._send_counter, msg_type, payload))
         except asyncio.QueueFull:
+            # R24 (F10): a full local send queue is OUR
+            # slowness, not the peer's fault — do not charge
+            # the peer's reputation for it (3 drops used to
+            # ban the victim).
             logger.debug(f"[P2P] Send queue full for {peer.address}, dropping type={msg_type}")
-            self._update_reputation(peer, "invalid_message")
 
     async def broadcast_message(self, msg_type: int, payload: bytes, exclude: Set[str] = None):
         if exclude is None:
@@ -14186,8 +15241,11 @@ class P2PNode:
         ]
 
         if len(self.peer_message_counts[addr][msg_type]) >= limit:
-            self._update_reputation(peer, "invalid_message")
-            logger.warning(f"[P2P] Rate limit exceeded: {addr} msg_type={msg_type}")
+            # R24 (F2): a rate-limit drop is NOT a reputation
+            # offence (a burst during catch-up is normal).
+            # Drop quietly; charging it banned good peers
+            # after 3 excesses.
+            logger.debug(f"[P2P] Rate limit exceeded: {addr} msg_type={msg_type}")
             return False
 
         self.peer_message_counts[addr][msg_type].append(now)
@@ -14320,6 +15378,17 @@ class P2PNode:
                         return False
                     for _ep in payload["peers"]:
                         if not isinstance(_ep, str) or len(_ep) > 256 or not _ep:
+                            return False
+                if "tunnel_peers" in payload:
+                    if not isinstance(payload["tunnel_peers"], list) or len(payload["tunnel_peers"]) > 128:
+                        return False
+                    for _tp in payload["tunnel_peers"]:
+                        if not isinstance(_tp, dict):
+                            return False
+                        _pw = str(_tp.get("p2p_ws") or _tp.get("ws_url") or "")
+                        if not _pw or len(_pw) > 512:
+                            return False
+                        if "height" in _tp and _tp.get("height") is not None and not isinstance(_tp.get("height"), int):
                             return False
 
             elif msg_type == MSG_GET_STATUS:
@@ -14513,7 +15582,13 @@ class P2PNode:
     async def rebroadcast_block_later(self, block_data: dict, delay: float):
         try:
             await asyncio.sleep(delay)
-            await self.broadcast_block(block_data, force=True)
+            # R24 (F11): no force — a timed rebroadcast must
+            # respect the seen-dedup, or every sealed block
+            # is re-sent to 3 peers at 3 s and 9 s and
+            # force-relayed downstream. With force=False this
+            # is a retry only if the first broadcast never
+            # marked the block seen.
+            await self.broadcast_block(block_data, force=False)
         except Exception:
             pass
 
@@ -14534,7 +15609,7 @@ class P2PNode:
 
     def _ban_peer(self, address: str, reason: str, node_id: Optional[str] = None):
         h, _ = parse_ip_port(address)
-        if h == GENESIS_NODE_HOST or any(h in b for b in self.bootstrap_nodes):
+        if h == GENESIS_NODE_HOST or h in self._bootstrap_ips:
             now_ts = time.time()
             last_log = self._bootstrap_cooldown_log_ts.get(address, 0.0)
             if now_ts - last_log >= 60.0:
@@ -14544,12 +15619,35 @@ class P2PNode:
                 del self.peers[address]
             self.banned_peers[address] = time.time() + 15.0
             return
-        self.banned_peers[address] = time.time() + self.ban_duration
+        # R24 (F3): a ban must actually disconnect the peer
+        # and must not refresh its own 1 h clock on every
+        # offence. Only a NEW ban gets a fresh expiry; a
+        # peer that is already banned keeps its original
+        # expiry, so retrying cannot extend the ban
+        # forever. Mark the peer banned and close its
+        # writer — the peer loop's finally then removes it
+        # from self.peers and frees its per-IP / subnet /
+        # ASN slots.
+        _now = time.time()
+        _already = address in self.banned_peers and _now < self.banned_peers[address]
+        if not _already:
+            self.banned_peers[address] = _now + self.ban_duration
         if node_id:
-            self.banned_node_ids[node_id] = time.time() + self.ban_duration
+            _nid_already = node_id in self.banned_node_ids and _now < self.banned_node_ids[node_id]
+            if not _nid_already:
+                self.banned_node_ids[node_id] = _now + self.ban_duration
+        _peer = self.peers.get(address)
+        if _peer is not None:
+            _peer.banned = True
+            try:
+                if _peer.writer is not None:
+                    _peer.writer.close()
+            except Exception:
+                pass
         if address in self.peers:
             del self.peers[address]
-        logger.warning(f"[P2P] Banned peer {address}{f' (node {node_id[:16]})' if node_id else ''}: {reason}")
+        if not _already:
+            logger.warning(f"[P2P] Banned peer {address}{f' (node {node_id[:16]})' if node_id else ''}: {reason}")
         try:
             exp = self.banned_peers.get(address, time.time() + self.ban_duration)
             asyncio.get_running_loop().create_task(
@@ -14568,6 +15666,18 @@ class P2PNode:
         now = time.time()
         if address and address in self.banned_peers and now < self.banned_peers[address]:
             return True
+        if address:
+            # R24 (F4): a ban is keyed by the peer's IP, not
+            # by the ephemeral source port of one connection,
+            # or an inbound ban (IP:ephemeral) never matches
+            # the dial form (IP:8081) and the node keeps
+            # re-dialling a banned peer. Match by IP.
+            _h, _ = parse_ip_port(address)
+            for _banned_addr, _exp in list(self.banned_peers.items()):
+                if now < _exp:
+                    _bh, _ = parse_ip_port(_banned_addr)
+                    if _bh == _h:
+                        return True
         if node_id and node_id in self.banned_node_ids and now < self.banned_node_ids[node_id]:
             return True
         return False
@@ -14666,11 +15776,9 @@ class P2PNode:
                         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                     except Exception:
                         pass
-                is_bootstrap = (
-                    any(addr == b for b in self.bootstrap_nodes)
-                    or any(h == parse_ip_port(b, P2P_PORT)[0] for b in self.dns_seeds)
-                    or h == self.genesis_node
-                )
+                # R24 (F5): compare the resolved IP, not the
+                # hostname string (a hostname never equals an IP).
+                is_bootstrap = h in self._bootstrap_ips or h == self.genesis_node
                 peer = await asyncio.wait_for(
                     perform_handshake(
                         reader, writer,
@@ -14728,7 +15836,7 @@ class P2PNode:
 
                 peer_ip = h
                 ip_conns = self._conn_per_ip.get(peer_ip, 0)
-                is_bootstrap = any(peer_ip in b for b in self.bootstrap_nodes) or peer_ip == self.genesis_node
+                is_bootstrap = peer_ip in self._bootstrap_ips or peer_ip == self.genesis_node
                 if not is_bootstrap and ip_conns >= self._max_conn_per_ip:
                     logger.info(f"[P2P] Rejecting outbound peer {addr}: per-IP cap ({ip_conns}/{self._max_conn_per_ip})")
                     writer.close()
@@ -14806,6 +15914,287 @@ class P2PNode:
         except Exception:
             logger.debug(msg)
 
+    def _resolve_tunnel_host(self, p2p_cfg) -> str:
+        try:
+            for _src in (p2p_cfg.get('tunnel_host', ''),
+                         (getattr(self.node, 'config', {}) or {}).get('node', {}).get('tunnel_host', ''),
+                         os.environ.get('MCX_TUNNEL_HOST', '')):
+                if _src and str(_src).strip():
+                    return str(_src).strip().lower()
+        except Exception:
+            pass
+        try:
+            with open(os.path.join(os.getcwd(), "munex_tunnel.json"), "r", encoding="utf-8") as _fh:
+                _st = json.load(_fh)
+            if isinstance(_st, dict):
+                for _key in ("hosts", "hostnames"):
+                    _m = _st.get(_key)
+                    if isinstance(_m, dict) and str(_m.get("8080") or "").strip():
+                        return str(_m.get("8080")).strip().lower()
+        except Exception:
+            pass
+        return ""
+
+    async def _ws_dial_allowed(self, host: str):
+        """TUNNEL-P2P-WS SSRF gate for a /p2p hostname. A tunnel hostname
+        is NOT an IP, so the raw-TCP SSRF filter must never see it: the
+        hostname is resolved here and the resolved IPs are judged by the
+        same rule as registry IP endpoints -- public IPs always diallable,
+        private/loopback/link-local only when allow_private_peers is set
+        (local/test nets). Returns (ok, reason). The check is a gate, not
+        a pin: aiohttp resolves again when it connects (same as the TCP
+        path, which resolves and then dials the resolved IP)."""
+        try:
+            ipaddress.ip_address(host)
+            _ips = [host]
+        except ValueError:
+            try:
+                loop = asyncio.get_running_loop()
+                _res = await loop.run_in_executor(None, socket.gethostbyname_ex, host)
+                _ips = list(_res[2]) if isinstance(_res, tuple) else list(_res)
+            except Exception:
+                return False, f"unresolvable host {host}"
+            if not _ips:
+                return False, f"unresolvable host {host}"
+        for _ip in _ips:
+            if _ssrf_ip_blocked(_ip):
+                if self.allow_private_peers and _lan_dialable(_ip):
+                    return True, "private-lan"
+                continue
+            return True, "public"
+        return False, f"no dialable address for {host}"
+
+    def _is_ws_peer_connected(self, ws_url: str) -> bool:
+        for p in list(self.peers.values()):
+            if getattr(p, "transport", "tcp") == "ws" and getattr(p, "p2p_ws", "") == ws_url:
+                return True
+        return False
+
+    async def _register_ws_peer(self, peer: EncryptedPeer, direction: str) -> bool:
+        """Register a handshaked WS peer exactly like a TCP peer: self
+        check, ban check, duplicate handling (DIAL-KEEPER-1), per-IP cap,
+        subnet tracking, max-peers eviction, then GET_STATUS + tip push +
+        _peer_loop. Returns True when the peer is registered. The only
+        transport difference is the address label (tunnel host + WS port)
+        and the per-IP key, which is the hostname, not an IP."""
+        if peer.node_id == self.node.node_id:
+            logger.debug(f"[P2P-WS] Rejecting self-connection via WS {peer.p2p_ws}")
+            self._dial_backoff[peer.p2p_ws] = time.time() + 86400.0
+            return False
+        if self._is_banned(node_id=peer.node_id) or self._is_banned(address=peer.address):
+            logger.info(f"[P2P-WS] Rejecting WS peer {peer.address}: banned")
+            return False
+        async with self._lock:
+            existing = [p for p in self.peers.values() if p.node_id == peer.node_id]
+            if existing:
+                _lb = parse_ip_port(peer.address, P2P_PORT)[0] in ("127.0.0.1", "localhost", "::1")
+                if _dial_dup_action(self.node.node_id, peer.node_id, direction, _lb, True) != 'replace_existing':
+                    logger.debug(f"[P2P-WS] Already connected to node {peer.node_id[:16]}, closing WS duplicate")
+                    return False
+                logger.debug(f"[P2P-WS] DIAL-KEEPER-1 replacing duplicate socket to node {peer.node_id[:16]} with WS keeper")
+                for _old in existing:
+                    try:
+                        if _old.writer is not None:
+                            _old.writer.close()
+                    except Exception:
+                        pass
+                    if self.peers.get(_old.address) is _old:
+                        del self.peers[_old.address]
+            peer_ip = parse_ip_port(peer.address, P2P_PORT)[0]
+            ip_conns = self._conn_per_ip.get(peer_ip, 0)
+            is_bootstrap = peer_ip in self._bootstrap_ips or peer_ip == self.genesis_node
+            if not is_bootstrap and ip_conns >= self._max_conn_per_ip:
+                logger.info(f"[P2P-WS] Rejecting WS peer {peer.address}: per-IP cap ({ip_conns}/{self._max_conn_per_ip})")
+                return False
+            if not self._track_peer_subnet(peer):
+                logger.info(f"[P2P-WS] Rejecting WS peer {peer.address}: subnet diversity cap reached")
+                return False
+            self._conn_per_ip[peer_ip] = ip_conns + 1
+            if len(self.peers) >= self.max_peers:
+                oldest = min(self.peers.values(), key=lambda p: p.last_seen)
+                try:
+                    if oldest.writer is not None:
+                        oldest.writer.close()
+                except Exception as _ev_e:
+                    logger.debug(f"[P2P-WS] evict close failed for {oldest.address}: {_ev_e}")
+                del self.peers[oldest.address]
+            self.peers[peer.address] = peer
+            self._metrics["connections"] += 1
+            self._metrics["peers_discovered"] += 1
+            self._dial_note_result(peer.p2p_ws, True)
+        self._track_task(asyncio.create_task(self._send_message(peer, MSG_GET_STATUS, b'{}')))
+        self.tip_push(peer)
+        self._track_task(asyncio.create_task(self._peer_loop(peer)))
+        return True
+
+    async def _connect_to_peer_ws(self, ws_url: str):
+        """Dial a tunnel peer's /p2p endpoint over WebSocket (aiohttp
+        client -- no new dependency). Same handshake, same registration,
+        same dial backoff as _connect_to_peer; the handshake's node_id
+        check is the backstop for every self-dial the pre-checks miss."""
+        ws_url = str(ws_url or "").strip()
+        if not ws_url:
+            return
+        if "://" not in ws_url:
+            ws_url = "ws://" + ws_url.strip("/") + "/p2p"
+        try:
+            _u = urlparse(ws_url)
+        except Exception:
+            return
+        if _u.scheme not in ("ws", "wss"):
+            logger.info(f"[P2P-WS] Refusing dial {ws_url}: scheme must be ws/wss")
+            return
+        if not _u.hostname:
+            return
+        if self._is_ws_peer_connected(ws_url):
+            return
+        try:
+            if time.time() < float(self._dial_backoff.get(ws_url, 0.0)):
+                return
+        except (TypeError, ValueError, AttributeError):
+            pass
+        _host = _u.hostname
+        _port = _u.port or (443 if _u.scheme == "wss" else 80)
+        # Self-dial pre-check: our own WS listener, by resolved address +
+        # port. A tunnel hostname resolves to Cloudflare IPs, never to us,
+        # so this only fires for a direct/local URL; the handshake node_id
+        # check below catches every other self-dial.
+        _self_hit = False
+        try:
+            _own_ws = int(self.node.config.get('node', {}).get('ws_port', WS_PORT))
+            if _port == _own_ws:
+                _ips = socket.gethostbyname_ex(_host)[2]
+                if set(_ips) & set(self._local_ips):
+                    _self_hit = True
+        except Exception:
+            _self_hit = False
+        if _self_hit:
+            logger.debug(f"[P2P-WS] Skipping {ws_url}: it is this node")
+            self._dial_backoff[ws_url] = time.time() + 86400.0
+            return
+        _ok, _why = await self._ws_dial_allowed(_host)
+        if not _ok:
+            logger.info(f"[P2P-WS] R4-ssrf-filter: refusing dial {ws_url}: {_why}")
+            return
+        logger.info(f"[P2P-WS] Attempting WS connection to {ws_url}")
+        session = None
+        ws = None
+        try:
+            async with self._dial_sem:
+                session = aiohttp.ClientSession()
+                try:
+                    ws = await asyncio.wait_for(
+                        session.ws_connect(ws_url, heartbeat=30, timeout=aiohttp.ClientTimeout(total=10)),
+                        timeout=12.0)
+                except Exception:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
+                    raise
+                reader = _WSByteReader()
+                writer = _WSByteWriter(ws.send_bytes, _ws_client_close(ws, session), (_host, _port))
+                pump_task = self._track_task(asyncio.create_task(_pump_ws_into_reader(ws, reader)))
+                try:
+                    peer = await asyncio.wait_for(
+                        perform_handshake(
+                            reader, writer,
+                            self.node.node_id,
+                            self.node.height,
+                            VERSION,
+                            self.node.priv,
+                            self.node.pub,
+                            allow_genesis_learn=(self.node.height == 0)
+                        ),
+                        timeout=10.0
+                    )
+                except Exception:
+                    peer = None
+                if peer is None:
+                    pump_task.cancel()
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    self._dial_note_result(ws_url, False)
+                    return
+            peer.transport = "ws"
+            peer.p2p_ws = ws_url
+            if not await self._register_ws_peer(peer, 'out'):
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
+            logger.info(f"[P2P-WS] Connected to peer: {peer.address} (node {peer.node_id[:16]}) via WS {ws_url}")
+        except Exception as e:
+            _wait = self._dial_note_result(ws_url, False)
+            self._dial_log_failure(
+                ws_url, f"[P2P-WS] Failed to connect to {ws_url}: {type(e).__name__}: {e} "
+                        f"(retry in {_wait:.0f}s)")
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            if session is not None:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+
+    async def _dial_tunnel_peers(self):
+        """Dial every registry tunnel peer via WS (in addition to the IP
+        endpoints _dial_addrs handles). Backoff and already-connected
+        checks live in _connect_to_peer_ws; this only builds the list."""
+        todo = []
+        seen = set()
+        for tp in list(self._registry_tunnel_peers):
+            if not isinstance(tp, dict):
+                continue
+            url = str(tp.get("p2p_ws") or "")
+            if not url:
+                url = _p2p_ws_from_ws_url(str(tp.get("ws_url") or ""))
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            if self._is_ws_peer_connected(url):
+                continue
+            try:
+                if time.time() < float(self._dial_backoff.get(url, 0.0)):
+                    continue
+            except (TypeError, ValueError, AttributeError):
+                pass
+            todo.append(url)
+        if todo:
+            await asyncio.gather(*[self._connect_to_peer_ws(u) for u in todo], return_exceptions=True)
+
+    async def _maybe_reregister_tunnel(self):
+        """Re-register this node's own tunnel link (with current height)
+        at most once per registry_interval, so the registry's served
+        height stays fresh. No-op when this node has no tunnel host.
+        Lightweight: one blocking POST in an executor per interval."""
+        host = getattr(self, "_tunnel_host", "")
+        if not host:
+            return
+        now = time.time()
+        if now - float(getattr(self, "_tunnel_last_register", 0.0)) < self.registry_interval:
+            return
+        self._tunnel_last_register = now
+        try:
+            loop = asyncio.get_running_loop()
+            ok, status, body = await loop.run_in_executor(
+                None, lambda: tunnel_register_host(host, self.registry_url, height=int(self.node.height)))
+        except Exception as e:
+            logger.debug(f"[TUNNEL] re-register {host} failed: {e}")
+            return
+        if ok:
+            logger.debug(f"[TUNNEL] re-registered {host} height={self.node.height} (status {status})")
+        else:
+            logger.info(f"[TUNNEL] re-register {host} failed (status {status}): {str(body)[:200]}")
+
     def _fetch_registry_peers_sync(self):
         # V11: one blocking HTTPS GET of the registry list, run in an
         # executor so the event loop never stalls. Returns ["host:port"]
@@ -14836,9 +16225,16 @@ class P2PNode:
                 if n.get("tunnel"):
                     host = str(n.get("host") or "").strip().lower()
                     ws_url = str(n.get("ws_url") or "").strip()
+                    p2p_ws = str(n.get("p2p_ws") or "").strip()
+                    if not p2p_ws and ws_url:
+                        p2p_ws = _p2p_ws_from_ws_url(ws_url)
+                    try:
+                        _h = int(n.get("height")) if n.get("height") is not None else None
+                    except (TypeError, ValueError):
+                        _h = None
                     if host:
-                        tunnel_peers.append({"host": host, "ws_url": ws_url})
-                        logger.info(f"[REGISTRY] tunnel peer {host} (WS-only, not P2P-dialled)")
+                        tunnel_peers.append({"host": host, "ws_url": ws_url, "p2p_ws": p2p_ws, "height": _h})
+                        logger.info(f"[REGISTRY] tunnel peer {host} (WS P2P via {p2p_ws or 'ws_url /p2p fallback'})")
                     continue
                 p2p = n.get("p2p") or ""
                 host, port = parse_ip_port(str(p2p), P2P_PORT)
@@ -15007,34 +16403,37 @@ class P2PNode:
         except Exception as e:
             logger.error(f"[DHT] DHT failed: {e}")
 
+    async def _dial_addrs(self, addrs):
+        # R24 (F8): dial a list of candidate peers concurrently
+        # (bounded by _dial_sem inside _connect_to_peer). Serial
+        # dials let a few dead peers stall the whole discovery
+        # cycle for up to 75 s before GET_PEERS is even sent.
+        _todo = []
+        _seen = set()
+        for _a in addrs:
+            if _a and _a not in _seen:
+                _seen.add(_a)
+                if not self._is_peer_connected(_a) and not self._is_banned(address=_a):
+                    _todo.append(_a)
+        if _todo:
+            await asyncio.gather(*[self._connect_to_peer(_a) for _a in _todo], return_exceptions=True)
+
     async def _discovery_loop(self):
         while not self._discovery_stop.is_set():
             registry_peers = await self._fetch_registry_peers()
-            for addr in registry_peers:
-                if not self._is_peer_connected(addr) and not self._is_banned(address=addr):
-                    await self._connect_to_peer(addr)
-                    if len(self.peers) >= self.max_peers:
-                        break
+            await self._dial_addrs(registry_peers)
+            await self._dial_tunnel_peers()
+            await self._maybe_reregister_tunnel()
             dns_peers = await self._resolve_dns_seeds()
-            for addr in dns_peers:
-                if not self._is_peer_connected(addr) and not self._is_banned(address=addr):
-                    await self._connect_to_peer(addr)
-                    if len(self.peers) >= self.max_peers:
-                        break
+            await self._dial_addrs(dns_peers)
 
-            for addr in self.bootstrap_nodes:
-                if not self._is_peer_connected(addr) and not self._is_banned(address=addr):
-                    await self._connect_to_peer(addr)
+            await self._dial_addrs(self.bootstrap_nodes)
 
             cached = load_peers_from_cache()
-            for addr in cached:
-                if not self._is_peer_connected(addr) and not self._is_banned(address=addr):
-                    await self._connect_to_peer(addr)
+            await self._dial_addrs(cached)
 
             if len(self.peers) < 3 and self.fallback_nodes:
-                for addr in self.fallback_nodes:
-                    if not self._is_peer_connected(addr) and not self._is_banned(address=addr):
-                        await self._connect_to_peer(addr)
+                await self._dial_addrs(self.fallback_nodes)
 
             async with self._lock:
                 peers_copy = list(self.peers.values())
@@ -15361,7 +16760,7 @@ class P2PNode:
                     await db.execute_dml(_ins("svf_profiles", ["token_address", "chain_id", "runtime_code_hash", "template_id", "profile_schema_version", "canonical_profile_bytes", "profile_hash", "registrant", "registration_tx_hash", "registration_block_height", "effective_epoch", "status"]), tok, int(reg.get("chain_id", CHAIN_ID)), "", "", SVF_PROFILE_SCHEMA_VERSION, canonical.hex(), phash, "", "", 0, 0, "ACTIVE")
                 await db.execute_dml("DELETE FROM svf_epoch_roots")
                 for epoch_id, e in svfepochs.items():
-                    await db.execute_dml(_ins("svf_epoch_roots", ["epoch_id", "root_hash", "record_count", "complete"]), int(epoch_id), e.get("root_hash", ""), int(e.get("record_count", 0)), 1 if int(e.get("record_count", 0)) == SVF_EPOCH_BLOCKS else 0)
+                    await db.execute_dml(_ins("svf_epoch_roots", ["epoch_id", "root_hash", "record_count", "complete"]), int(epoch_id), e.get("root", ""), int(e.get("count", 0)), 1 if int(e.get("count", 0)) == SVF_EPOCH_BLOCKS else 0)
                 await db.execute_dml("DELETE FROM svf_certificates")
                 for epoch_id, c in svfcerts.items():
                     ep = int(epoch_id)
@@ -15467,7 +16866,15 @@ class P2PNode:
         # R20 apply code unpacked it as (ok, reason) and raised
         # TypeError on every call. The function itself logs
         # the specific failure reason.
-        ok = await self.node.verify_block_proof(tip)
+        _snap_att = {k[8:]: int(v.get("last_size", 5)) for k, v in (snapshot or {}).items() if isinstance(k, str) and k.startswith("mazeatt:") and isinstance(v, dict)}
+        # R31 (F11): pre-warm the mazes the tip verify will need
+        # (cold generation is the 5-minute snapshot cost).
+        _pw0 = time.time()
+        await self.node.consensus._prewarm_mazes(self.node.consensus._maze_keys_for_block(tip))
+        logger.info(f"[Verify] pre-warm snapshot tip block {H}: {time.time() - _pw0:.1f}s")
+        _tv0 = time.time()
+        ok = await self.node.verify_block_proof(tip, _snap_att=_snap_att)
+        logger.info(f"[Sync] tip verify block {H} took {time.time() - _tv0:.1f}s")
         if not ok:
             logger.warning(f"[Sync] Snapshot sync rejected: tip block {H} failed verify_block_proof")
             for bid in added:
@@ -15486,6 +16893,119 @@ class P2PNode:
                 except Exception:
                     pass
             return False
+        # R32: the served snapshot is the producer's SEAL-TIME snapshot,
+        # whose mazeatt row for the tip winner is one block stale
+        # (last_block=H-1: the snapshot is computed before the attestation
+        # upsert for block H). Advance it to the tip's own attestation so
+        # the next forward import's post-apply root matches the
+        # producer's sealed root. Mirrors the _append_block upsert.
+        # Skip genesis block 0 (no attestation) and tips without one.
+        _tip_att = tip.get("maze_attestation") if isinstance(tip, dict) else None
+        if isinstance(_tip_att, dict) and _tip_att.get("maze_id") and _tip_att.get("size") is not None and H > 0:
+            try:
+                await self.node.maze_attestation_repo.upsert({
+                    "maze_id": str(_tip_att["maze_id"]),
+                    "last_size": int(_tip_att["size"]),
+                    "last_block": H,
+                    "last_block_hash": str(tip.get("hash", "")),
+                    "pubkey": str(_tip_att.get("pubkey", "")),
+                })
+            except Exception as _e:
+                logger.warning(f"[Sync] Snapshot tip attestation upsert failed for block {H}: {_e}")
+        # R33: the snapshot's balances already contain the genesis
+        # alloc, but _load_state_snapshot never touches network_state,
+        # so the genesis_alloc_applied marker is absent and the
+        # _load_state() call below would re-credit a second 200 MCX
+        # (400 MCX total). Mark the alloc as applied here, and
+        # recompute total_minted from the loaded state (the snapshot
+        # does not carry it): total_minted = sum(balances) + burned.
+        try:
+            await self.node.network_state_repo.set("genesis_alloc_applied", "1")
+            _tot = 0
+            _brows = await self.node.db.fetch("SELECT bal FROM balances")
+            for _br in _brows or []:
+                try:
+                    _tot += int(_br["bal"])
+                except Exception:
+                    continue
+            _burned = await self.node.network_state_repo.get("burned_total")
+            if _burned:
+                try:
+                    _tot += int(_burned)
+                except Exception:
+                    pass
+            # R33: the snapshot carries no burned_total; write
+            # the key (default 0) so the follower's network_state
+            # matches the producer's instead of diverging (key
+            # absent vs '0').
+            try:
+                _burned_i = int(_burned) if _burned else 0
+            except Exception:
+                _burned_i = 0
+            await self.node.network_state_repo.set("burned_total", str(_burned_i))
+            await self.node.network_state_repo.set("total_minted", str(_tot))
+            self.node.total_minted = _tot
+            logger.info(f"[Sync] Snapshot genesis alloc marked applied; total_minted recomputed to {_tot // SUBS} MCX")
+        except Exception as _e:
+            logger.warning(f"[Sync] Snapshot genesis marker/total_minted recompute failed: {_e}")
+        # R33: rebuild the SVF evidence for the in-progress epoch
+        # from the stored last-100 history blocks. The snapshot
+        # carries no evidence, so a snapshot-synced follower can
+        # never complete the epoch root at the boundary (block 200,
+        # 300, ...). The history covers the whole in-progress epoch
+        # (epoch length 100 == SNAPSHOT_WINDOW 100). Persist to the
+        # svf_evidence table; _load_state() below restores it into
+        # svf_evidence_store. Records are recomputed from
+        # already-verified blocks (no new trust); blocks without
+        # valid evidence (genesis block 0) are skipped, mirroring
+        # _append_block. Best-effort: a failure here must never fail
+        # the snapshot sync itself.
+        try:
+            _ev_n = 0
+            _ev_skip = 0
+            _ev_start = max(1, H - SNAPSHOT_WINDOW + 1)
+            for _hid in range(_ev_start, H + 1):
+                _hb = await self.node.block_repo.get_by_id(_hid)
+                if not isinstance(_hb, dict):
+                    continue
+                try:
+                    _ev = compute_block_evidence(_hb, _hid)
+                except SVFReject:
+                    _ev_skip += 1
+                    continue
+                except Exception as _ee:
+                    logger.warning(f"[Sync] Snapshot SVF evidence rebuild: block {_hid} extraction failed: {_ee}")
+                    continue
+                _ev_epoch = _hid // SVF_EPOCH_BLOCKS
+                _ev_rec = {
+                    "epoch_id": _ev_epoch,
+                    "height": _ev.block_id,
+                    "block_hash": _ev.block_hash,
+                    "winner_pubkey": _ev.winner_pubkey,
+                    "attested_size": _ev.attested_size,
+                    "attestation_weight": str(_ev.attestation_weight),
+                    "growth_present": 1 if _ev.growth_present else 0,
+                    "record_hash": _ev.record_hash.hex(),
+                }
+                try:
+                    if self.node.db.db_type == "sqlite":
+                        await self.node.db.execute_dml(
+                            "INSERT OR REPLACE INTO svf_evidence (epoch_id, height, block_hash, winner_pubkey, attested_size, attestation_weight, growth_present, record_hash) VALUES (?,?,?,?,?,?,?,?)",
+                            _ev_rec["epoch_id"], _ev_rec["height"], _ev_rec["block_hash"], _ev_rec["winner_pubkey"],
+                            _ev_rec["attested_size"], _ev_rec["attestation_weight"], _ev_rec["growth_present"],
+                            _ev_rec["record_hash"])
+                    else:
+                        await self.node.db.execute_dml(
+                            "INSERT INTO svf_evidence (epoch_id, height, block_hash, winner_pubkey, attested_size, attestation_weight, growth_present, record_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (epoch_id, height) DO UPDATE SET block_hash=$3, winner_pubkey=$4, attested_size=$5, attestation_weight=$6, growth_present=$7, record_hash=$8",
+                            _ev_rec["epoch_id"], _ev_rec["height"], _ev_rec["block_hash"], _ev_rec["winner_pubkey"],
+                            _ev_rec["attested_size"], _ev_rec["attestation_weight"], _ev_rec["growth_present"],
+                            _ev_rec["record_hash"])
+                    _ev_n += 1
+                except Exception as _ee:
+                    logger.warning(f"[Sync] Snapshot SVF evidence rebuild: persist failed for block {_hid}: {_ee}")
+            logger.info(f"[Sync] Snapshot SVF evidence rebuilt: {_ev_n} records persisted, {_ev_skip} skipped (no evidence)")
+        except Exception as _e:
+            logger.warning(f"[Sync] Snapshot SVF evidence rebuild failed: {_e}")
         await self.node._load_state()
         logger.info(f"[Sync] Snapshot sync complete: height={self.node.height} (tip block {H}), state root verified, last {SNAPSHOT_WINDOW} blocks present. This node is PRUNED (no full history).")
         return True
@@ -15525,7 +17045,12 @@ class P2PNode:
         self._snapshot_sync_running = True
         try:
             self._snapshot_last_attempt = now
-            ordered = sorted(peer_list, key=lambda p: -p.height)
+            # R30: re-apply the alive filter here (callers pass an
+            # alive-filtered list, but the first attempt must go to
+            # a live peer even if the list was built earlier) and
+            # break height ties by lowest address, so the choice is
+            # deterministic instead of list order.
+            ordered = sorted(self._alive_peers(peer_list), key=lambda p: (-p.height, p.address))
             seen = set()
             for peer in ordered:
                 if peer.address in seen:
@@ -15538,9 +17063,12 @@ class P2PNode:
                     continue
                 reason = await self._verify_snapshot_response(resp, peer_list)
                 if reason is not None:
+                    # R24 (F7): one peer answering with a bad
+                    # snapshot must not veto the whole round —
+                    # try the next peer instead of giving up.
                     self._snapshot_consec_failures += 1
-                    logger.warning(f"[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — will retry snapshot sync next cycle")
-                    return False
+                    logger.warning(f"[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — trying next peer")
+                    continue
                 if await self._apply_snapshot_response(resp, peer):
                     self._snapshot_consec_failures = 0
                     return True
@@ -15596,6 +17124,16 @@ class P2PNode:
         logger.warning(f"[Sync] No majority agreement on latest checkpoint among {len(responses)} peers — falling back to single-peer sync.")
         return None
 
+    def _r37_import_in_flight(self):
+        """R37 (F5): True while an import/verify holds the node's
+        _import_lock (import_blocks / receive_block verify+append
+        run under it, R35 N3 / R31 F10). The sync loop uses this
+        to tell work from staleness: no height progress while the
+        lock is held is an import still verifying, not a stuck
+        sync. False when the lock is free or absent."""
+        _lock = getattr(self.node, "_import_lock", None)
+        return _lock is not None and _lock.locked()
+
     async def _sync_loop(self):
         while not self._discovery_stop.is_set():
             await asyncio.sleep(SYNC_INTERVAL)
@@ -15623,11 +17161,10 @@ class P2PNode:
                 self._snapshot_consec_failures = 0
             logger.info(f"[P2P] Syncing from {best_peer.address}: local={self.node.height}, remote={best_height}")
 
-            if gap > CHECKPOINT_SYNC_THRESHOLD:
-                sample_peers = sorted(peer_list, key=lambda p: -p.height)[:5]
-                checkpoint = await self._request_checkpoints(sample_peers)
-                if checkpoint:
-                    logger.info(f"[Sync] Quorum-agreed checkpoint at block {checkpoint['block_id']} — anchoring catch-up sync on it")
+            # R24 (F14): the checkpoint round-trip was fetched
+            # and then discarded (only logged) — it added 5 s
+            # to every far-behind sync cycle for no effect.
+            # Removed.
 
             # R22: snapshot sync ONLY when far behind or at
             # height 0 — the node only ever needs the state
@@ -15652,28 +17189,95 @@ class P2PNode:
                 payload = json.dumps({"start": start, "end": end}).encode()
                 await self._send_message(best_peer, MSG_GET_BLOCKS, payload)
 
+                # R37 (F5): sync-loop patience accounts for in-flight
+                # verify work. The 8 s wait below used to count wall
+                # time even while an import held _import_lock verifying
+                # a cold growth block, so a size-25 maze (37.3 s solo,
+                # run 6: F4 fired at 09:42:49, snapshot requested at
+                # 09:43:23, 39.1 s after the stall began) lost the race
+                # to the snapshot although the import was healthy work.
+                # Lock-held time is now deferred, not counted: waited
+                # advances only while no import holds the lock, and the
+                # deferral is capped (see _R37_SYNC_IMPORT_DEFER_CAP_S)
+                # so a genuinely stuck verify still snapshots.
+                _r37_deferred = 0.0
+                _r37_defer_logged = False
                 waited = 0.0
-                while self.node.height <= start and waited < 8.0:
+                while self.node.height <= start and waited < 8.0 and _r37_deferred < _R37_SYNC_IMPORT_DEFER_CAP_S:
+                    _r37_t0 = time.monotonic()
                     await asyncio.sleep(0.25)
-                    waited += 0.25
+                    _r37_dt = time.monotonic() - _r37_t0
+                    if self._r37_import_in_flight():
+                        _r37_deferred += _r37_dt
+                        if not _r37_defer_logged:
+                            _r37_defer_logged = True
+                            logger.info(f"[R37] sync patience: import in flight for [{start},{end}) (holder={getattr(self.node, '_import_lock_holder', None)}) - lock-held time does not count toward the snapshot budget (cap {_R37_SYNC_IMPORT_DEFER_CAP_S:.0f}s)")
+                    else:
+                        waited += 0.25
+                if _r37_deferred >= _R37_SYNC_IMPORT_DEFER_CAP_S:
+                    logger.warning(f"[R37] sync patience: import in flight for [{start},{end}) held the lock {_r37_deferred:.0f}s (cap reached) - treating the stall as genuine, snapshot fallback proceeds")
                 if self.node.height <= start and not rewound_this_stall:
                     # never finds a common parent. One bounded rewind re-fetches
                     rewound_this_stall = True
                     rewind_start = max(0, start - 100)
+                    # R35 (N4): paginate the rewind in
+                    # SYNC_BATCH_BLOCKS chunks. The old code sent one
+                    # [rewind_start, end) request, but the server caps
+                    # batches at SYNC_BATCH_BLOCKS (50), so only the
+                    # already-present first 50 blocks came back, height
+                    # could never advance, and the loop burned the full
+                    # 30 s wait. Fetch [rewind_start, +49], then the
+                    # next chunk, etc., stopping as soon as height
+                    # advances past start (fork point found) or the
+                    # 30 s budget is spent.
                     logger.info(
                         f"[Sync] No progress on [{start},{end}); rewinding fetch to "
-                        f"[{rewind_start},{end}) to locate fork point"
+                        f"[{rewind_start},{end}) in SYNC_BATCH_BLOCKS chunks to locate fork point"
                     )
-                    payload = json.dumps({"start": rewind_start, "end": end}).encode()
-                    await self._send_message(best_peer, MSG_GET_BLOCKS, payload)
-                    waited = 0.0
-                    while self.node.height <= start and waited < 30.0:
-                        await asyncio.sleep(0.25)
-                        waited += 0.25
+                    _rw = rewind_start
+                    _rw_waited = 0.0
+                    # R37 (F5): the 30 s rewind budget is lock-free time
+                    # only (same rule as the 8 s wait above): while an
+                    # import holds _import_lock, _cw and _rw_waited do
+                    # not advance and the deferral accrues instead, up
+                    # to the same cap. A stuck verify therefore still
+                    # exhausts the budget and snapshots; a verifying
+                    # growth block does not.
+                    while _rw <= end and self.node.height <= start and _rw_waited < 30.0 and _r37_deferred < _R37_SYNC_IMPORT_DEFER_CAP_S:
+                        _chunk_end = min(end, _rw + SYNC_BATCH_BLOCKS - 1)
+                        payload = json.dumps({"start": _rw, "end": _chunk_end}).encode()
+                        await self._send_message(best_peer, MSG_GET_BLOCKS, payload)
+                        _cw = 0.0
+                        while self.node.height <= start and _cw < 8.0 and _rw_waited < 30.0 and _r37_deferred < _R37_SYNC_IMPORT_DEFER_CAP_S:
+                            _r37_t0 = time.monotonic()
+                            await asyncio.sleep(0.25)
+                            _r37_dt = time.monotonic() - _r37_t0
+                            if self._r37_import_in_flight():
+                                _r37_deferred += _r37_dt
+                                if not _r37_defer_logged:
+                                    _r37_defer_logged = True
+                                    logger.info(f"[R37] sync patience: import in flight for [{start},{end}) (holder={getattr(self.node, '_import_lock_holder', None)}) - lock-held time does not count toward the snapshot budget (cap {_R37_SYNC_IMPORT_DEFER_CAP_S:.0f}s)")
+                            else:
+                                _cw += 0.25
+                                _rw_waited += 0.25
+                        _rw = _chunk_end + 1
                 if self.node.height <= start:
                     # R20: a node stuck below a rejected/corrupt
                     # block can jump past it with a snapshot sync
                     # (cooldown-guarded inside _try_snapshot_sync).
+                    # R37 (F5): except when an import/verify started
+                    # (or resumed) after the rewind budget was spent -
+                    # the lock was free while the budget ran out, then
+                    # an import took it. Snapshotting here would kill
+                    # healthy verify work that only just began, so skip
+                    # the snapshot this cycle (break to the next sync
+                    # cycle, with no stuck-cycle increment) and let the
+                    # capped deferral above judge it next round. The
+                    # guard only fires while the deferral is below its
+                    # cap; past the cap the snapshot proceeds.
+                    if self._r37_import_in_flight() and _r37_deferred < _R37_SYNC_IMPORT_DEFER_CAP_S:
+                        logger.info(f"[R37] sync patience: import in flight for [{start},{end}) (holder={getattr(self.node, '_import_lock_holder', None)}) after rewind - deferring snapshot to next sync cycle")
+                        break
                     if await self._try_snapshot_sync(best_peer, peer_list):
                         self._stuck_cycles = 0
                         self._stuck_peer = None
@@ -15688,6 +17292,12 @@ class P2PNode:
                     self._stuck_cycles = getattr(self, "_stuck_cycles", 0) + 1
                     self._stuck_peer = best_peer.address
                     if self._stuck_cycles >= 3:
+                        # R24 (F7): reset the counter when the
+                        # trip fires, or the next stuck cycle
+                        # re-trips immediately and production
+                        # pauses in back-to-back 300 s
+                        # increments forever.
+                        self._stuck_cycles = 0
                         self._sync_paused_until = time.time() + SYNC_STUCK_TRIP_COOLDOWN
                         self.node._producing_enabled = False
                         logger.error(
@@ -15848,7 +17458,6 @@ class MicroCoreNode:
         # are pruned when the key is logged (reset to 0).
         self._ws_rate_limit_log: Dict[str, list] = {}
         self.subnet_rate_limiter = RateLimiter(max_requests=300, window_seconds=60)
-        self.register_rate_limiter = RateLimiter(max_requests=6, window_seconds=60)
         self.rpc_rate_limiter = RateLimiter(max_requests=30, window_seconds=60)
         self.miner_rate_limiters: Dict[str, RateLimiter] = {}
         self.health_checker = HealthChecker()
@@ -15857,6 +17466,14 @@ class MicroCoreNode:
         self.mempool = Mempool()
         self.memory_mgr = MemoryChallengeManager()
         self.blockexecutionlock = asyncio.Lock()
+        # R31 (F10): single-flight import lock. import_blocks /
+        # receive_block verify+append run under this lock so
+        # concurrent deliveries of the same block collapse into
+        # one verify. Non-block messages never wait on it.
+        self._import_lock = asyncio.Lock()
+        # R35 (N3): which import is holding _import_lock, for the
+        # >2 s wait warning (see _acquire_import_lock). None when free.
+        self._import_lock_holder = None
         self.ws_sessions = {}
 
         self.vm_manager = None
@@ -16098,6 +17715,18 @@ class MicroCoreNode:
                         continue
                 logger.debug(f"[SVF] restored {len(self.svf_certificates)} certificates from DB")
 
+                # R33: reset the evidence store before restoring
+                # from the DB. _load_state() runs twice after a
+                # snapshot sync (once in _apply_snapshot_response,
+                # once in the join flow), and the restore below
+                # APPENDS; without this reset the store holds
+                # duplicate records, so _svf_epoch_root_if_complete
+                # (which requires EXACTLY 100 valid records) never
+                # fires at the epoch boundary and block 200 fails
+                # the state-root check. The DB holds everything
+                # the store had (seal/import persist every record),
+                # so re-reading from scratch loses nothing.
+                self.svf_evidence_store = {}
                 tip_h = int(self.height or 0)
                 earliest_epoch = max(0, (tip_h - PRUNE_BLOCKS) // SVF_EPOCH_BLOCKS)
                 if self.db.db_type == "sqlite":
@@ -16143,6 +17772,153 @@ class MicroCoreNode:
                         logger.debug(f"[Sync] Restored seal-time snapshot for tip block {_tip_id} from state_snapshots")
         except Exception as _ss_e:
             logger.debug(f"[Sync] seal-time snapshot restore failed: {_ss_e}")
+        # R34 (Fix 2a): catch-up replay for a forward-only follower.
+        # _load_state just advanced height from stored blocks; if the
+        # state behind them was never applied (genesis-only state),
+        # the next live import fails its sealed state-root check (R33
+        # peer C: 28 AuxStateError on block 157). Replay the stored
+        # history through the normal apply path so the live tip
+        # imports onto a correct base. Best-effort: a replay that
+        # stops early fails closed and the node waits for a snapshot
+        # (the working fallback); _load_state itself never fails.
+        try:
+            await self._replay_stored_forward_history()
+        except Exception as _r34_e:
+            logger.warning(f"[R34] catch-up replay failed: {_r34_e}")
+
+
+
+    async def _replay_stored_forward_history(self) -> bool:
+        """R34 (Fix 2a): catch-up replay for a forward-only follower.
+
+        A fresh node that stored blocks (snapshot-history fetch)
+        without ever applying their state has height advanced by
+        _load_state but genesis-only balances/mazes: the next live
+        import then fails its sealed state-root check (R33 peer C:
+        28 AuxStateError on block 157, tip stuck at 156). Replay the
+        stored blocks in id order through _append_block, which
+        applies each block and verifies its sealed state_root as it
+        goes, failing closed per block. Only blocks already stored
+        are replayed, each re-verified here by hash and by its phash
+        link to its predecessor; the replay covers the contiguous
+        stored run starting at block 1 and stops at the first gap
+        or the first mismatch (a node whose stored range starts
+        above block 1 still needs a snapshot — the working
+        fallback — because no stored prefix can rebuild the state
+        those blocks commit to). _append_block is reused unchanged:
+        the stored row is deleted just before the call (its create
+        is a plain insert) and restored from the held dict if the
+        call fails, so a failed replay leaves the stored history
+        intact. The replay never fetches blocks and never weakens,
+        skips or reorders a check; it runs inside _load_state, so
+        it also runs for in-process verify nodes, where the same
+        detection decides. Returns True when nothing needed
+        replaying or the replay completed, False when it stopped
+        early (state is then correct through the last replayed
+        block, and the node waits for a snapshot for the rest).
+        """
+        _tip = await self.block_repo.get_latest()
+        if _tip is None:
+            return True
+        _tip_id = int(_tip["id"])
+        if _tip_id <= 0:
+            return True
+        # Detect genesis-only state: no maze rows and no miner rows.
+        # Every sealed block >= 1 carries a non-empty maze_state, so
+        # any applied state leaves maze rows behind; a snapshot load
+        # leaves them too. A node that only stored blocks has none.
+        try:
+            _maze_n = await self.db.fetchrow("SELECT COUNT(*) AS n FROM minermazes")
+            _miner_n = await self.db.fetchrow("SELECT COUNT(*) AS n FROM miners")
+        except Exception as _e:
+            logger.warning(f"[R34] replay: state check failed ({_e}) — skipping replay")
+            return False
+        _n_maze = 0
+        _n_miner = 0
+        try:
+            _n_maze = int((_maze_n or {}).get("n", 0) or 0)
+            _n_miner = int((_miner_n or {}).get("n", 0) or 0)
+        except Exception:
+            pass
+        if _n_maze > 0 or _n_miner > 0:
+            return True
+        # The stored run must start at block 1: without the prefix
+        # no stored block's sealed root can match (its state commits
+        # to every earlier block).
+        _first = await self.block_repo.get_by_id(1)
+        if _first is None:
+            logger.info("[R34] replay: stored history starts above block 1 — no replay possible, waiting for a snapshot")
+            return False
+        # Anchor the phash chain: the stored genesis block, else the
+        # genesis file's hash, else the learned genesis hash.
+        _prev_hash = ""
+        _g0 = await self.block_repo.get_by_id(0)
+        if _g0 is not None:
+            _prev_hash = str(_g0.get("hash", "") or "")
+        if not _prev_hash:
+            try:
+                _gd = load_genesis_file()
+                if _gd:
+                    _prev_hash = str(_gd.get("hash", "") or "")
+            except Exception:
+                _prev_hash = ""
+        if not _prev_hash:
+            _prev_hash = str(getattr(self, "genesis_hash", "") or "")
+        if not _prev_hash:
+            logger.info("[R34] replay: no genesis hash available — skipping the block-1 phash anchor check (hash + state-root checks still apply)")
+        _del_q = "DELETE FROM blocks WHERE id = ?" if self.db.db_type == "sqlite" else "DELETE FROM blocks WHERE id = $1"
+        _replayed = 0
+        _bid = 1
+        _ok = True
+        while _bid <= _tip_id:
+            _blk = await self.block_repo.get_by_id(_bid)
+            if _blk is None:
+                logger.info(f"[R34] replay: stored history ends at block {_bid - 1} (gap) — replayed {_replayed} block(s), waiting for a snapshot for the rest")
+                _ok = False
+                break
+            _verified = True
+            try:
+                if str(_blk.get("hash", "") or "") != calculate_block_hash(_blk):
+                    raise AuxStateError(f"replay: stored block {_bid} hash mismatch")
+                if _prev_hash and str(_blk.get("phash", "") or "") != _prev_hash:
+                    raise AuxStateError(f"replay: stored block {_bid} phash does not link to block {_bid - 1}")
+            except Exception as _ve:
+                logger.warning(f"[R34] replay: stored block {_bid} failed hash/link verification ({_ve}) — stopping replay")
+                _verified = False
+            if not _verified:
+                _ok = False
+                break
+            _prev_hash = str(_blk.get("hash", "") or "")
+            try:
+                await self.db.execute_dml(_del_q, _bid)
+                await self._append_block(_blk)
+            except Exception as _ae:
+                try:
+                    await self.block_repo.create(_blk)
+                except Exception as _re:
+                    logger.warning(f"[R34] replay: could not restore stored block {_bid} after failed append ({_re})")
+                logger.warning(f"[R34] replay: block {_bid} failed to apply ({_ae}) — stopping replay, state correct through block {_bid - 1}")
+                _ok = False
+                break
+            _replayed += 1
+            _bid += 1
+        # Refresh the tick cache from the DB for the current height
+        # window (the replay rebuilt it in id order; a partial replay
+        # leaves height at the last replayed block + 1).
+        try:
+            _ls = self.height - BLOCK_CACHE_MAX
+            if _ls < 0:
+                _ls = 0
+            self.blocks = await self.block_repo.get_range(_ls, self.height - 1, limit=BLOCK_CACHE_MAX)
+        except Exception:
+            pass
+        if _ok:
+            logger.info(f"[R34] replay: replayed {_replayed} stored block(s), height={self.height}")
+            return True
+        if _replayed > 0:
+            logger.info(f"[R34] replay: replayed {_replayed} stored block(s), height={self.height}")
+        return False
+
 
     async def _live_mazes(self) -> list:
         """Interpretation A: 'live' = MinerMazeRepo.get_eligible chain state,
@@ -16275,6 +18051,58 @@ class MicroCoreNode:
                 if _sz is not None:
                     return _sz
         return None
+
+
+    async def _resolve_actual_maze_size(self, att_mid, block, _proven_base=None, _snap_att=None, _reorg_mode=False, _fallback_to_min=True):
+        """R29: resolve the ACTUAL size of a maze from sealed/proven state.
+
+        First available wins:
+          1. this block's last maze_update for the maze;
+          2. the proven-update walk (_proven_update_size; in reorg mode
+             the branch-scoped _proven_base ONLY, never the DB walk);
+          3. the snapshot attestation map (_snap_att, mazeatt: entries).
+        R29: the local minermazes row is NOT consulted -- it reflects
+        unsealed local shrinks/growths and diverges from sealed state,
+        so it let the strict check compare against a size no sealed
+        block proves. A maze with no sealed provenance at all still
+        resolves via the floor below (attestation check) or None
+        (candidate loop).
+        With _fallback_to_min (the attestation check) a maze with no
+        provenance at all resolves to MIN_MAZE_SIZE (a brand-new maze).
+        Without it (the lottery-candidate loop) an unresolvable maze
+        returns None and the caller skips it.
+        """
+        _mid = str(att_mid or "")
+        if not _mid:
+            return MIN_MAZE_SIZE if _fallback_to_min else None
+        _lu = _last_updates_by_maze(block.get("maze_updates", []) or [])
+        _lu_e = _lu.get(_mid) or _lu.get(_mid.lower())
+        if isinstance(_lu_e, dict):
+            _sz = _valid_maze_size(_lu_e.get("new_size"))
+            if _sz is not None:
+                return int(_sz)
+        # 2. Proven-update history. In reorg mode the branch-scoped
+        # _proven_base ONLY -- the DB walk must never run there (it
+        # could prove from an orphaned branch). In normal mode the
+        # DB walk (_proven_base=None).
+        if _reorg_mode and not isinstance(_proven_base, dict):
+            _psz = None
+        else:
+            try:
+                _psz = await self._proven_update_size(_mid, int(block.get("id", 0)), _proven_base if _reorg_mode else None)
+            except Exception:
+                _psz = None
+        _sz = _valid_maze_size(_psz)
+        if _sz is not None:
+            return int(_sz)
+        if isinstance(_snap_att, dict):
+            _sv = _snap_att.get(_mid)
+            if _sv is None:
+                _sv = _snap_att.get(_mid.lower())
+            _sz = _valid_maze_size(_sv)
+            if _sz is not None:
+                return int(_sz)
+        return MIN_MAZE_SIZE if _fallback_to_min else None
 
 
     async def execute_transaction(self, tx_data: Dict, block_id: int, block_ts: float = None) -> Tuple[bool, Dict]:
@@ -17615,7 +19443,7 @@ class MicroCoreNode:
 
         return True
 
-    async def verify_block_proof(self, block: dict, _att_base: dict = None, _maze_base: dict = None, _branch=None, _proven_base: dict = None) -> bool:
+    async def verify_block_proof(self, block: dict, _att_base: dict = None, _maze_base: dict = None, _branch=None, _proven_base: dict = None, _snap_att: dict = None) -> bool:
         """Verify PoSW block proof – replay maze_updates, verify lottery, validate signature,
         re-execute transactions, and check timestamp.
         R9-branch-replay (I-R8-09): _branch is an optional shared context
@@ -17711,18 +19539,15 @@ class MicroCoreNode:
             if _pb >= block.get('id', 0):
                 logger.warning(f"[Verify] Block {block['id']} growth cap unverifiable (local attestation at {_pb} on competing chain) — rejected (ATTEST-CAP-STRICT)")
                 return False
-            else:
-                _cap = int(_prior_att.get("last_size", MIN_MAZE_SIZE)) + ATTEST_GROWTH_PER_BLOCK * (int(block.get('id', 0)) - _pb)
-                if att_size > _cap:
-                    logger.warning(f"[Verify] Block {block['id']} attestation growth cap exceeded: {att_size} > {_cap} (IDEA5-ATTEST)")
-                    return False
-        else:
-            _cap = MIN_MAZE_SIZE + ATTEST_FRESH_BUFFER
-            if att_size > _cap:
-                logger.warning(f"[Verify] Block {block['id']} first attestation exceeds cap: {att_size} > {_cap} (ATTEST-FRESH-BUFFER-1)")
-                return False
         if att_size < MIN_MAZE_SIZE:
             logger.warning(f"[Verify] Block {block['id']} attestation size {att_size} below floor (must be >= {MIN_MAZE_SIZE})")
+            return False
+        # R28-STRICT-SIZE: the attested size must EQUAL the actual maze size.
+        # No cap -- a cap only limits how much can be lied about; equality
+        # against the actual state makes lying impossible.
+        _actual_size = await self._resolve_actual_maze_size(att_mid, block, _proven_base=_proven_base, _snap_att=_snap_att, _reorg_mode=_reorg_mode)
+        if _actual_size is None or att_size != int(_actual_size):
+            logger.warning(f"[Verify] Block {block['id']} attested size {att_size} != actual maze size {_actual_size} for {att_mid[:16]} (R28-STRICT-SIZE)")
             return False
         # LOTTERY-DRAW-VERIFY-1 (Option B): the block seals the draw
         # inputs (candidates + rank + winner_index). Recompute the
@@ -17797,41 +19622,22 @@ class MicroCoreNode:
                 if str(_lr.get("maze_id", "")).lower() == att_mid.lower():
                     _ld_cand_size = int(_lr.get("size", 0))
                     break
-            if _ld_cand_size is None or att_size > _ld_cand_size:
+            if _ld_cand_size is None or att_size != _ld_cand_size:
                 logger.warning(f"[Verify] Block {block['id']} attested size {att_size} inconsistent with lottery candidate - rejecting")
                 return False
             if _ld_widx != _ld_rank and not _ld.get("takeover"):
                 logger.warning(f"[Verify] Block {block['id']} lottery winner_index != rank without takeover flag - rejecting")
                 return False
-        # B1 (mainnet audit): growth beyond the fresh-claim cap must be
-        # prior attestation of the same size (maze_attestations, never
-        # Validity NEVER reads pruned block history, so pruning can never
-        if att_size > MIN_MAZE_SIZE + ATTEST_FRESH_BUFFER:
-            _here = False
-            for _u in list(block.get("maze_updates") or []) + list(block.get("attestation_proof") or []):
-                if not isinstance(_u, dict):
-                    continue
-                _um = str(_u.get("maze_id") or _u.get("miner_id") or "")
-                if _um == att_mid and _valid_maze_size(_u.get("new_size")) == att_size:
-                    _here = True
-                    break
-            if not _here:
-                if isinstance(_proven_base, dict):
-                    # never from pruned history)
-                    _pb_sz = _proven_base.get(att_mid)
-                    if _pb_sz is not None and att_size <= int(_pb_sz):
-                        _here = True
-                elif not _reorg_mode:
-                    # (maze_attestations is never pruned)
-                    try:
-                        _pa = await self.maze_attestation_repo.get(att_mid)
-                    except Exception:
-                        _pa = None
-                    if _pa is not None and int(_pa.get("last_size", 0) or 0) >= att_size:
-                        _here = True
-            if not _here:
-                logger.warning(f"[Verify] Block {block['id']} attestation size {att_size} not backed by a proven catch")
-                return False
+            # R28-STRICT-SIZE: every lottery candidate size must equal
+            # its actual maze size when resolvable; an unresolvable
+            # candidate is skipped, not rejected.
+            for _clw, _cl in _ld_pos:
+                _cl_mid = str(_cl.get("maze_id", "") or "")
+                _cl_sz = int(_cl.get("size", 0))
+                _cl_actual = await self._resolve_actual_maze_size(_cl_mid, block, _proven_base=_proven_base, _snap_att=_snap_att, _reorg_mode=_reorg_mode, _fallback_to_min=False)
+                if _cl_actual is not None and _cl_sz != int(_cl_actual):
+                    logger.warning(f"[Verify] Block {block['id']} lottery candidate {_cl_mid[:16]} size {_cl_sz} != actual {_cl_actual} (R28-STRICT-SIZE)")
+                    return False
         # is not consensus state (chain-agreed sizes govern lottery/weight).
         try:
             _gsf = float(block.get("global_shrink_factor", 1.0))
@@ -17894,11 +19700,10 @@ class MicroCoreNode:
             new_size = _new_size
             if seed and new_size > 0:
                 try:
-                    loop = asyncio.get_event_loop()
-                    test_maze = await loop.run_in_executor(
-                        self.consensus._move_executor,
-                        self.consensus._generate_deterministic_maze,
-                        seed, new_size, new_density, new_turbulence, self.height)
+                    # R37 (F3): pool single-flight (see _ensure_maze_cached)
+                    # - verify no longer generates in-process first.
+                    test_maze = await self.consensus._ensure_maze_cached(
+                        seed, new_size, new_density, new_turbulence)
                     expected_root = self.consensus._calculate_maze_root(test_maze)
                     claimed_root = update.get("mazeroot", "")
                     if claimed_root and expected_root != claimed_root:
@@ -17945,11 +19750,9 @@ class MicroCoreNode:
                     return False
 
                 try:
-                    loop = asyncio.get_event_loop()
-                    parent_maze = await loop.run_in_executor(
-                        self.consensus._move_executor,
-                        self.consensus._generate_deterministic_maze,
-                        parent_seed, parent_size, parent_density, parent_turbulence, self.height)
+                    # R37 (F3): pool single-flight (see _ensure_maze_cached).
+                    parent_maze = await self.consensus._ensure_maze_cached(
+                        parent_seed, parent_size, parent_density, parent_turbulence)
                     actual_parent_root = self.consensus._calculate_maze_root(parent_maze)
                     if parent_mazeroot and actual_parent_root != parent_mazeroot:
                         logger.warning(f"[Verify] Block {block['id']} parent maze root mismatch for {mid[:16]}")
@@ -18001,11 +19804,9 @@ class MicroCoreNode:
             _pturb = _pe.get("turbulenceppm", 0)
             if _pseed and _psz > 0:
                 try:
-                    _ploop = asyncio.get_event_loop()
-                    _ptest = await _ploop.run_in_executor(
-                        self.consensus._move_executor,
-                        self.consensus._generate_deterministic_maze,
-                        _pseed, _psz, _pdens, _pturb, self.height)
+                    # R37 (F3): pool single-flight (see _ensure_maze_cached).
+                    _ptest = await self.consensus._ensure_maze_cached(
+                        _pseed, _psz, _pdens, _pturb)
                     _pexp = self.consensus._calculate_maze_root(_ptest)
                     _pclaim = _pe.get("mazeroot", "")
                     if _pclaim and _pexp != _pclaim:
@@ -18037,11 +19838,9 @@ class MicroCoreNode:
                     logger.warning(f"[Verify] Block {block['id']} attestation_proof size jump {_ppsz_v} -> {_psz} != +1 — rejected")
                     return False
                 try:
-                    _ploop2 = asyncio.get_event_loop()
-                    _pparent = await _ploop2.run_in_executor(
-                        self.consensus._move_executor,
-                        self.consensus._generate_deterministic_maze,
-                        _pps, _ppsz_v, _ppd, _ppt, self.height)
+                    # R37 (F3): pool single-flight (see _ensure_maze_cached).
+                    _pparent = await self.consensus._ensure_maze_cached(
+                        _pps, _ppsz_v, _ppd, _ppt)
                     _pactual = self.consensus._calculate_maze_root(_pparent)
                     if _ppm and _pactual != _ppm:
                         logger.warning(f"[Verify] Block {block['id']} attestation_proof parent maze root mismatch — rejected")
@@ -18370,6 +20169,11 @@ class MicroCoreNode:
                 if not verify_signature(pub_key, message, signature):
                     logger.warning(f"[MINER] Re-registration signature invalid for {miner_id[:16]}")
                     return False
+                # R24: a re-registering miner may rotate to a
+                # new maze key; store it so the seal verify
+                # compares against the new key, not a stale one.
+                if block_signing_pub:
+                    existing['block_signing_pub'] = block_signing_pub
             now = time.time()
             if existing.get('banned_until', 0) > now:
                 logger.info(f"[MINER] Re-registration rejected for {miner_id[:16]}: still banned for {existing['banned_until'] - now:.0f}s")
@@ -18387,11 +20191,17 @@ class MicroCoreNode:
         if not verify_signature(pub_key, message, signature):
             logger.warning(f"[MINER] First-time registration signature invalid for {miner_id[:16]}")
             return False
+        # R24: the miner id derives from the MAZE key
+        # (block_signing_pub), not the identity key — that
+        # is the key the attestation and the winner
+        # derivation use. In single-key mode the two are
+        # the same, so first miners are unaffected.
+        _signing_pub = block_signing_pub or pub_key
         _expected = "PC_" + hashlib.sha256(
-            f"{pubkey_to_address(pub_key)}_mcx_miner".encode()
+            f"{pubkey_to_address(_signing_pub)}_mcx_miner".encode()
         ).hexdigest()[:32].upper()
         if not (miner_id == _expected or miner_id.startswith(_expected + "_")):
-            logger.warning(f"[MINER] Register rejected: miner_id does not derive from pub_key")
+            logger.warning(f"[MINER] Register rejected: miner_id does not derive from block_signing_pub")
             return False
         miner = {
             'miner_id': miner_id,
@@ -18487,7 +20297,91 @@ class MicroCoreNode:
             except Exception as _re:
                 logger.warning(f"[Relay] Failed to relay verified block {(_blk or {}).get('id')}: {_re}")
 
+    async def _acquire_import_lock(self, what: str):
+        """R35 (N3): acquire _import_lock, warning when the wait
+        exceeds 2 s. Polls instead of wait_for: cancelling
+        Lock.acquire() at the instant the lock is granted can leave
+        it acquired with no owner. Records the holder so the next
+        waiter can name it. The locked() check + acquire() on a
+        free lock is atomic in the single-threaded event loop (no
+        await between them)."""
+        _t0 = time.monotonic()
+        _warned = False
+        while True:
+            if not self._import_lock.locked():
+                await self._import_lock.acquire()
+                _dt = time.monotonic() - _t0
+                if _warned:
+                    logger.info(f"[R35] acquired _import_lock for {what} after {_dt:.1f}s (holder was {self._import_lock_holder})")
+                self._import_lock_holder = what
+                return
+            if not _warned and time.monotonic() - _t0 > 2.0:
+                _warned = True
+                logger.warning(f"[R35] waiting >2s on _import_lock for {what} (holder={self._import_lock_holder})")
+            await asyncio.sleep(0.1)
+
     async def import_blocks(self, blocks_data: List[Dict]):
+        # R35 (N3): pre-warm BEFORE the import lock. The pre-warm
+        # used to run inside _import_blocks_inner (first await under
+        # the lock), so a block-196 import held the lock for >=45 s
+        # across a cold two-maze generation while every other
+        # delivery queued silently behind it (R34 epoch boundary:
+        # 11 attempts, 0 blocks). The pre-warm is idempotent and
+        # cache-populating, so doing it outside the lock is safe;
+        # verify then hits the warm cache, and single-flight
+        # (R34-1a) dedupes concurrent same-key generations.
+        # _prewarm_mazes skips keys already cached.
+        # R37 (F1): the pre-warm below is started in the BACKGROUND
+        # and never awaited. R35 (N3) moved it out from under the
+        # import lock, but import_blocks still awaited it - and it
+        # awaited EVERY key of EVERY block in the batch (up to 50
+        # blocks). At maze sizes 17-21 one batch's pre-warm took
+        # 51-120 s, so B made zero forward progress while the sync
+        # loop's patience ran out and it snapshotted (R36 Forward
+        # (b)). The import now proceeds straight to the lock and
+        # verify; verify awaits the pool single-flight for a cold
+        # key (_ensure_maze_cached, R37 F3) and generates in-process
+        # only if the pool did not fill the cache. The background
+        # pre-warm - single-flight since R37 - usually has the maze
+        # warm by the time verify needs it. No check
+        # is skipped: verify still recomputes every root.
+        try:
+            _keys = set()
+            for _b in (blocks_data or []):
+                if isinstance(_b, dict):
+                    # R37 (F3): only pre-warm keys for blocks this node
+                    # does not already have (id above the local tip).
+                    # _import_blocks_inner skips blocks already present,
+                    # so a rewind batch (e.g. 50 blocks below the tip)
+                    # used to queue dozens of useless generations in
+                    # the 4-worker pool while the tip's own keys waited
+                    # behind them (R37 run 3: the (22, 23) keys B2
+                    # needed never completed in 48 s). Verify of a
+                    # skipped block never runs, so nothing is lost;
+                    # a re-verified block still generates in-process
+                    # via _ensure_maze_cached if its maze is cold.
+                    try:
+                        if int(_b.get("id", -1)) > self.height:
+                            _keys |= self.consensus._maze_keys_for_block(_b)
+                    except Exception:
+                        pass
+            if _keys:
+                self.consensus._prewarm_background(_keys)
+        except Exception as _e:
+            logger.warning(f"[R35] import pre-warm failed ({_e}) — verify will generate in-process")
+        _ids = [int(_b.get("id", -1)) for _b in (blocks_data or []) if isinstance(_b, dict)]
+        _what = f"import_blocks ids={_ids}"
+        # R31 (F10): single-flight import lock. Concurrent
+        # deliveries of the same block collapse into one
+        # verify+append; the inner implementation is unchanged.
+        await self._acquire_import_lock(_what)
+        try:
+            return await self._import_blocks_inner(blocks_data)
+        finally:
+            self._import_lock_holder = None
+            self._import_lock.release()
+
+    async def _import_blocks_inner(self, blocks_data: List[Dict]):
         sorted_blocks = sorted(blocks_data, key=lambda x: x['id'])
         for b in sorted_blocks:
             existing = await self.block_repo.get_by_id(b['id'])
@@ -18495,15 +20389,25 @@ class MicroCoreNode:
                 continue
 
             if b['id'] > self.height:
-                logger.debug(f"[IMPORT] Block {b['id']} above local tip {self.height} with unknown parent; skipping batch")
-                break
+                # R24 (F7): skip just this gapped block and
+                # import the contiguous prefix, instead of
+                # discarding the whole batch on one missing
+                # parent.
+                logger.debug(f"[IMPORT] Block {b['id']} above local tip {self.height} with unknown parent; skipping block")
+                continue
 
             bid = b['id']
             phash = b.get('phash', '')
 
             if bid == self.height and phash == self.last_hash:
                 # blocks must NOT be verified against local tip state (A3):
-                if not await self.verify_block_proof(b):
+                # R35 (N3): pre-warm moved to import_blocks, before
+                # the import lock — the keys are already warm here
+                # (verify still generates in-process on a cache miss).
+                _iv0 = time.time()
+                _iv_ok = await self.verify_block_proof(b)
+                logger.info(f"[IMPORT] verify block {b['id']} took {time.time() - _iv0:.1f}s")
+                if not _iv_ok:
                     logger.warning(f"[IMPORT] Block {b['id']} failed verification")
                     if not self._proof_field_hint_shown:
                         self._proof_field_hint_shown = True
@@ -18582,6 +20486,29 @@ class MicroCoreNode:
                     continue
 
     async def receive_block(self, block_data: Dict) -> str:
+        # R35 (N3): pre-warm BEFORE the import lock (same reason as
+        # import_blocks: a cold generation under the lock stalls
+        # every other delivery).
+        # R37 (F1): started in the BACKGROUND, never awaited (see
+        # import_blocks: awaiting it parked the whole import behind
+        # a batch of mazes at sizes 17-21, R36 Forward (b)). The
+        # task starts before the import lock; verify awaits the pool
+        # single-flight for a cold key (R37 F3) - no check is skipped.
+        try:
+            if isinstance(block_data, dict):
+                self.consensus._prewarm_background(self.consensus._maze_keys_for_block(block_data))
+        except Exception as _e:
+            logger.warning(f"[R35] receive pre-warm failed ({_e}) — verify will generate in-process")
+        _what = f"receive_block id={block_data.get('id') if isinstance(block_data, dict) else '?'}"
+        # R31 (F10): single-flight import lock (see import_blocks).
+        await self._acquire_import_lock(_what)
+        try:
+            return await self._receive_block_inner(block_data)
+        finally:
+            self._import_lock_holder = None
+            self._import_lock.release()
+
+    async def _receive_block_inner(self, block_data: Dict) -> str:
         #   "ok"          - block PASSED full consensus verification; the
         #                   the caller must NOT relay it as verified and
         #                   heavier) and has NOT passed full consensus
@@ -18590,7 +20517,12 @@ class MicroCoreNode:
                             and block_data.get('id') == self.height
                             and block_data.get('phash') == self.last_hash)
         if _is_clean_append:
-            if not await self.verify_block_proof(block_data):
+            # R35 (N3): pre-warm moved to receive_block, before the
+            # import lock (see import_blocks).
+            _rv0 = time.time()
+            _rv_ok = await self.verify_block_proof(block_data)
+            logger.info(f"[IMPORT] verify block {block_data.get('id')} took {time.time() - _rv0:.1f}s")
+            if not _rv_ok:
                 logger.warning(f"[Block] Rejected block {block_data.get('id')} – invalid proof")
                 return "rejected"
         else:
@@ -19959,11 +21891,17 @@ class MicroCoreNode:
                 row.setdefault("createdat", int(time.time()))
                 await self.maze_repo.upsert(row)
             else:
+                # R28: never trust the attestation size for a new row.
+                # Resolve it from this block's last maze_update for the
+                # maze, else the floor (a brand-new maze is size 5).
+                _lu = _last_updates_by_maze(block.get("maze_updates", []) or [])
+                _lu_e = _lu.get(_mid) or _lu.get(_mid.lower())
+                _lu_sz = _valid_maze_size(_lu_e.get("new_size")) if isinstance(_lu_e, dict) else None
+                _new_size = int(_lu_sz) if _lu_sz is not None else MIN_MAZE_SIZE
                 await self.maze_repo.upsert({
                     "maze_id": _mid,
                     "minerid": _e.get("minerid", _mid),
-                    "size": (int(_att.get("size", MIN_MAZE_SIZE) or MIN_MAZE_SIZE)
-                             if (_att_mid and _mid.lower() == _att_mid) else MIN_MAZE_SIZE),
+                    "size": _new_size,
                     "walldensityppm": _e.get("walldensityppm", MIN_WALL_DENSITY_PPM),
                     "seed": _e.get("seed", ""),
                     "posx": 0, "posy": 0, "posz": 0,
@@ -19987,13 +21925,30 @@ class MicroCoreNode:
         async with await self.db.transaction():
             await self.block_repo.create(block)
             _pending_svf_epoch_root = None
+            # R34 (Fix 2b): SVF evidence records staged here,
+            # flushed to the in-memory store only after the
+            # transaction commits (see the flush below); the
+            # mint is staged the same way. On any failure
+            # above, the transaction rolls back and the flush
+            # never runs, so a retry starts from identical
+            # in-memory state.
+            _r34_pending_evidence: list = []
+            _r34_pending_mint = 0
             # no-op by construction; it never touches consumed state roots.
             if svf_active_at(block['id']):
                 try:
                     _ev = compute_block_evidence(block, block['id'])
                     if _ev is not None:
                         _ev_epoch = block['id'] // SVF_EPOCH_BLOCKS
-                        self.svf_evidence_store.setdefault(_ev_epoch, []).append(_ev)
+                        # R34 (Fix 2b): stage the record instead
+                        # of appending to the in-memory store.
+                        # The DB record below rolls back with
+                        # the transaction if the root check
+                        # fails, but the store append does not
+                        # - failed imports left duplicate
+                        # records in the store. Flushed after
+                        # the transaction commits (see below).
+                        _r34_pending_evidence.append((_ev_epoch, _ev))
                         _ev_rec = {
                             "epoch_id": _ev_epoch,
                             "height": _ev.block_id,
@@ -20017,7 +21972,12 @@ class MicroCoreNode:
                                 _ev_rec["attested_size"], _ev_rec["attestation_weight"], _ev_rec["growth_present"],
                                 _ev_rec["record_hash"])
                         logger.debug(f"[SVF] block {block['id']}: evidence persisted for epoch {_ev_epoch}")
-                    _epoch_recs = self.svf_evidence_store.get(_ev_epoch, [])
+                    # R34 (Fix 2b): compute the epoch root from
+                    # the store PLUS the staged record (no
+                    # mutation), so the deferred root application
+                    # below still sees this block's evidence on
+                    # the success path.
+                    _epoch_recs = list(self.svf_evidence_store.get(_ev_epoch, [])) + [_ev]
                     _root = _svf_epoch_root_if_complete(_epoch_recs, _ev_epoch)
                     if _root is not None:
                         _pending_svf_epoch_root = (_ev_epoch, _root)
@@ -20110,8 +22070,17 @@ class MicroCoreNode:
                 if _mint > 0:
                     if self.total_minted + _mint > MAX_SUPPLY:
                         raise AuxStateError(f"mint of block {block.get('id')} exceeds MAX_SUPPLY")
-                    self.total_minted += _mint
-                    await self.network_state_repo.set("total_minted", str(self.total_minted))
+                    # R34 (Fix 2b): do NOT bump the in-memory
+                    # mint counter yet. The DB write below rolls
+                    # back with the transaction if the root check
+                    # fails, but the counter does not - failed
+                    # imports left a phantom mint in memory.
+                    # Write the DB value from the pre-increment
+                    # counter (the same value the old code
+                    # wrote) and apply the counter after the
+                    # transaction commits (see below).
+                    await self.network_state_repo.set("total_minted", str(self.total_minted + _mint))
+                    _r34_pending_mint = _mint
 
             # longer mutate locally; the dedupe below is replay safety).
             for update in block.get("maze_updates", []):
@@ -20315,6 +22284,17 @@ class MicroCoreNode:
                     # aux state is consensus-relevant; partial apply diverges followers. Fail the block.
                     raise AuxStateError(f"maze_attestation of block {block.get('id')}: {_e}") from _e
             await self.distribute_token_mining_rewards(block['id'])
+
+        # R34 (Fix 2b): the transaction committed, so the staged
+        # in-memory mirrors may now advance. On any failure above,
+        # the transaction rolled back and this flush never runs, so
+        # a retry starts from identical state (the R33 peer-C
+        # failure left duplicate evidence records and a phantom
+        # mint in memory).
+        for _r34_ep, _r34_ev in _r34_pending_evidence:
+            self.svf_evidence_store.setdefault(_r34_ep, []).append(_r34_ev)
+        if _r34_pending_mint:
+            self.total_minted += _r34_pending_mint
 
         # rolls the transaction back) skips eviction, so a rollback never
         if getattr(self, 'mempool', None) is not None:
@@ -20892,13 +22872,19 @@ class MicroCoreNode:
                 for _addr, _amt in alloc.items():
                     _amt = int(_amt)
                     cur = await self.balance_repo.get(_addr)
-                    new_bal = cur + _amt
+                    # R33: idempotent BY VALUE - the snapshot loader
+                    # already wrote these balances (which contain the
+                    # alloc), so an additive credit would double-pay
+                    # the genesis alloc (400 MCX instead of 200).
+                    # The alloc is a floor, not an addition.
+                    new_bal = max(cur, _amt)
                     await self.balance_repo.set(_addr, new_bal)
                     await self.state_trie.put(f"balance:{_addr}", new_bal)
                     self.balances[_addr] = new_bal
                 gm = int(genesis_data.get("total_minted", GENESIS_SUPPLY))
                 cur_m = await self.network_state_repo.get("total_minted")
-                new_m = (int(cur_m) if cur_m else 0) + gm
+                # R33: same value-idempotence for total_minted.
+                new_m = max(int(cur_m) if cur_m else 0, gm)
                 await self.network_state_repo.set("total_minted", str(new_m))
                 self.total_minted = new_m
                 logger.info(f"{GREEN}[GENESIS]{RESET} Applied genesis alloc "
@@ -21174,7 +23160,7 @@ class MicroCoreNode:
                 pass
 
         for _rl in (self.rate_limiter, self.subnet_rate_limiter,
-                    self.register_rate_limiter, self.rpc_rate_limiter):
+                    self.rpc_rate_limiter):
             _ct = getattr(_rl, '_cleanup_task', None)
             if _ct is not None and not _ct.done():
                 _ct.cancel()
@@ -21389,16 +23375,29 @@ class MicroCoreNode:
                         except json.JSONDecodeError:
                             await ws.send_json({"type": "error", "message": "Invalid JSON"})
                         except Exception as e:
-                            if not self._shutdown_flag:
-                                logger.error(f"[WS] Handler error: {e}", exc_info=True)
-                            try:
-                                await ws.send_json({"type": "error", "message": str(e)})
-                            except Exception:
-                                pass
+                            # R24: a miner that disconnects
+                            # mid-reply raises "Cannot write to
+                            # closing transport" — the client is
+                            # just gone, not an error. Log it
+                            # quietly and do not try to reply on
+                            # a dead transport.
+                            if isinstance(e, (ConnectionResetError, BrokenPipeError)) or "Cannot write to closing transport" in str(e):
+                                logger.debug(f"[WS] Reply to disconnected miner dropped: {e}")
+                            else:
+                                if not self._shutdown_flag:
+                                    logger.error(f"[WS] Handler error: {e}", exc_info=True)
+                                try:
+                                    await ws.send_json({"type": "error", "message": str(e)})
+                                except Exception:
+                                    pass
                     elif msg.type == WSMsgType.ERROR:
                         logger.debug(f"[WS] Connection error: {ws.exception()}")
             except Exception as e:
-                if not self._shutdown_flag:
+                # R24: same transport-closing rule as the
+                # inner handler — a dropped client is quiet.
+                if isinstance(e, (ConnectionResetError, BrokenPipeError)) or "Cannot write to closing transport" in str(e):
+                    logger.debug(f"[WS] Connection dropped: {e}")
+                elif not self._shutdown_flag:
                     logger.error(f"[WS] Connection error: {e}")
             finally:
                 _sess = self.ws_sessions.pop(ws, None)
@@ -21412,9 +23411,117 @@ class MicroCoreNode:
                     del self.miner_websockets[miner_id]
             return ws
 
+        async def p2p_ws_handler(request):
+            """TUNNEL-P2P-WS: P2P over WebSocket at /p2p on the WS port.
+            Same framed bytes, same handshake, same _peer_loop (same
+            message types, same _process_message, same ban / reputation /
+            rate-limit logic) as raw TCP -- only the transport differs.
+            The /healthz contract is untouched, and miner /ws handling
+            is untouched. The pump task must start BEFORE the handshake:
+            the handshake reads from the reader, and only the pump feeds it."""
+            ws = WebSocketResponse(heartbeat=60)
+            await ws.prepare(request)
+            client_ip = (
+                request.headers.get("CF-Connecting-IP")
+                or request.headers.get("X-Real-IP")
+                or (request.headers.get("X-Forwarded-For", "").split(",")[0].strip())
+                or request.remote
+            )
+            if self.p2p and self.p2p._is_banned(address=str(client_ip or "")):
+                await ws.close(code=1008, message=b"banned")
+                return ws
+            # X-Forwarded-Host wins when a proxy sets it (it names the
+            # public host); else Host, which Cloudflare forwards unchanged.
+            _host_hdr = (request.headers.get("X-Forwarded-Host") or request.host or "").strip()
+            _scheme = (request.headers.get("X-Forwarded-Proto") or request.scheme or "http").split(",")[0].strip().lower()
+            _ws_scheme = "wss" if _scheme in ("https", "wss") else "ws"
+            _hh, _hp = parse_ip_port(_host_hdr, 443 if _ws_scheme == "wss" else 80)
+            _peername = (_hh or str(client_ip or ""), int(_hp or 0))
+            _p2p_ws = f"{_ws_scheme}://{_host_hdr}/p2p" if _host_hdr else ""
+            reader = _WSByteReader()
+
+            async def _server_close():
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
+            writer = _WSByteWriter(ws.send_bytes, _server_close, _peername)
+            pump_task = asyncio.create_task(_pump_ws_into_reader(ws, reader))
+            peer = None
+            if self.p2p:
+                _cip = str(client_ip or "")
+                _pend = self.p2p._pending_handshakes.get(_cip, 0)
+                if _pend >= self.p2p._max_pending_handshakes:
+                    logger.info(f"[P2P-WS] Rejecting inbound WS peer {client_ip}: too many pending handshakes ({_pend}/{self.p2p._max_pending_handshakes})")
+                    pump_task.cancel()
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    return ws
+                _now_ts = time.time()
+                _hs = self.p2p._handshake_rate_limiter.setdefault(_cip, [])
+                _hs[:] = [t for t in _hs if _now_ts - t < 60]
+                if len(_hs) >= self.p2p._handshake_rate_limit[0]:
+                    logger.info(f"[P2P-WS] Rejecting inbound WS peer {client_ip}: handshake rate limit ({len(_hs)}/{self.p2p._handshake_rate_limit[0]} per 60 s)")
+                    pump_task.cancel()
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    return ws
+                _hs.append(_now_ts)
+                self.p2p._pending_handshakes[_cip] = _pend + 1
+                try:
+                    peer = await asyncio.wait_for(
+                        perform_handshake(
+                            reader, writer,
+                            self.node_id,
+                            self.height,
+                            VERSION,
+                            self.priv,
+                            self.pub,
+                            allow_genesis_learn=False
+                        ),
+                        timeout=10.0
+                    )
+                except Exception:
+                    peer = None
+                finally:
+                    self.p2p._pending_handshakes[_cip] = max(0, self.p2p._pending_handshakes.get(_cip, 1) - 1)
+                    if self.p2p._pending_handshakes[_cip] == 0:
+                        self.p2p._pending_handshakes.pop(_cip, None)
+            if peer is None:
+                pump_task.cancel()
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return ws
+            peer.transport = "ws"
+            peer.p2p_ws = _p2p_ws
+            if not self.p2p or not await self.p2p._register_ws_peer(peer, 'in'):
+                pump_task.cancel()
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return ws
+            logger.info(f"[P2P-WS] New peer via WS: {peer.address} (node {peer.node_id[:16]})")
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass
+            return ws
+
         # app). invariant preserved: /rpc never rides 0.0.0.0.
         app_ws = _ws_app_routes(Application(middlewares=[cors_middleware]),
-                                websocket_handler)
+                                websocket_handler, p2p_ws_handler)
 
         async def rpc_handler(request):
             # below echoes the request id (None when the body never parsed,
@@ -21905,11 +24012,31 @@ class MicroCoreNode:
         async def peers_handler(request):
             peers = []
             if self.p2p:
-                for nid, (url, last_seen) in getattr(self.p2p, 'tunnel_peers', {}).items():
-                    peers.append({"node_id": nid, "url": url, "last_seen": last_seen})
-                for nid, info in getattr(self.p2p, 'peers', {}).items():
-                    if hasattr(info, 'addr') and info.addr not in [p.get("url","") for p in peers]:
-                        peers.append({"node_id": nid, "url": info.addr, "last_seen": getattr(info, 'last_seen', 0)})
+                # TUNNEL-P2P-WS: the old code read a 'tunnel_peers'
+                # attribute the P2P class never had, and 'info.addr'
+                # which EncryptedPeer never had (its field is
+                # 'address'), so no peer was ever served here.
+                # Connected peers (TCP + WS) and registry tunnel
+                # peers are both listed now; existing fields
+                # (node_id/url/last_seen/height) are unchanged.
+                for addr, info in getattr(self.p2p, 'peers', {}).items():
+                    _entry = {"node_id": getattr(info, 'node_id', addr), "url": getattr(info, 'address', addr), "last_seen": getattr(info, 'last_seen', 0), "height": int(getattr(info, 'height', 0) or 0), "transport": getattr(info, 'transport', 'tcp')}
+                    if getattr(info, 'p2p_ws', ''):
+                        _entry["p2p_ws"] = info.p2p_ws
+                    peers.append(_entry)
+                _seen_hosts = {str(_p.get("url", "")).split(":")[0] for _p in peers}
+                for _tp in list(getattr(self.p2p, '_registry_tunnel_peers', []) or []):
+                    if not isinstance(_tp, dict):
+                        continue
+                    _host = str(_tp.get("host") or "")
+                    if not _host or _host in _seen_hosts:
+                        continue
+                    _entry = {"node_id": "", "url": str(_tp.get("ws_url") or ""), "last_seen": time.time(), "transport": "ws", "host": _host}
+                    if str(_tp.get("p2p_ws") or ""):
+                        _entry["p2p_ws"] = str(_tp.get("p2p_ws"))
+                    if _tp.get("height") is not None:
+                        _entry["height"] = _tp.get("height")
+                    peers.append(_entry)
             _api_port = self.config.get('node', {}).get('api_port', API_PORT)
             peers.append({"node_id": "self", "url": f"http://127.0.0.1:{_api_port}/rpc", "last_seen": time.time(), "height": self.height})
             return web.json_response({"peers": peers, "total": len(peers)})
@@ -22523,7 +24650,9 @@ class MicroCoreNode:
                     challenge = self.memory_mgr.generate_challenge(miner_id)
                     session["challenge_sent"] = True
                     session["miner_id"] = miner_id
-                    session["maze_id"] = data.get("maze_id") or miner_id
+                    # R24: the maze id is a maze pubkey, never a
+                    # PC_ id. Prefer the maze key the miner sent.
+                    session["maze_id"] = data.get("maze_id") or block_signing_pub or miner_id
                     await ws.send_json(challenge)
                 else:
                     await ws.send_json({"type": "registration_failed", "error": "Invalid signature or banned"})
@@ -22659,6 +24788,11 @@ class MicroCoreNode:
                     # the same names the body already uses, so the body
                     # below is unchanged.
                     ws, session, miner_id, maze_id, direction, signature, move_nonce = _job
+                    # R24 (Finding 4): remember when THIS task
+                    # started, so its finally only frees the
+                    # slot it owns. A reclaimed (stale) task
+                    # must not pop a newer task's slot.
+                    _my_started = time.monotonic()
                     try:
                         if ws.closed:
                             return
@@ -22692,9 +24826,13 @@ class MicroCoreNode:
                                 "message": msg,
                                 "state": state
                             }
+                            # R27: stamp the ack with the nonce this move
+                            # was accepted under. A DB re-read here could
+                            # return a later nonce (stale ack), and the
+                            # miner then burns the full 30 s MOVE_TIMEOUT.
+                            ack["movenonce"] = move_nonce
                             _ack_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
                             if _ack_row:
-                                ack["movenonce"] = int(_ack_row["movenonce"])
                                 ack["growthcount"] = int(_ack_row["growthcount"])
                             ghost = self.consensus._ghost_tuple(_ack_row)
                             if ghost:
@@ -22718,7 +24856,7 @@ class MicroCoreNode:
                                         ack["start"] = [row["posx"], row["posy"], row["posz"]]
                                         ack["goal"] = [row["goalx"], row["goaly"], row["goalz"]]
                                         ack["growthcount"] = row["growthcount"]
-                                        ack["movenonce"] = row["movenonce"]
+                                        ack["movenonce"] = move_nonce
                                 except Exception as e:
                                     logger.error(f"[WS] maze growth send error for {miner_id}: {e}", exc_info=True)
                             if not ws.closed:
@@ -22757,7 +24895,16 @@ class MicroCoreNode:
                             except Exception:
                                 pass
                     finally:
-                        self.consensus._inflight_moves.pop(miner_id, None)
+                        # R24 (Finding 4): pop the slot only if
+                        # it is still ours (set no later than
+                        # when this task started). A stale task
+                        # whose slot was reclaimed by a newer
+                        # move must not free the newer move's
+                        # slot, or one slow move cascades into
+                        # a third task and a nonce storm.
+                        _cur = self.consensus._inflight_moves.get(miner_id)
+                        if _cur is not None and _cur <= _my_started:
+                            self.consensus._inflight_moves.pop(miner_id, None)
                         # MOVE-QUEUE-1: drain one queued move for this
                         # miner, if any. Skip entries whose socket already
                         # closed (miner reconnected; it retries on the
@@ -22862,36 +25009,24 @@ class MicroCoreNode:
                                                 idx = (idx + 1) % len(cycle_cells)
                                                 self.consensus._ghost_cycle_idx[maze_id] = idx
                                                 target = cycle_cells[idx]
-                                            for _ in range(3):
-                                                gdx, gdy, gdz = self.consensus._bfs_next_step(mdense, gsize, gpos, target)
-                                                if gdx is None:
-                                                    break
-                                                new_gpos = (gpos[0]+gdx, gpos[1]+gdy, gpos[2]+gdz)
-                                                gpos = new_gpos
-                                                gpos_moved = True
-                                                if new_gpos == (msx, msy, msz):
-                                                    caught = True
-                                                    restart_ev = await self.consensus._restart_position(dict(row), maze_id, row["minerid"], gsize)
-                                                    if restart_ev:
-                                                        await self.consensus.maze_repo.upsert({**dict(row), **restart_ev})
-                                                    break
+                                            # R27: no ghost steps in the solve replay.
+                                            # The wall-hit move already gave the ghost
+                                            # its 1 step (1:1); a solve is not a move.
                                     else:
-                                        for _ in range(3):
-                                            gdx, gdy, gdz = self.consensus._bfs_next_step(mdense, gsize, gpos, (msx, msy, msz))
-                                            if gdx is None:
-                                                break
-                                            new_gpos = (gpos[0]+gdx, gpos[1]+gdy, gpos[2]+gdz)
-                                            gpos = new_gpos
-                                            gpos_moved = True
-                                            if new_gpos == (msx, msy, msz):
-                                                caught = True
-                                                restart_ev = await self.consensus._restart_position(dict(row), maze_id, row["minerid"], gsize)
-                                                if restart_ev:
-                                                    await self.consensus.maze_repo.upsert({**dict(row), **restart_ev})
-                                                break
+                                        # R27: no ghost steps in the solve replay.
+                                        # The wall-hit move already gave the ghost
+                                        # its 1 step (1:1); a solve is not a move.
+                                        pass
                                 if gpos_moved and not caught:
-                                    self.consensus._set_ghost(row, gpos)
-                                    await self.consensus.maze_repo.upsert(dict(row))
+                                    # R28: re-read before the upsert -- `row` was
+                                    # read before the solve replay; a concurrent
+                                    # move may have advanced it. (Dead code in R27:
+                                    # gpos_moved is never set True; the re-read
+                                    # removes the trap if it ever fires.)
+                                    _fresh_w = await self.consensus.maze_repo.get_for_miner(miner_id, maze_id)
+                                    if _fresh_w is not None:
+                                        self.consensus._set_ghost(_fresh_w, gpos)
+                                        await self.consensus.maze_repo.upsert(_fresh_w)
                         reply = {"type": "wall_hit_solved", "accepted": True, "caught": caught}
                         reply["sealed_walls"] = list(self.consensus._sealed_walls.get(maze_id, set()))
                         reply["ghost"] = None
@@ -23013,6 +25148,26 @@ class MicroCoreNode:
                     self.consensus._generate_deterministic_maze,
                     row["seed"], size, int(row["walldensityppm"]), int(row["turbulenceppm"]), self.height
                 )
+                # R30: re-read after the generation await. A move may
+                # have landed during the (up to 120 s cold) generation;
+                # building the reply from the pre-generation row would
+                # hand the miner a stale movenonce (N-1) after its move
+                # N was already accepted — the miner then resends N and
+                # gets a -1 desync rejection. If the maze itself
+                # changed, regenerate from the fresh params (a cache
+                # hit — the catch path generated it).
+                _fresh_row = await self.maze_repo.get_for_miner(miner_id, maze_id)
+                if _fresh_row is not None:
+                    if (_fresh_row.get("seed") != row.get("seed") or int(_fresh_row.get("size", 0)) != int(size)
+                            or int(_fresh_row.get("walldensityppm", 0)) != int(row.get("walldensityppm", 0))
+                            or int(_fresh_row.get("turbulenceppm", 0)) != int(row.get("turbulenceppm", 0))):
+                        size = _fresh_row["size"]
+                        sparse_maze = await loop.run_in_executor(
+                            self.consensus._move_executor,
+                            self.consensus._generate_deterministic_maze,
+                            _fresh_row["seed"], size, int(_fresh_row["walldensityppm"]), int(_fresh_row["turbulenceppm"]), self.height
+                        )
+                    row = _fresh_row
                 maze_array = sparse_to_dense(sparse_maze)
                 sx, sy, sz = row["posx"], row["posy"], row["posz"]
                 gx, gy, gz = row["goalx"], row["goaly"], row["goalz"]
@@ -23245,7 +25400,7 @@ class MicroCoreNode:
                 maze_rows = await self.maze_repo.get(miner_id)
                 if maze_rows:
                     for mz in maze_rows:
-                        await self.maze_repo.upsert({**dict(mz), "updatedat": int(time.time())})
+                        await self.maze_repo.touch_updatedat(mz.get("maze_id"))
                 logger.debug(f"[WS] Uptime ping from {miner_id}: {uptime_seconds}s")
 
         elif msg_type == "block_signed":
@@ -23475,7 +25630,6 @@ class MicroCoreNode:
         await self.mempool.start_cleanup()
         await self.rate_limiter.start_cleanup()
         await self.subnet_rate_limiter.start_cleanup()
-        await self.register_rate_limiter.start_cleanup()
         await self.rpc_rate_limiter.start_cleanup()
 
         _chain_ready = await self.ensure_genesis()
@@ -23851,9 +26005,24 @@ def tunnel_install_instructions():
     tunnel_say("Then run: python node.py --tunnel-setup")
 
 
-def tunnel_register_host(host, registry_url):
-    url = registry_url.rstrip("/") + "/register"
-    payload = json.dumps({"host": host}).encode("utf-8")
+def tunnel_register_host(host, registry_url, height=None):
+    # The node's registry_url points at the /nodes list; the helper's
+    # points at the registry base. Both must POST to base + /register,
+    # so a trailing /nodes... segment is dropped here (and nowhere
+    # else): /nodes, /nodes-b, /nodes?x all reduce to the base.
+    _u = urlparse(registry_url.rstrip("/"))
+    _segs = [s for s in _u.path.split("/") if s]
+    if _segs and _segs[-1].startswith("nodes"):
+        _segs.pop()
+    _base = _u.scheme + "://" + _u.netloc + ("/" + "/".join(_segs) if _segs else "")
+    url = _base + "/register"
+    _body = {"host": host}
+    if height is not None:
+        try:
+            _body["height"] = int(height)
+        except (TypeError, ValueError):
+            pass
+    payload = json.dumps(_body).encode("utf-8")
     request = urllib.request.Request(url, data=payload, method="POST",
                                      headers={"Content-Type": "application/json", "User-Agent": "munex-tunnel/1.0"})
     try:
@@ -23870,8 +26039,8 @@ def tunnel_register_host(host, registry_url):
         return False, 0, str(err)
 
 
-def tunnel_register_link(host, registry_url):
-    ok, tunnel_status_show, body = tunnel_register_host(host, registry_url)
+def tunnel_register_link(host, registry_url, height=None):
+    ok, tunnel_status_show, body = tunnel_register_host(host, registry_url, height=height)
     if ok:
         tunnel_say("Registered " + host + " with the registry, miners can find it.")
         return True

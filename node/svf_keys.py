@@ -7,7 +7,6 @@ import genesis
 def _svf_canon(obj) -> bytes:
     return bootstrap.json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode('ascii')
 '\nSVF v1 Threshold-BLS Consensus using py_ecc for all curve operations.\n\nBLS12-381 curve:\n- G1: points over F_q (base field), coordinates are FQ elements (integers mod q)\n- G2: points over F_q^2, coordinates are FQ2 elements (pairs of FQ elements)\n\nSerialization:\n- G1 point (public key): x(48 bytes) + y(48 bytes) = 96 bytes uncompressed\n- G2 point (signature): x(96 bytes) + y(96 bytes) = 192 bytes uncompressed\n'
-'\nSVF v1 Threshold-BLS Consensus using py_ecc for all curve operations.\n\nBLS12-381 curve:\n- G1: points over F_q (base field), coordinates are FQ elements\n- G2: points over F_q^2, coordinates are FQ2 elements\n\nSerialization:\n- G1 point (public key): x(48 bytes) + y(48 bytes) = 96 bytes uncompressed\n- G2 point (signature): x(96 bytes) + y(96 bytes) = 192 bytes uncompressed\n'
 from py_ecc.optimized_bls12_381 import multiply as _bls_multiply, add as _bls_add, G1, G2, FQ, FQ2, pairing, final_exponentiate, is_on_curve, is_inf, normalize, optimized_swu_G2, curve_order, field_modulus, b, b2
 from hashlib import sha256
 from py_ecc.bls.hash_to_curve import hash_to_G2

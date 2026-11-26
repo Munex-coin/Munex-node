@@ -127,7 +127,7 @@ def _ensure_dependencies() -> None:
     if still_missing:
         print('[MCX] Optional packages unavailable (some features stay disabled): ' + ', '.join((p for p, _ in still_missing)), file=sys.stderr)
 _ensure_dependencies()
-import sys, io, os, time, json, hashlib, hmac, secrets, random, struct, socket, subprocess, re, argparse, traceback, logging, base64, binascii, ipaddress, math, asyncio, aiohttp, websockets, signal, importlib, warnings, sqlite3, copy
+import sys, io, os, time, json, hashlib, hmac, secrets, random, struct, socket, subprocess, re, argparse, traceback, logging, base64, binascii, ipaddress, math, asyncio, aiohttp, websockets, signal, importlib, warnings, sqlite3, copy, threading
 from datetime import datetime
 from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field

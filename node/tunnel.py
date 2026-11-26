@@ -1,3 +1,4 @@
+import bootstrap
 import json
 import os
 import platform
@@ -194,9 +195,20 @@ def tunnel_install_instructions():
     tunnel_say('  Mac:     brew install cloudflared')
     tunnel_say('Then run: python node.py --tunnel-setup')
 
-def tunnel_register_host(host, registry_url):
-    url = registry_url.rstrip('/') + '/register'
-    payload = json.dumps({'host': host}).encode('utf-8')
+def tunnel_register_host(host, registry_url, height=None):
+    _u = bootstrap.urlparse(registry_url.rstrip('/'))
+    _segs = [s for s in _u.path.split('/') if s]
+    if _segs and _segs[-1].startswith('nodes'):
+        _segs.pop()
+    _base = _u.scheme + '://' + _u.netloc + ('/' + '/'.join(_segs) if _segs else '')
+    url = _base + '/register'
+    _body = {'host': host}
+    if height is not None:
+        try:
+            _body['height'] = int(height)
+        except (TypeError, ValueError):
+            pass
+    payload = json.dumps(_body).encode('utf-8')
     request = urllib.request.Request(url, data=payload, method='POST', headers={'Content-Type': 'application/json', 'User-Agent': 'munex-tunnel/1.0'})
     try:
         with urllib.request.urlopen(request, timeout=TUNNEL_REGISTER_TIMEOUT) as response:
@@ -211,8 +223,8 @@ def tunnel_register_host(host, registry_url):
     except Exception as err:
         return (False, 0, str(err))
 
-def tunnel_register_link(host, registry_url):
-    ok, tunnel_status_show, body = tunnel_register_host(host, registry_url)
+def tunnel_register_link(host, registry_url, height=None):
+    ok, tunnel_status_show, body = tunnel_register_host(host, registry_url, height=height)
     if ok:
         tunnel_say('Registered ' + host + ' with the registry, miners can find it.')
         return True

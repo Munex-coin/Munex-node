@@ -754,6 +754,14 @@ class MinerMazeRepo:
         else:
             await self.db.execute_dml('UPDATE minermazes SET minerid=$1, updatedat=$2 WHERE maze_id=$3', miner_id, int(bootstrap.time.time()), maze_id)
 
+    async def touch_updatedat(self, maze_id: str):
+        if not maze_id:
+            return
+        if self.db.db_type == 'sqlite':
+            await self.db.execute_dml('UPDATE minermazes SET updatedat=? WHERE maze_id=?', int(bootstrap.time.time()), maze_id)
+        else:
+            await self.db.execute_dml('UPDATE minermazes SET updatedat=$1 WHERE maze_id=$2', int(bootstrap.time.time()), maze_id)
+
     async def get_by_miner_id(self, miner_id: str):
         query = 'SELECT * FROM minermazes WHERE minerid = ?' if self.db.db_type == 'sqlite' else 'SELECT * FROM minermazes WHERE minerid = $1'
         return await self.db.fetch(query, miner_id)

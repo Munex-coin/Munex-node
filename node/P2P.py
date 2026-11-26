@@ -9,6 +9,7 @@ import genesis
 import db
 import db as _db
 import repos
+import tunnel
 try:
     from kademlia.network import Server
     from kademlia.storage import ForgetfulStorage
@@ -33,6 +34,8 @@ class EncryptedPeer:
     version: str
     last_seen: float
     p2p_port: int = 8081
+    transport: str = 'tcp'
+    p2p_ws: str = ''
     score: int = 0
     banned: bool = False
     write_lock: bootstrap.asyncio.Lock = bootstrap.field(default_factory=bootstrap.asyncio.Lock)
@@ -96,6 +99,144 @@ def _dial_dup_action(local_id, remote_id, direction, loopback, has_existing) -> 
     else:
         keeper = _mutual_dial_keep(local_id, remote_id)
     return 'replace_existing' if keeper else 'close_new'
+
+class _WSByteReader:
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._need = bootstrap.asyncio.Event()
+        self._closed = False
+
+    def feed(self, data: bytes):
+        if data:
+            self._buf += data
+            self._need.set()
+
+    def set_closed(self):
+        self._closed = True
+        self._need.set()
+
+    async def readexactly(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            if self._closed:
+                raise bootstrap.asyncio.IncompleteReadError(partial=bytes(self._buf), expected=n)
+            self._need.clear()
+            if len(self._buf) >= n or self._closed:
+                continue
+            await self._need.wait()
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+class _WSByteWriter:
+
+    def __init__(self, send_bytes, close_ws, peername):
+        self._send_bytes = send_bytes
+        self._close_ws = close_ws
+        self._peername = peername
+        self._buf = bytearray()
+        self._closed = False
+        self._close_task = None
+        self._close_event = bootstrap.asyncio.Event()
+
+    def write(self, data: bytes):
+        if not self._closed:
+            self._buf += data
+
+    async def drain(self):
+        if self._buf:
+            chunk = bytes(self._buf)
+            self._buf.clear()
+            await self._send_bytes(chunk)
+
+    def get_extra_info(self, name):
+        if name == 'peername':
+            return self._peername
+        return None
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            loop = bootstrap.asyncio.get_running_loop()
+        except RuntimeError:
+            self._close_event.set()
+            return
+
+        async def _do_close():
+            try:
+                r = self._close_ws()
+                if bootstrap.asyncio.iscoroutine(r):
+                    await r
+            except Exception:
+                pass
+            finally:
+                self._close_event.set()
+        self._close_task = loop.create_task(_do_close())
+
+    async def wait_closed(self):
+        if not self._closed:
+            return
+        if self._close_task is not None:
+            try:
+                await bootstrap.asyncio.wait_for(bootstrap.asyncio.shield(self._close_task), timeout=5)
+            except Exception:
+                pass
+        try:
+            await bootstrap.asyncio.wait_for(self._close_event.wait(), timeout=5)
+        except Exception:
+            pass
+
+def _p2p_ws_from_ws_url(ws_url):
+    try:
+        text = str(ws_url or '').strip()
+        if not text:
+            return ''
+        u = bootstrap.urlparse(text)
+        if not u.scheme:
+            u = bootstrap.urlparse('ws://' + text)
+        scheme = {'http': 'ws', 'https': 'wss'}.get(u.scheme, u.scheme) or 'ws'
+        host = u.hostname or ''
+        if not host:
+            return ''
+        port = u.port
+        default = 443 if scheme == 'wss' else 80
+        if port and port != default:
+            netloc = f'[{host}]:{port}' if ':' in host else f'{host}:{port}'
+        elif ':' in host:
+            netloc = f'[{host}]'
+        else:
+            netloc = host
+        return f'{scheme}://{netloc}/p2p'
+    except Exception:
+        return ''
+
+def _ws_client_close(ws, session):
+
+    async def _close():
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        try:
+            await session.close()
+        except Exception:
+            pass
+    return _close
+
+async def _pump_ws_into_reader(ws, reader):
+    from aiohttp import WSMsgType as _WMT
+    try:
+        async for _msg in ws:
+            if _msg.type == _WMT.BINARY:
+                reader.feed(_msg.data)
+            elif _msg.type in (_WMT.CLOSE, _WMT.CLOSED, _WMT.ERROR):
+                break
+    except Exception:
+        pass
+    finally:
+        reader.set_closed()
 
 async def perform_handshake(reader: bootstrap.asyncio.StreamReader, writer: bootstrap.asyncio.StreamWriter, my_node_id: str, my_height: int, my_version: str, my_priv_key: str, my_pub_key: str, allow_genesis_learn: bool=False) -> bootstrap.Optional[EncryptedPeer]:
     try:
@@ -392,15 +533,16 @@ class P2PNode:
         self._discovery_stop = bootstrap.asyncio.Event()
         self._metrics = {'messages_sent': 0, 'messages_received': 0, 'bytes_sent': 0, 'bytes_received': 0, 'connections': 0, 'errors': 0, 'peers_discovered': 0}
         self.peer_scores: bootstrap.Dict[str, bootstrap.Dict] = {}
-        self.reputation_weights = {'valid_block': 2, 'valid_tx': 1, 'valid_peer_list': 1, 'ping_response': 1, 'invalid_message': -2, 'decrypt_failed': -5, 'oversized_message': -10, 'protocol_violation': -15, 'invalid_block': -20, 'invalid_tx': -15}
+        self.reputation_weights = {'valid_block': 2, 'valid_tx': 1, 'valid_peer_list': 1, 'ping_response': 1, 'invalid_message': -2, 'decrypt_failed': -5, 'oversized_message': -10, 'protocol_violation': -2, 'invalid_block': -2, 'invalid_tx': -15}
         self.score_decay_interval = 3600
         self.max_positive_score = 100
         self.min_score_for_ban = -config.BAN_THRESHOLD
-        self.rate_limits = {config.MSG_PING: (30, 60), config.MSG_GET_PEERS: (10, 60), config.MSG_GET_BLOCKS: (60, 60), config.MSG_GET_STATUS: (30, 60), config.MSG_GET_CHECKPOINT: (10, 60), config.MSG_GET_SNAPSHOT: (5, 60), config.MSG_NEW_BLOCK: (100, 60), config.MSG_NEW_TX: (200, 60), config.MSG_NEW_MOVE: (1200, 60)}
+        self.rate_limits = {config.MSG_PING: (30, 60), config.MSG_GET_PEERS: (10, 60), config.MSG_GET_BLOCKS: (60, 60), config.MSG_GET_STATUS: (60, 60), config.MSG_GET_CHECKPOINT: (10, 60), config.MSG_GET_SNAPSHOT: (5, 60), config.MSG_NEW_BLOCK: (100, 60), config.MSG_NEW_TX: (200, 60), config.MSG_NEW_MOVE: (1200, 60)}
         self.peer_message_counts: bootstrap.Dict[str, bootstrap.Dict[int, bootstrap.List[float]]] = {}
         self._seen_block_hashes: bootstrap.OrderedDict = bootstrap.OrderedDict()
         self._seen_tx_hashes: bootstrap.OrderedDict = bootstrap.OrderedDict()
         self._seen_max = 8192
+        self._rejected_block_hashes: bootstrap.Dict[str, float] = {}
         self._bootstrap_cooldown_log_ts: bootstrap.Dict[str, float] = {}
         self.peer_subnets: bootstrap.Dict[str, str] = {}
         self.subnet_peer_count: bootstrap.Dict[str, int] = {}
@@ -444,12 +586,27 @@ class P2PNode:
         self.checkpoint_interval = config.CONFIG.get('consensus', {}).get('checkpoint_interval', 100)
         p2p_cfg = getattr(self.node, 'config', {}).get('p2p', {}) if self.node else config.CONFIG.get('p2p', {})
         self.genesis_node, self.dns_seeds, self.bootstrap_nodes, self.dht_bootstrap_nodes = resolve_seed_lists(p2p_cfg)
+        self._bootstrap_ips = set()
+        for _b in list(self.bootstrap_nodes) + [self.genesis_node]:
+            try:
+                _bh, _ = parse_ip_port(str(_b), config.P2P_PORT)
+            except Exception:
+                continue
+            self._bootstrap_ips.add(_bh)
+            try:
+                for _fam, _typ, _proto, _canon, _sa in bootstrap.socket.getaddrinfo(_bh, None):
+                    if _sa and _sa[0]:
+                        self._bootstrap_ips.add(str(_sa[0]))
+            except Exception:
+                pass
         self.registry_url = str(p2p_cfg.get('registry_url', config.REGISTRY_URL_DEFAULT)).strip()
         self.registry_enabled = config._strict_bool('p2p.registry_enabled', p2p_cfg.get('registry_enabled', True))
         self.registry_interval = max(60, int(p2p_cfg.get('registry_interval', 300) or 300))
         self._registry_last_fetch = 0.0
         self._registry_cached_peers = []
         self._registry_tunnel_peers = []
+        self._tunnel_host = self._resolve_tunnel_host(p2p_cfg)
+        self._tunnel_last_register = 0.0
         self.fallback_nodes = list(p2p_cfg.get('fallback_nodes', []))
         self.dht_port = int(p2p_cfg.get('dht_port', config.DHT_PORT))
         self.allow_private_peers = config._strict_bool('p2p.allow_private_peers', p2p_cfg.get('allow_private_peers', False))
@@ -550,6 +707,7 @@ class P2PNode:
         ip_only = addr[0]
         pending = self._pending_handshakes.get(ip_only, 0)
         if pending >= self._max_pending_handshakes:
+            bootstrap.logger.info(f'[P2P] Rejecting inbound peer {addr_str}: too many pending handshakes ({pending}/{self._max_pending_handshakes})')
             writer.close()
             await writer.wait_closed()
             return
@@ -557,6 +715,7 @@ class P2PNode:
         hs_timestamps = self._handshake_rate_limiter.setdefault(ip_only, [])
         hs_timestamps[:] = [t for t in hs_timestamps if now_ts - t < 60]
         if len(hs_timestamps) >= self._handshake_rate_limit[0]:
+            bootstrap.logger.info(f'[P2P] Rejecting inbound peer {addr_str}: handshake rate limit ({len(hs_timestamps)}/{self._handshake_rate_limit[0]} per 60 s)')
             writer.close()
             await writer.wait_closed()
             return
@@ -610,7 +769,7 @@ class P2PNode:
                         del self.peers[_old.address]
             peer_ip = parse_ip_port(peer.address, config.P2P_PORT)[0]
             ip_conns = self._conn_per_ip.get(peer_ip, 0)
-            is_bootstrap = any((peer_ip in b for b in self.bootstrap_nodes)) or peer_ip == self.genesis_node
+            is_bootstrap = peer_ip in self._bootstrap_ips or peer_ip == self.genesis_node
             if not is_bootstrap and ip_conns >= self._max_conn_per_ip:
                 bootstrap.logger.info(f'[P2P] Rejecting inbound peer {peer.address}: per-IP cap ({ip_conns}/{self._max_conn_per_ip})')
                 writer.close()
@@ -664,8 +823,8 @@ class P2PNode:
                 data = plaintext[1:]
                 self._metrics['messages_received'] += 1
                 self._metrics['bytes_received'] += len(plaintext)
-                await self._process_message(peer, msg_type, data)
                 peer.last_seen = bootstrap.time.time()
+                self._track_task(bootstrap.asyncio.create_task(self._process_message_safe(peer, msg_type, data)))
         except (bootstrap.asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             pass
         except Exception as e:
@@ -707,8 +866,14 @@ class P2PNode:
         except (TypeError, ValueError):
             return 0
         if claimed > self.node.height + 100:
-            return self.node.height
+            return self.node.height + 101
         return max(0, claimed)
+
+    async def _process_message_safe(self, peer: EncryptedPeer, msg_type: int, data: bytes):
+        try:
+            await self._process_message(peer, msg_type, data)
+        except Exception as _e:
+            bootstrap.logger.error(f'[P2P] _process_message failed for {peer.address}: {_e}', exc_info=True)
 
     async def _process_message(self, peer: EncryptedPeer, msg_type: int, data: bytes):
         peer.last_seen = bootstrap.time.time()
@@ -742,10 +907,19 @@ class P2PNode:
             elif msg_type == config.MSG_GET_PEERS:
                 async with self._lock:
                     peers_list = []
+                    tunnel_list = []
                     for p in self.peers.values():
+                        if getattr(p, 'transport', 'tcp') == 'ws':
+                            if getattr(p, 'p2p_ws', ''):
+                                tunnel_list.append({'host': parse_ip_port(p.address)[0], 'p2p_ws': p.p2p_ws, 'height': int(getattr(p, 'height', 0) or 0)})
+                            continue
                         h = parse_ip_port(p.address)[0]
                         peers_list.append(f'[{h}]:{p.p2p_port}' if ':' in str(h) else f'{h}:{p.p2p_port}')
-                payload = bootstrap.json.dumps({'peers': peers_list[:100]}).encode()
+                    for _tp in list(self._registry_tunnel_peers):
+                        _pw = str(_tp.get('p2p_ws') or '')
+                        if _pw and all((_pw != str(_t.get('p2p_ws') or '') for _t in tunnel_list)):
+                            tunnel_list.append({'host': str(_tp.get('host') or ''), 'ws_url': str(_tp.get('ws_url') or ''), 'p2p_ws': _pw, 'height': _tp.get('height')})
+                payload = bootstrap.json.dumps({'peers': peers_list[:100], 'tunnel_peers': tunnel_list[:100]}).encode()
                 await self._send_message(peer, config.MSG_PEERS, payload)
             elif msg_type == config.MSG_PEERS:
                 try:
@@ -763,6 +937,20 @@ class P2PNode:
                                 break
                             _spawned += 1
                             self._track_task(bootstrap.asyncio.create_task(self._connect_to_peer(addr)))
+                    for _tp in data_json.get('tunnel_peers', []) or []:
+                        if not isinstance(_tp, dict):
+                            continue
+                        _pw = str(_tp.get('p2p_ws') or '')
+                        if not _pw:
+                            _wu = str(_tp.get('ws_url') or '')
+                            _pw = _p2p_ws_from_ws_url(_wu) if _wu else ''
+                        if not _pw or _pw in _seen_eps:
+                            continue
+                        _seen_eps.add(_pw)
+                        if _spawned >= 32:
+                            break
+                        _spawned += 1
+                        self._track_task(bootstrap.asyncio.create_task(self._connect_to_peer_ws(_pw)))
                 except Exception as e:
                     bootstrap.logger.debug(f'[P2P] MSG_PEERS error from {peer.address}: {e}')
             elif msg_type == config.MSG_GET_BLOCKS:
@@ -797,6 +985,8 @@ class P2PNode:
                                 _ids = []
                             if not _ids or min(_ids) < hist_start or max(_ids) > hist_end:
                                 hist_fut = None
+                    _r35_ids = [int(b.get('id', -1)) for b in blocks if isinstance(b, dict)]
+                    bootstrap.logger.info(f'[R35] MSG_BLOCKS from {peer.address}: {len(blocks)} blocks ids={_r35_ids} received; importing')
                     if hist_fut is not None:
                         hist_fut.set_result(blocks)
                     else:
@@ -826,8 +1016,17 @@ class P2PNode:
                         pass
                     if not self._mark_seen_block(str(block_data.get('hash', ''))):
                         return
+                    _bh = str(block_data.get('hash', ''))
+                    _rej_until = self._rejected_block_hashes.get(_bh, 0.0)
+                    if _rej_until and bootstrap.time.time() < _rej_until:
+                        return
+                    bootstrap.logger.info(f'[R35] MSG_NEW_BLOCK from {peer.address}: block {block_data.get('id')} hash={str(block_data.get('hash', ''))[:16]} received')
                     _status = await self.node.receive_block(block_data)
+                    if _status == 'ok':
+                        self._update_reputation(peer, 'valid_block')
                     if _status == 'rejected':
+                        self._update_reputation(peer, 'invalid_block')
+                        self._rejected_block_hashes[str(block_data.get('hash', ''))] = bootstrap.time.time() + 60.0
                         self._unmark_seen_block(str(block_data.get('hash', '')))
                     if _status == 'ok':
                         bootstrap.asyncio.create_task(self.broadcast_block(block_data, force=True))
@@ -919,7 +1118,7 @@ class P2PNode:
                                     bootstrap.logger.warning(f'[Sync] Snapshot at height {tip2}: cached root {root[:16]}... != tip state_root {str(latest2.get('state_root', ''))[:16]}... — refusing to serve')
                                 else:
                                     genesis_row = await self.node.block_repo.get_by_id(0)
-                                    genesis_hash = genesis_row['hash'] if genesis_row else getattr(self.node, 'genesis_hash', '') or ''
+                                    genesis_hash = genesis_row['hash'] if genesis_row else getattr(self.node, 'genesis_hash', '') or genesis._node_genesis_hash or ''
                                     resp = {'height': tip2, 'genesis_hash': genesis_hash, 'state_root': root, 'snapshot': snapshot, 'tip_block': latest2}
                                     payload = bootstrap.json.dumps(resp).encode()
                                     if len(payload) >= 4000000:
@@ -1064,7 +1263,7 @@ class P2PNode:
                     try:
                         encrypted = peer.encrypt_message(plaintext)
                         peer.writer.write(bootstrap.struct.pack('>I', len(encrypted)) + encrypted)
-                        await peer.writer.drain()
+                        await bootstrap.asyncio.wait_for(peer.writer.drain(), timeout=10)
                         self._metrics['messages_sent'] += 1
                         self._metrics['bytes_sent'] += len(plaintext)
                     except (ConnectionResetError, BrokenPipeError, OSError) as e:
@@ -1090,7 +1289,6 @@ class P2PNode:
             peer.send_queue.put_nowait((prio, peer._send_counter, msg_type, payload))
         except bootstrap.asyncio.QueueFull:
             bootstrap.logger.debug(f'[P2P] Send queue full for {peer.address}, dropping type={msg_type}')
-            self._update_reputation(peer, 'invalid_message')
 
     async def broadcast_message(self, msg_type: int, payload: bytes, exclude: bootstrap.Set[str]=None):
         if exclude is None:
@@ -1118,8 +1316,7 @@ class P2PNode:
         cutoff = now - window
         self.peer_message_counts[addr][msg_type] = [ts for ts in self.peer_message_counts[addr][msg_type] if ts > cutoff]
         if len(self.peer_message_counts[addr][msg_type]) >= limit:
-            self._update_reputation(peer, 'invalid_message')
-            bootstrap.logger.warning(f'[P2P] Rate limit exceeded: {addr} msg_type={msg_type}')
+            bootstrap.logger.debug(f'[P2P] Rate limit exceeded: {addr} msg_type={msg_type}')
             return False
         self.peer_message_counts[addr][msg_type].append(now)
         return True
@@ -1234,6 +1431,17 @@ class P2PNode:
                         return False
                     for _ep in payload['peers']:
                         if not isinstance(_ep, str) or len(_ep) > 256 or (not _ep):
+                            return False
+                if 'tunnel_peers' in payload:
+                    if not isinstance(payload['tunnel_peers'], list) or len(payload['tunnel_peers']) > 128:
+                        return False
+                    for _tp in payload['tunnel_peers']:
+                        if not isinstance(_tp, dict):
+                            return False
+                        _pw = str(_tp.get('p2p_ws') or _tp.get('ws_url') or '')
+                        if not _pw or len(_pw) > 512:
+                            return False
+                        if 'height' in _tp and _tp.get('height') is not None and (not isinstance(_tp.get('height'), int)):
                             return False
             elif msg_type == config.MSG_GET_STATUS:
                 if not data or data == b'{}':
@@ -1393,7 +1601,7 @@ class P2PNode:
     async def rebroadcast_block_later(self, block_data: dict, delay: float):
         try:
             await bootstrap.asyncio.sleep(delay)
-            await self.broadcast_block(block_data, force=True)
+            await self.broadcast_block(block_data, force=False)
         except Exception:
             pass
 
@@ -1413,7 +1621,7 @@ class P2PNode:
 
     def _ban_peer(self, address: str, reason: str, node_id: bootstrap.Optional[str]=None):
         h, _ = parse_ip_port(address)
-        if h == config.GENESIS_NODE_HOST or any((h in b for b in self.bootstrap_nodes)):
+        if h == config.GENESIS_NODE_HOST or h in self._bootstrap_ips:
             now_ts = bootstrap.time.time()
             last_log = self._bootstrap_cooldown_log_ts.get(address, 0.0)
             if now_ts - last_log >= 60.0:
@@ -1423,12 +1631,26 @@ class P2PNode:
                 del self.peers[address]
             self.banned_peers[address] = bootstrap.time.time() + 15.0
             return
-        self.banned_peers[address] = bootstrap.time.time() + self.ban_duration
+        _now = bootstrap.time.time()
+        _already = address in self.banned_peers and _now < self.banned_peers[address]
+        if not _already:
+            self.banned_peers[address] = _now + self.ban_duration
         if node_id:
-            self.banned_node_ids[node_id] = bootstrap.time.time() + self.ban_duration
+            _nid_already = node_id in self.banned_node_ids and _now < self.banned_node_ids[node_id]
+            if not _nid_already:
+                self.banned_node_ids[node_id] = _now + self.ban_duration
+        _peer = self.peers.get(address)
+        if _peer is not None:
+            _peer.banned = True
+            try:
+                if _peer.writer is not None:
+                    _peer.writer.close()
+            except Exception:
+                pass
         if address in self.peers:
             del self.peers[address]
-        bootstrap.logger.warning(f'[P2P] Banned peer {address}{(f' (node {node_id[:16]})' if node_id else '')}: {reason}')
+        if not _already:
+            bootstrap.logger.warning(f'[P2P] Banned peer {address}{(f' (node {node_id[:16]})' if node_id else '')}: {reason}')
         try:
             exp = self.banned_peers.get(address, bootstrap.time.time() + self.ban_duration)
             bootstrap.asyncio.get_running_loop().create_task(self.peer_ban_repo.upsert(address, node_id, reason, exp))
@@ -1446,6 +1668,13 @@ class P2PNode:
         now = bootstrap.time.time()
         if address and address in self.banned_peers and (now < self.banned_peers[address]):
             return True
+        if address:
+            _h, _ = parse_ip_port(address)
+            for _banned_addr, _exp in list(self.banned_peers.items()):
+                if now < _exp:
+                    _bh, _ = parse_ip_port(_banned_addr)
+                    if _bh == _h:
+                        return True
         if node_id and node_id in self.banned_node_ids and (now < self.banned_node_ids[node_id]):
             return True
         return False
@@ -1531,7 +1760,7 @@ class P2PNode:
                         sock.setsockopt(bootstrap.socket.SOL_SOCKET, bootstrap.socket.SO_KEEPALIVE, 1)
                     except Exception:
                         pass
-                is_bootstrap = any((addr == b for b in self.bootstrap_nodes)) or any((h == parse_ip_port(b, config.P2P_PORT)[0] for b in self.dns_seeds)) or h == self.genesis_node
+                is_bootstrap = h in self._bootstrap_ips or h == self.genesis_node
                 peer = await bootstrap.asyncio.wait_for(perform_handshake(reader, writer, self.node.node_id, self.node.height, config.VERSION, self.node.priv, self.node.pub, allow_genesis_learn=self.node.height == 0), timeout=10.0)
             if peer is None:
                 writer.close()
@@ -1573,7 +1802,7 @@ class P2PNode:
                             del self.peers[_old.address]
                 peer_ip = h
                 ip_conns = self._conn_per_ip.get(peer_ip, 0)
-                is_bootstrap = any((peer_ip in b for b in self.bootstrap_nodes)) or peer_ip == self.genesis_node
+                is_bootstrap = peer_ip in self._bootstrap_ips or peer_ip == self.genesis_node
                 if not is_bootstrap and ip_conns >= self._max_conn_per_ip:
                     bootstrap.logger.info(f'[P2P] Rejecting outbound peer {addr}: per-IP cap ({ip_conns}/{self._max_conn_per_ip})')
                     writer.close()
@@ -1638,6 +1867,240 @@ class P2PNode:
         except Exception:
             bootstrap.logger.debug(msg)
 
+    def _resolve_tunnel_host(self, p2p_cfg) -> str:
+        try:
+            for _src in (p2p_cfg.get('tunnel_host', ''), (getattr(self.node, 'config', {}) or {}).get('node', {}).get('tunnel_host', ''), bootstrap.os.environ.get('MCX_TUNNEL_HOST', '')):
+                if _src and str(_src).strip():
+                    return str(_src).strip().lower()
+        except Exception:
+            pass
+        try:
+            with open(bootstrap.os.path.join(bootstrap.os.getcwd(), 'munex_tunnel.json'), 'r', encoding='utf-8') as _fh:
+                _st = bootstrap.json.load(_fh)
+            if isinstance(_st, dict):
+                for _key in ('hosts', 'hostnames'):
+                    _m = _st.get(_key)
+                    if isinstance(_m, dict) and str(_m.get('8080') or '').strip():
+                        return str(_m.get('8080')).strip().lower()
+        except Exception:
+            pass
+        return ''
+
+    async def _ws_dial_allowed(self, host: str):
+        try:
+            bootstrap.ipaddress.ip_address(host)
+            _ips = [host]
+        except ValueError:
+            try:
+                loop = bootstrap.asyncio.get_running_loop()
+                _res = await loop.run_in_executor(None, bootstrap.socket.gethostbyname_ex, host)
+                _ips = list(_res[2]) if isinstance(_res, tuple) else list(_res)
+            except Exception:
+                return (False, f'unresolvable host {host}')
+            if not _ips:
+                return (False, f'unresolvable host {host}')
+        for _ip in _ips:
+            if _ssrf_ip_blocked(_ip):
+                if self.allow_private_peers and _lan_dialable(_ip):
+                    return (True, 'private-lan')
+                continue
+            return (True, 'public')
+        return (False, f'no dialable address for {host}')
+
+    def _is_ws_peer_connected(self, ws_url: str) -> bool:
+        for p in list(self.peers.values()):
+            if getattr(p, 'transport', 'tcp') == 'ws' and getattr(p, 'p2p_ws', '') == ws_url:
+                return True
+        return False
+
+    async def _register_ws_peer(self, peer: EncryptedPeer, direction: str) -> bool:
+        if peer.node_id == self.node.node_id:
+            bootstrap.logger.debug(f'[P2P-WS] Rejecting self-connection via WS {peer.p2p_ws}')
+            self._dial_backoff[peer.p2p_ws] = bootstrap.time.time() + 86400.0
+            return False
+        if self._is_banned(node_id=peer.node_id) or self._is_banned(address=peer.address):
+            bootstrap.logger.info(f'[P2P-WS] Rejecting WS peer {peer.address}: banned')
+            return False
+        async with self._lock:
+            existing = [p for p in self.peers.values() if p.node_id == peer.node_id]
+            if existing:
+                _lb = parse_ip_port(peer.address, config.P2P_PORT)[0] in ('127.0.0.1', 'localhost', '::1')
+                if _dial_dup_action(self.node.node_id, peer.node_id, direction, _lb, True) != 'replace_existing':
+                    bootstrap.logger.debug(f'[P2P-WS] Already connected to node {peer.node_id[:16]}, closing WS duplicate')
+                    return False
+                bootstrap.logger.debug(f'[P2P-WS] DIAL-KEEPER-1 replacing duplicate socket to node {peer.node_id[:16]} with WS keeper')
+                for _old in existing:
+                    try:
+                        if _old.writer is not None:
+                            _old.writer.close()
+                    except Exception:
+                        pass
+                    if self.peers.get(_old.address) is _old:
+                        del self.peers[_old.address]
+            peer_ip = parse_ip_port(peer.address, config.P2P_PORT)[0]
+            ip_conns = self._conn_per_ip.get(peer_ip, 0)
+            is_bootstrap = peer_ip in self._bootstrap_ips or peer_ip == self.genesis_node
+            if not is_bootstrap and ip_conns >= self._max_conn_per_ip:
+                bootstrap.logger.info(f'[P2P-WS] Rejecting WS peer {peer.address}: per-IP cap ({ip_conns}/{self._max_conn_per_ip})')
+                return False
+            if not self._track_peer_subnet(peer):
+                bootstrap.logger.info(f'[P2P-WS] Rejecting WS peer {peer.address}: subnet diversity cap reached')
+                return False
+            self._conn_per_ip[peer_ip] = ip_conns + 1
+            if len(self.peers) >= self.max_peers:
+                oldest = min(self.peers.values(), key=lambda p: p.last_seen)
+                try:
+                    if oldest.writer is not None:
+                        oldest.writer.close()
+                except Exception as _ev_e:
+                    bootstrap.logger.debug(f'[P2P-WS] evict close failed for {oldest.address}: {_ev_e}')
+                del self.peers[oldest.address]
+            self.peers[peer.address] = peer
+            self._metrics['connections'] += 1
+            self._metrics['peers_discovered'] += 1
+            self._dial_note_result(peer.p2p_ws, True)
+        self._track_task(bootstrap.asyncio.create_task(self._send_message(peer, config.MSG_GET_STATUS, b'{}')))
+        self.tip_push(peer)
+        self._track_task(bootstrap.asyncio.create_task(self._peer_loop(peer)))
+        return True
+
+    async def _connect_to_peer_ws(self, ws_url: str):
+        ws_url = str(ws_url or '').strip()
+        if not ws_url:
+            return
+        if '://' not in ws_url:
+            ws_url = 'ws://' + ws_url.strip('/') + '/p2p'
+        try:
+            _u = bootstrap.urlparse(ws_url)
+        except Exception:
+            return
+        if _u.scheme not in ('ws', 'wss'):
+            bootstrap.logger.info(f'[P2P-WS] Refusing dial {ws_url}: scheme must be ws/wss')
+            return
+        if not _u.hostname:
+            return
+        if self._is_ws_peer_connected(ws_url):
+            return
+        try:
+            if bootstrap.time.time() < float(self._dial_backoff.get(ws_url, 0.0)):
+                return
+        except (TypeError, ValueError, AttributeError):
+            pass
+        _host = _u.hostname
+        _port = _u.port or (443 if _u.scheme == 'wss' else 80)
+        _self_hit = False
+        try:
+            _own_ws = int(self.node.config.get('node', {}).get('ws_port', config.WS_PORT))
+            if _port == _own_ws:
+                _ips = bootstrap.socket.gethostbyname_ex(_host)[2]
+                if set(_ips) & set(self._local_ips):
+                    _self_hit = True
+        except Exception:
+            _self_hit = False
+        if _self_hit:
+            bootstrap.logger.debug(f'[P2P-WS] Skipping {ws_url}: it is this node')
+            self._dial_backoff[ws_url] = bootstrap.time.time() + 86400.0
+            return
+        _ok, _why = await self._ws_dial_allowed(_host)
+        if not _ok:
+            bootstrap.logger.info(f'[P2P-WS] R4-ssrf-filter: refusing dial {ws_url}: {_why}')
+            return
+        bootstrap.logger.info(f'[P2P-WS] Attempting WS connection to {ws_url}')
+        session = None
+        ws = None
+        try:
+            async with self._dial_sem:
+                session = bootstrap.aiohttp.ClientSession()
+                try:
+                    ws = await bootstrap.asyncio.wait_for(session.ws_connect(ws_url, heartbeat=30, timeout=bootstrap.aiohttp.ClientTimeout(total=10)), timeout=12.0)
+                except Exception:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
+                    raise
+                reader = _WSByteReader()
+                writer = _WSByteWriter(ws.send_bytes, _ws_client_close(ws, session), (_host, _port))
+                pump_task = self._track_task(bootstrap.asyncio.create_task(_pump_ws_into_reader(ws, reader)))
+                try:
+                    peer = await bootstrap.asyncio.wait_for(perform_handshake(reader, writer, self.node.node_id, self.node.height, config.VERSION, self.node.priv, self.node.pub, allow_genesis_learn=self.node.height == 0), timeout=10.0)
+                except Exception:
+                    peer = None
+                if peer is None:
+                    pump_task.cancel()
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    self._dial_note_result(ws_url, False)
+                    return
+            peer.transport = 'ws'
+            peer.p2p_ws = ws_url
+            if not await self._register_ws_peer(peer, 'out'):
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
+            bootstrap.logger.info(f'[P2P-WS] Connected to peer: {peer.address} (node {peer.node_id[:16]}) via WS {ws_url}')
+        except Exception as e:
+            _wait = self._dial_note_result(ws_url, False)
+            self._dial_log_failure(ws_url, f'[P2P-WS] Failed to connect to {ws_url}: {type(e).__name__}: {e} (retry in {_wait:.0f}s)')
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            if session is not None:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+
+    async def _dial_tunnel_peers(self):
+        todo = []
+        seen = set()
+        for tp in list(self._registry_tunnel_peers):
+            if not isinstance(tp, dict):
+                continue
+            url = str(tp.get('p2p_ws') or '')
+            if not url:
+                url = _p2p_ws_from_ws_url(str(tp.get('ws_url') or ''))
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            if self._is_ws_peer_connected(url):
+                continue
+            try:
+                if bootstrap.time.time() < float(self._dial_backoff.get(url, 0.0)):
+                    continue
+            except (TypeError, ValueError, AttributeError):
+                pass
+            todo.append(url)
+        if todo:
+            await bootstrap.asyncio.gather(*[self._connect_to_peer_ws(u) for u in todo], return_exceptions=True)
+
+    async def _maybe_reregister_tunnel(self):
+        host = getattr(self, '_tunnel_host', '')
+        if not host:
+            return
+        now = bootstrap.time.time()
+        if now - float(getattr(self, '_tunnel_last_register', 0.0)) < self.registry_interval:
+            return
+        self._tunnel_last_register = now
+        try:
+            loop = bootstrap.asyncio.get_running_loop()
+            ok, status, body = await loop.run_in_executor(None, lambda: tunnel.tunnel_register_host(host, self.registry_url, height=int(self.node.height)))
+        except Exception as e:
+            bootstrap.logger.debug(f'[TUNNEL] re-register {host} failed: {e}')
+            return
+        if ok:
+            bootstrap.logger.debug(f'[TUNNEL] re-registered {host} height={self.node.height} (status {status})')
+        else:
+            bootstrap.logger.info(f'[TUNNEL] re-register {host} failed (status {status}): {str(body)[:200]}')
+
     def _fetch_registry_peers_sync(self):
         req = bootstrap.urllib.request.Request(self.registry_url, headers={'User-Agent': 'munex-node/11', 'Accept': 'application/json'})
         try:
@@ -1657,9 +2120,16 @@ class P2PNode:
                 if n.get('tunnel'):
                     host = str(n.get('host') or '').strip().lower()
                     ws_url = str(n.get('ws_url') or '').strip()
+                    p2p_ws = str(n.get('p2p_ws') or '').strip()
+                    if not p2p_ws and ws_url:
+                        p2p_ws = _p2p_ws_from_ws_url(ws_url)
+                    try:
+                        _h = int(n.get('height')) if n.get('height') is not None else None
+                    except (TypeError, ValueError):
+                        _h = None
                     if host:
-                        tunnel_peers.append({'host': host, 'ws_url': ws_url})
-                        bootstrap.logger.info(f'[REGISTRY] tunnel peer {host} (WS-only, not P2P-dialled)')
+                        tunnel_peers.append({'host': host, 'ws_url': ws_url, 'p2p_ws': p2p_ws, 'height': _h})
+                        bootstrap.logger.info(f'[REGISTRY] tunnel peer {host} (WS P2P via {p2p_ws or 'ws_url /p2p fallback'})')
                     continue
                 p2p = n.get('p2p') or ''
                 host, port = parse_ip_port(str(p2p), config.P2P_PORT)
@@ -1809,31 +2279,30 @@ class P2PNode:
         except Exception as e:
             bootstrap.logger.error(f'[DHT] DHT failed: {e}')
 
+    async def _dial_addrs(self, addrs):
+        _todo = []
+        _seen = set()
+        for _a in addrs:
+            if _a and _a not in _seen:
+                _seen.add(_a)
+                if not self._is_peer_connected(_a) and (not self._is_banned(address=_a)):
+                    _todo.append(_a)
+        if _todo:
+            await bootstrap.asyncio.gather(*[self._connect_to_peer(_a) for _a in _todo], return_exceptions=True)
+
     async def _discovery_loop(self):
         while not self._discovery_stop.is_set():
             registry_peers = await self._fetch_registry_peers()
-            for addr in registry_peers:
-                if not self._is_peer_connected(addr) and (not self._is_banned(address=addr)):
-                    await self._connect_to_peer(addr)
-                    if len(self.peers) >= self.max_peers:
-                        break
+            await self._dial_addrs(registry_peers)
+            await self._dial_tunnel_peers()
+            await self._maybe_reregister_tunnel()
             dns_peers = await self._resolve_dns_seeds()
-            for addr in dns_peers:
-                if not self._is_peer_connected(addr) and (not self._is_banned(address=addr)):
-                    await self._connect_to_peer(addr)
-                    if len(self.peers) >= self.max_peers:
-                        break
-            for addr in self.bootstrap_nodes:
-                if not self._is_peer_connected(addr) and (not self._is_banned(address=addr)):
-                    await self._connect_to_peer(addr)
+            await self._dial_addrs(dns_peers)
+            await self._dial_addrs(self.bootstrap_nodes)
             cached = util.load_peers_from_cache()
-            for addr in cached:
-                if not self._is_peer_connected(addr) and (not self._is_banned(address=addr)):
-                    await self._connect_to_peer(addr)
+            await self._dial_addrs(cached)
             if len(self.peers) < 3 and self.fallback_nodes:
-                for addr in self.fallback_nodes:
-                    if not self._is_peer_connected(addr) and (not self._is_banned(address=addr)):
-                        await self._connect_to_peer(addr)
+                await self._dial_addrs(self.fallback_nodes)
             async with self._lock:
                 peers_copy = list(self.peers.values())
             for peer in peers_copy:
@@ -2125,7 +2594,7 @@ class P2PNode:
                     await db.execute_dml(_ins('svf_profiles', ['token_address', 'chain_id', 'runtime_code_hash', 'template_id', 'profile_schema_version', 'canonical_profile_bytes', 'profile_hash', 'registrant', 'registration_tx_hash', 'registration_block_height', 'effective_epoch', 'status']), tok, int(reg.get('chain_id', config.CHAIN_ID)), '', '', svf.SVF_PROFILE_SCHEMA_VERSION, canonical.hex(), phash, '', '', 0, 0, 'ACTIVE')
                 await db.execute_dml('DELETE FROM svf_epoch_roots')
                 for epoch_id, e in svfepochs.items():
-                    await db.execute_dml(_ins('svf_epoch_roots', ['epoch_id', 'root_hash', 'record_count', 'complete']), int(epoch_id), e.get('root_hash', ''), int(e.get('record_count', 0)), 1 if int(e.get('record_count', 0)) == svf.SVF_EPOCH_BLOCKS else 0)
+                    await db.execute_dml(_ins('svf_epoch_roots', ['epoch_id', 'root_hash', 'record_count', 'complete']), int(epoch_id), e.get('root', ''), int(e.get('count', 0)), 1 if int(e.get('count', 0)) == svf.SVF_EPOCH_BLOCKS else 0)
                 await db.execute_dml('DELETE FROM svf_certificates')
                 for epoch_id, c in svfcerts.items():
                     ep = int(epoch_id)
@@ -2203,7 +2672,13 @@ class P2PNode:
                 except Exception:
                     pass
             return False
-        ok = await self.node.verify_block_proof(tip)
+        _snap_att = {k[8:]: int(v.get('last_size', 5)) for k, v in (snapshot or {}).items() if isinstance(k, str) and k.startswith('mazeatt:') and isinstance(v, dict)}
+        _pw0 = bootstrap.time.time()
+        await self.node.consensus._prewarm_mazes(self.node.consensus._maze_keys_for_block(tip))
+        bootstrap.logger.info(f'[Verify] pre-warm snapshot tip block {H}: {bootstrap.time.time() - _pw0:.1f}s')
+        _tv0 = bootstrap.time.time()
+        ok = await self.node.verify_block_proof(tip, _snap_att=_snap_att)
+        bootstrap.logger.info(f'[Sync] tip verify block {H} took {bootstrap.time.time() - _tv0:.1f}s')
         if not ok:
             bootstrap.logger.warning(f'[Sync] Snapshot sync rejected: tip block {H} failed verify_block_proof')
             for bid in added:
@@ -2222,6 +2697,66 @@ class P2PNode:
                 except Exception:
                     pass
             return False
+        _tip_att = tip.get('maze_attestation') if isinstance(tip, dict) else None
+        if isinstance(_tip_att, dict) and _tip_att.get('maze_id') and (_tip_att.get('size') is not None) and (H > 0):
+            try:
+                await self.node.maze_attestation_repo.upsert({'maze_id': str(_tip_att['maze_id']), 'last_size': int(_tip_att['size']), 'last_block': H, 'last_block_hash': str(tip.get('hash', '')), 'pubkey': str(_tip_att.get('pubkey', ''))})
+            except Exception as _e:
+                bootstrap.logger.warning(f'[Sync] Snapshot tip attestation upsert failed for block {H}: {_e}')
+        try:
+            await self.node.network_state_repo.set('genesis_alloc_applied', '1')
+            _tot = 0
+            _brows = await self.node.db.fetch('SELECT bal FROM balances')
+            for _br in _brows or []:
+                try:
+                    _tot += int(_br['bal'])
+                except Exception:
+                    continue
+            _burned = await self.node.network_state_repo.get('burned_total')
+            if _burned:
+                try:
+                    _tot += int(_burned)
+                except Exception:
+                    pass
+            try:
+                _burned_i = int(_burned) if _burned else 0
+            except Exception:
+                _burned_i = 0
+            await self.node.network_state_repo.set('burned_total', str(_burned_i))
+            await self.node.network_state_repo.set('total_minted', str(_tot))
+            self.node.total_minted = _tot
+            bootstrap.logger.info(f'[Sync] Snapshot genesis alloc marked applied; total_minted recomputed to {_tot // config.SUBS} MCX')
+        except Exception as _e:
+            bootstrap.logger.warning(f'[Sync] Snapshot genesis marker/total_minted recompute failed: {_e}')
+        try:
+            _ev_n = 0
+            _ev_skip = 0
+            _ev_start = max(1, H - maze.SNAPSHOT_WINDOW + 1)
+            for _hid in range(_ev_start, H + 1):
+                _hb = await self.node.block_repo.get_by_id(_hid)
+                if not isinstance(_hb, dict):
+                    continue
+                try:
+                    _ev = svf.compute_block_evidence(_hb, _hid)
+                except svf.SVFReject:
+                    _ev_skip += 1
+                    continue
+                except Exception as _ee:
+                    bootstrap.logger.warning(f'[Sync] Snapshot SVF evidence rebuild: block {_hid} extraction failed: {_ee}')
+                    continue
+                _ev_epoch = _hid // svf.SVF_EPOCH_BLOCKS
+                _ev_rec = {'epoch_id': _ev_epoch, 'height': _ev.block_id, 'block_hash': _ev.block_hash, 'winner_pubkey': _ev.winner_pubkey, 'attested_size': _ev.attested_size, 'attestation_weight': str(_ev.attestation_weight), 'growth_present': 1 if _ev.growth_present else 0, 'record_hash': _ev.record_hash.hex()}
+                try:
+                    if self.node.db.db_type == 'sqlite':
+                        await self.node.db.execute_dml('INSERT OR REPLACE INTO svf_evidence (epoch_id, height, block_hash, winner_pubkey, attested_size, attestation_weight, growth_present, record_hash) VALUES (?,?,?,?,?,?,?,?)', _ev_rec['epoch_id'], _ev_rec['height'], _ev_rec['block_hash'], _ev_rec['winner_pubkey'], _ev_rec['attested_size'], _ev_rec['attestation_weight'], _ev_rec['growth_present'], _ev_rec['record_hash'])
+                    else:
+                        await self.node.db.execute_dml('INSERT INTO svf_evidence (epoch_id, height, block_hash, winner_pubkey, attested_size, attestation_weight, growth_present, record_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (epoch_id, height) DO UPDATE SET block_hash=$3, winner_pubkey=$4, attested_size=$5, attestation_weight=$6, growth_present=$7, record_hash=$8', _ev_rec['epoch_id'], _ev_rec['height'], _ev_rec['block_hash'], _ev_rec['winner_pubkey'], _ev_rec['attested_size'], _ev_rec['attestation_weight'], _ev_rec['growth_present'], _ev_rec['record_hash'])
+                    _ev_n += 1
+                except Exception as _ee:
+                    bootstrap.logger.warning(f'[Sync] Snapshot SVF evidence rebuild: persist failed for block {_hid}: {_ee}')
+            bootstrap.logger.info(f'[Sync] Snapshot SVF evidence rebuilt: {_ev_n} records persisted, {_ev_skip} skipped (no evidence)')
+        except Exception as _e:
+            bootstrap.logger.warning(f'[Sync] Snapshot SVF evidence rebuild failed: {_e}')
         await self.node._load_state()
         bootstrap.logger.info(f'[Sync] Snapshot sync complete: height={self.node.height} (tip block {H}), state root verified, last {maze.SNAPSHOT_WINDOW} blocks present. This node is PRUNED (no full history).')
         return True
@@ -2242,7 +2777,7 @@ class P2PNode:
         self._snapshot_sync_running = True
         try:
             self._snapshot_last_attempt = now
-            ordered = sorted(peer_list, key=lambda p: -p.height)
+            ordered = sorted(self._alive_peers(peer_list), key=lambda p: (-p.height, p.address))
             seen = set()
             for peer in ordered:
                 if peer.address in seen:
@@ -2256,8 +2791,8 @@ class P2PNode:
                 reason = await self._verify_snapshot_response(resp, peer_list)
                 if reason is not None:
                     self._snapshot_consec_failures += 1
-                    bootstrap.logger.warning(f'[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — will retry snapshot sync next cycle')
-                    return False
+                    bootstrap.logger.warning(f'[Sync] Snapshot sync REJECTED from {peer.address}: {reason} — trying next peer')
+                    continue
                 if await self._apply_snapshot_response(resp, peer):
                     self._snapshot_consec_failures = 0
                     return True
@@ -2309,6 +2844,10 @@ class P2PNode:
         bootstrap.logger.warning(f'[Sync] No majority agreement on latest checkpoint among {len(responses)} peers — falling back to single-peer sync.')
         return None
 
+    def _r37_import_in_flight(self):
+        _lock = getattr(self.node, '_import_lock', None)
+        return _lock is not None and _lock.locked()
+
     async def _sync_loop(self):
         while not self._discovery_stop.is_set():
             await bootstrap.asyncio.sleep(config.SYNC_INTERVAL)
@@ -2333,11 +2872,6 @@ class P2PNode:
             if gap <= maze.SNAPSHOT_SYNC_THRESHOLD:
                 self._snapshot_consec_failures = 0
             bootstrap.logger.info(f'[P2P] Syncing from {best_peer.address}: local={self.node.height}, remote={best_height}')
-            if gap > config.CHECKPOINT_SYNC_THRESHOLD:
-                sample_peers = sorted(peer_list, key=lambda p: -p.height)[:5]
-                checkpoint = await self._request_checkpoints(sample_peers)
-                if checkpoint:
-                    bootstrap.logger.info(f'[Sync] Quorum-agreed checkpoint at block {checkpoint['block_id']} — anchoring catch-up sync on it')
             if self.node.height == 0 or gap > maze.SNAPSHOT_SYNC_THRESHOLD:
                 if await self._try_snapshot_sync(best_peer, peer_list):
                     bootstrap.logger.info('[Sync] Snapshot sync succeeded — resuming normal sync from the new tip')
@@ -2353,21 +2887,50 @@ class P2PNode:
                 end = min(best_height, start + config.SYNC_BATCH_BLOCKS - 1)
                 payload = bootstrap.json.dumps({'start': start, 'end': end}).encode()
                 await self._send_message(best_peer, config.MSG_GET_BLOCKS, payload)
+                _r37_deferred = 0.0
+                _r37_defer_logged = False
                 waited = 0.0
-                while self.node.height <= start and waited < 8.0:
+                while self.node.height <= start and waited < 8.0 and (_r37_deferred < maze._R37_SYNC_IMPORT_DEFER_CAP_S):
+                    _r37_t0 = bootstrap.time.monotonic()
                     await bootstrap.asyncio.sleep(0.25)
-                    waited += 0.25
+                    _r37_dt = bootstrap.time.monotonic() - _r37_t0
+                    if self._r37_import_in_flight():
+                        _r37_deferred += _r37_dt
+                        if not _r37_defer_logged:
+                            _r37_defer_logged = True
+                            bootstrap.logger.info(f'[R37] sync patience: import in flight for [{start},{end}) (holder={getattr(self.node, '_import_lock_holder', None)}) - lock-held time does not count toward the snapshot budget (cap {maze._R37_SYNC_IMPORT_DEFER_CAP_S:.0f}s)')
+                    else:
+                        waited += 0.25
+                if _r37_deferred >= maze._R37_SYNC_IMPORT_DEFER_CAP_S:
+                    bootstrap.logger.warning(f'[R37] sync patience: import in flight for [{start},{end}) held the lock {_r37_deferred:.0f}s (cap reached) - treating the stall as genuine, snapshot fallback proceeds')
                 if self.node.height <= start and (not rewound_this_stall):
                     rewound_this_stall = True
                     rewind_start = max(0, start - 100)
-                    bootstrap.logger.info(f'[Sync] No progress on [{start},{end}); rewinding fetch to [{rewind_start},{end}) to locate fork point')
-                    payload = bootstrap.json.dumps({'start': rewind_start, 'end': end}).encode()
-                    await self._send_message(best_peer, config.MSG_GET_BLOCKS, payload)
-                    waited = 0.0
-                    while self.node.height <= start and waited < 30.0:
-                        await bootstrap.asyncio.sleep(0.25)
-                        waited += 0.25
+                    bootstrap.logger.info(f'[Sync] No progress on [{start},{end}); rewinding fetch to [{rewind_start},{end}) in SYNC_BATCH_BLOCKS chunks to locate fork point')
+                    _rw = rewind_start
+                    _rw_waited = 0.0
+                    while _rw <= end and self.node.height <= start and (_rw_waited < 30.0) and (_r37_deferred < maze._R37_SYNC_IMPORT_DEFER_CAP_S):
+                        _chunk_end = min(end, _rw + config.SYNC_BATCH_BLOCKS - 1)
+                        payload = bootstrap.json.dumps({'start': _rw, 'end': _chunk_end}).encode()
+                        await self._send_message(best_peer, config.MSG_GET_BLOCKS, payload)
+                        _cw = 0.0
+                        while self.node.height <= start and _cw < 8.0 and (_rw_waited < 30.0) and (_r37_deferred < maze._R37_SYNC_IMPORT_DEFER_CAP_S):
+                            _r37_t0 = bootstrap.time.monotonic()
+                            await bootstrap.asyncio.sleep(0.25)
+                            _r37_dt = bootstrap.time.monotonic() - _r37_t0
+                            if self._r37_import_in_flight():
+                                _r37_deferred += _r37_dt
+                                if not _r37_defer_logged:
+                                    _r37_defer_logged = True
+                                    bootstrap.logger.info(f'[R37] sync patience: import in flight for [{start},{end}) (holder={getattr(self.node, '_import_lock_holder', None)}) - lock-held time does not count toward the snapshot budget (cap {maze._R37_SYNC_IMPORT_DEFER_CAP_S:.0f}s)')
+                            else:
+                                _cw += 0.25
+                                _rw_waited += 0.25
+                        _rw = _chunk_end + 1
                 if self.node.height <= start:
+                    if self._r37_import_in_flight() and _r37_deferred < maze._R37_SYNC_IMPORT_DEFER_CAP_S:
+                        bootstrap.logger.info(f'[R37] sync patience: import in flight for [{start},{end}) (holder={getattr(self.node, '_import_lock_holder', None)}) after rewind - deferring snapshot to next sync cycle')
+                        break
                     if await self._try_snapshot_sync(best_peer, peer_list):
                         self._stuck_cycles = 0
                         self._stuck_peer = None
@@ -2376,6 +2939,7 @@ class P2PNode:
                     self._stuck_cycles = getattr(self, '_stuck_cycles', 0) + 1
                     self._stuck_peer = best_peer.address
                     if self._stuck_cycles >= 3:
+                        self._stuck_cycles = 0
                         self._sync_paused_until = bootstrap.time.time() + config.SYNC_STUCK_TRIP_COOLDOWN
                         self.node._producing_enabled = False
                         bootstrap.logger.error(f'[Sync] Three consecutive stuck cycles — pausing GET_BLOCKS and block production for {config.SYNC_STUCK_TRIP_COOLDOWN}s (auto-retry with peer rotation; production re-enables once sync progress resumes). A restart also clears this state.')

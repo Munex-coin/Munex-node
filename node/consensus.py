@@ -80,8 +80,17 @@ class PoSWConsensus:
         self._ghost_frozen_target: bootstrap.Dict[str, bootstrap.Tuple[int, int, int]] = {}
         self._ghost_cycle: bootstrap.Dict[str, list] = {}
         self._ghost_cycle_idx: bootstrap.Dict[str, int] = {}
+        self._ghost_step_nonce: bootstrap.Dict[str, int] = {}
+        self._restart_tasks: bootstrap.Dict[str, bootstrap.asyncio.Task] = {}
+        self._maze_gen_lock = bootstrap.threading.Lock()
+        self._maze_gen_inflight: bootstrap.Dict[tuple, bootstrap.threading.Event] = {}
+        self._ghost_step_tasks: bootstrap.Dict[str, bootstrap.asyncio.Task] = {}
+        self._ghost_step_lock_skips: bootstrap.Dict[str, int] = {}
         self._maze_cache: bootstrap.OrderedDict = bootstrap.OrderedDict()
         self._maze_cache_max = 256
+        self._maze_pool = None
+        self._prewarm_inflight: bootstrap.Dict[tuple, bootstrap.asyncio.Future] = {}
+        self._prewarm_tasks: set = set()
         self._global_avg_size: float = 5.0
         self._lottery_commits: bootstrap.Dict[int, bootstrap.Dict[str, str]] = {}
         self._lottery_reveals: bootstrap.Dict[int, bootstrap.Dict[str, str]] = {}
@@ -229,118 +238,48 @@ class PoSWConsensus:
         idx = int.from_bytes(bootstrap.eth_keccak(b'MCXPOGGOALV1' + seed_bytes), 'big') % len(open_cells)
         return open_cells[idx]
 
-    def _select_spawn(self, maze, prev_pos: bootstrap.Tuple[int, int, int], seed_bytes: bytes) -> bootstrap.Tuple[int, int, int]:
+    def _select_spawn(self, maze, prev_pos, seed_bytes: bytes) -> bootstrap.Tuple[int, int, int]:
         open_cells = _maze.Maze3DGenerator.open_cells(maze)
         if not open_cells:
             return (0, 0, 0)
-        if prev_pos in open_cells:
+        if prev_pos is not None and prev_pos in open_cells:
             return prev_pos
         return open_cells[int.from_bytes(bootstrap.eth_keccak(b'MCXPOGSPAWNV1' + seed_bytes), 'big') % len(open_cells)]
 
     def _generate_deterministic_maze(self, seed_hex: str, size: int, density_ppm: int, turb_ppm: int, block_height: int=0) -> maze.SparseMaze:
-        _size = _maze._valid_maze_size(size)
+        _size = maze._valid_maze_size(size)
         if _size is None:
             raise ValueError(f'refusing to generate maze with invalid size {size!r}')
         size = _size
         cache_key = (seed_hex, size, density_ppm, turb_ppm)
-        if cache_key in self._maze_cache:
-            self._maze_cache.move_to_end(cache_key)
-            return self._maze_cache[cache_key]
-        rng = ConsensusRng(bytes.fromhex(seed_hex))
-        density = density_ppm / 1000000.0
-        maze = [[[True] * size for _ in range(size)] for _ in range(size)]
-
-        def carve(x0, y0, z0, x1, y1, z1):
-            width, depth, height = (x1 - x0, y1 - y0, z1 - z0)
-            if min(width, depth, height) <= 2:
-                for z in range(z0, z1):
-                    for y in range(y0, y1):
-                        for x in range(x0, x1):
-                            maze[z][y][x] = False
-                return
-            axis = 0
-            max_dim = width
-            if depth > max_dim:
-                axis = 1
-                max_dim = depth
-            if height > max_dim:
-                axis = 2
-            bounds = [(x0, x1), (y0, y1), (z0, z1)]
-            low, high = bounds[axis]
-            split = rng.randbelow(high - low - 2) + low + 1
-            bounds_a = [list(b) for b in bounds]
-            bounds_b = [list(b) for b in bounds]
-            bounds_a[axis][1] = split
-            bounds_b[axis][0] = split + 1
-            carve(bounds_a[0][0], bounds_a[1][0], bounds_a[2][0], bounds_a[0][1], bounds_a[1][1], bounds_a[2][1])
-            carve(bounds_b[0][0], bounds_b[1][0], bounds_b[2][0], bounds_b[0][1], bounds_b[1][1], bounds_b[2][1])
-            px = rng.randbelow(x1 - x0) + x0
-            py = rng.randbelow(y1 - y0) + y0
-            pz = rng.randbelow(z1 - z0) + z0
-            passage = [px, py, pz]
-            passage[axis] = split
-            maze[passage[2]][passage[1]][passage[0]] = False
-            adj = list(passage)
-            adj[axis] += 1
-            maze[adj[2]][adj[1]][adj[0]] = False
-        carve(0, 0, 0, size, size, size)
-        maze[0][0][0] = False
-        maze[size - 1][size - 1][size - 1] = False
-        if not _maze.Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1)):
-            bootstrap.logger.warning(f'[Maze] BSP carve not connected for size={size}, retrying with dense fill fallback')
-            maze = [[[True] * size for _ in range(size)] for _ in range(size)]
-            for z in range(size):
-                for y in range(size):
-                    for x in range(size):
-                        maze[z][y][x] = False
-            maze[0][0][0] = False
-            maze[size - 1][size - 1][size - 1] = False
-        density_ratio = max(0.25, min(0.9, density_ppm / 1000000.0))
-        open_cells = [(x, y, z) for z in range(size) for y in range(size) for x in range(size) if not maze[z][y][x] and (x, y, z) not in ((0, 0, 0), (size - 1, size - 1, size - 1))]
-        for i in range(len(open_cells) - 1, 0, -1):
-            j = rng.randbelow(i + 1)
-            open_cells[i], open_cells[j] = (open_cells[j], open_cells[i])
-        extra = int(len(open_cells) * density_ratio)
-        for x, y, z in open_cells[:extra]:
-            maze[z][y][x] = True
-            if not _maze.Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1)):
-                maze[z][y][x] = False
-        corridor_threshold = 2
-        corridor_chance = 95
-        for axis in range(3):
-            for a in range(size):
-                for b in range(size):
-                    run = 0
-                    for c in range(size):
-                        coords = [0, 0, 0]
-                        coords[axis] = c
-                        coords[(axis + 1) % 3] = a
-                        coords[(axis + 2) % 3] = b
-                        x, y, z = coords
-                        if not maze[z][y][x]:
-                            run += 1
-                            if run >= corridor_threshold and rng.randbelow(100) < corridor_chance:
-                                if (x, y, z) not in [(0, 0, 0), (size - 1, size - 1, size - 1)]:
-                                    maze[z][y][x] = True
-                                    if not _maze.Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1)):
-                                        maze[z][y][x] = False
-                                    run = 0
-                        else:
-                            run = 0
-        if not _maze.Maze3DGenerator.is_connected(maze, (0, 0, 0), (size - 1, size - 1, size - 1)):
-            bootstrap.logger.warning(f'[Maze] Final connectivity check failed for size={size}, reverting extra walls')
-            maze = [[[False] * size for _ in range(size)] for _ in range(size)]
-            for z in range(size):
-                for y in range(size):
-                    for x in range(size):
-                        maze[z][y][x] = False
-            maze[0][0][0] = False
-            maze[size - 1][size - 1][size - 1] = False
-        sparse = _maze.dense_to_sparse(maze)
-        if len(self._maze_cache) >= self._maze_cache_max:
-            self._maze_cache.popitem(last=False)
-        self._maze_cache[cache_key] = sparse
-        return sparse
+        _leader_ev = None
+        while True:
+            with self._maze_gen_lock:
+                if cache_key in self._maze_cache:
+                    self._maze_cache.move_to_end(cache_key)
+                    return self._maze_cache[cache_key]
+                _ev = self._maze_gen_inflight.get(cache_key)
+                if _ev is None:
+                    _ev = bootstrap.threading.Event()
+                    self._maze_gen_inflight[cache_key] = _ev
+                    _leader_ev = _ev
+                    break
+            _ev.wait()
+        try:
+            sparse = maze._generate_maze_pure(seed_hex, size, density_ppm, turb_ppm)
+        except Exception:
+            with self._maze_gen_lock:
+                self._maze_gen_inflight.pop(cache_key, None)
+            raise
+        else:
+            with self._maze_gen_lock:
+                if len(self._maze_cache) >= self._maze_cache_max:
+                    self._maze_cache.popitem(last=False)
+                self._maze_cache[cache_key] = sparse
+                self._maze_gen_inflight.pop(cache_key, None)
+            return sparse
+        finally:
+            _leader_ev.set()
 
     def _calculate_maze_root(self, maze) -> str:
         if isinstance(maze, _maze.SparseMaze):
@@ -404,6 +343,8 @@ class PoSWConsensus:
                 return (False, 'Maze not owned by signer', {})
             expected_nonce = int(row['movenonce']) + 1
             if move_nonce is not None and move_nonce != expected_nonce:
+                if move_nonce == expected_nonce - 1:
+                    bootstrap.logger.warning(f'[DESYNC] -1 nonce mismatch: miner {miner_id[:16]} expected {expected_nonce}, got {move_nonce}')
                 return (False, f'Nonce mismatch: expected {expected_nonce}, got {move_nonce}', {})
             move_nonce = expected_nonce
             auth_msg = self._move_auth_bytes(miner_id, maze_id, row['growthcount'], move_nonce, direction)
@@ -423,7 +364,13 @@ class PoSWConsensus:
             nx, ny, nz = (sx + dx, sy + dy, sz + dz)
             maze_seed = bytes.fromhex(row['seed'])
             loop = bootstrap.asyncio.get_event_loop()
+            _r34_k = (row['seed'], size, int(row['walldensityppm']), int(row['turbulenceppm']))
+            _r34_hit = _r34_k in self._maze_cache
+            _r34_t0 = bootstrap.time.monotonic()
             maze = await loop.run_in_executor(None, self._generate_deterministic_maze, row['seed'], size, int(row['walldensityppm']), int(row['turbulenceppm']), self.node.height)
+            _r34_dt = bootstrap.time.monotonic() - _r34_t0
+            if _r34_dt > 1.0:
+                bootstrap.logger.info(f'[R34] per-move gen size={size} hit={_r34_hit} took {_r34_dt:.1f}s')
             if not (0 <= nx < size and 0 <= ny < size and (0 <= nz < size)):
                 return (False, 'Out of bounds', {})
             if maze[nz][ny][nx]:
@@ -440,14 +387,19 @@ class PoSWConsensus:
                         self._set_ghost(row, new_gpos)
                         await self.maze_repo.upsert({**dict(row), 'updatedat': int(bootstrap.time.time())})
                         if new_gpos == (sx, sy, sz):
-                            restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
+                            _r31_rt = self._restart_tasks.get(maze_id)
+                            if _r31_rt is not None and (not _r31_rt.done()):
+                                bootstrap.logger.info(f'[F9] tick restart already in flight for {maze_id[:16]} — skipping duplicate process_move restart')
+                                restart_ev = None
+                            else:
+                                restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
                             if restart_ev:
                                 self._set_ghost(row, self._ghost_tuple(restart_ev))
                                 await self.maze_repo.upsert({**dict(row), **restart_ev})
                                 ghost_update = {'maze_id': row.get('maze_id') or miner_id, 'miner_id': miner_id, 'height': self.node.height, 'old_size': size, 'new_size': restart_ev.get('size', size), 'old_density': int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM)), 'new_density': restart_ev.get('walldensityppm', int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM))), 'seed': restart_ev.get('seed', row['seed']), 'mazeroot': restart_ev.get('mazeroot', row.get('mazeroot', '')), 'goal': [restart_ev.get('goalx', row['goalx']), restart_ev.get('goaly', row['goaly']), restart_ev.get('goalz', row['goalz'])], 'spawn': [restart_ev.get('posx', row['posx']), restart_ev.get('posy', row['posy']), restart_ev.get('posz', row['posz'])], 'turbulenceppm': restart_ev.get('turbulenceppm', 0)}
                                 self._pending_maze_updates.append(ghost_update)
                 resp_ghost = self._ghost_tuple(row)
-                return (False, 'Wall hit', {'type': 'wall_hit', 'seed': wall_seed, 'difficulty': difficulty, 'ghost': list(resp_ghost) if resp_ghost else None, 'position': [sx, sy, sz], 'size': size, 'movenonce': int(row['movenonce']), 'growthcount': int(row['growthcount'])})
+                return (False, 'Wall hit', {'type': 'wall_hit', 'seed': wall_seed, 'difficulty': difficulty, 'ghost': list(resp_ghost) if resp_ghost else None, 'position': [sx, sy, sz], 'size': size, 'movenonce': move_nonce, 'growthcount': int(row['growthcount'])})
             gx, gy, gz = (int(row['goalx']), int(row['goaly']), int(row['goalz']))
             updated = dict(row)
             updated['posx'] = nx
@@ -472,16 +424,21 @@ class PoSWConsensus:
                 self._oscillating_mazes.add(maze_id)
             elif (nx, ny, nz) != (sx, sy, sz):
                 self._oscillating_mazes.discard(maze_id)
+            _r30_catch_update = None
+            _r30_ghost_update = None
             caught = nx == gx and ny == gy and (nz == gz)
             state_info = {'type': 'mazemove', 'minerid': miner_id, 'position': (nx, ny, nz), 'movenonce': move_nonce, 'caught': caught}
             if caught:
                 new_params = self._compute_new_maze_params(dict(row), self.node.height, bootstrap.eth_keccak(direction.encode() + move_nonce.to_bytes(8, 'big')))
                 updated.update(new_params)
-                knowledge_val = int(row.get('knowledge', 0)) + max(1, int(size * 0.5))
-                new_density_ppm = min(900000, int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM)) + knowledge_val * 15000 + size * 4000)
-                updated['knowledge'] = knowledge_val
-                updated['walldensityppm'] = new_density_ppm
-                new_maze = await loop.run_in_executor(None, self._generate_deterministic_maze, new_params['seed'], new_params['size'], new_density_ppm, new_params['turbulenceppm'], self.node.height)
+                updated['knowledge'] = 0
+                _r34_ck = (new_params['seed'], new_params['size'], new_params['walldensityppm'], new_params['turbulenceppm'])
+                _r34_chit = _r34_ck in self._maze_cache
+                _r34_ct0 = bootstrap.time.monotonic()
+                new_maze = await loop.run_in_executor(self._move_executor, self._generate_deterministic_maze, new_params['seed'], new_params['size'], new_params['walldensityppm'], new_params['turbulenceppm'], self.node.height)
+                _r34_cdt = bootstrap.time.monotonic() - _r34_ct0
+                if _r34_cdt > 1.0:
+                    bootstrap.logger.info(f'[R34] catch gen size={new_params['size']} hit={_r34_chit} took {_r34_cdt:.1f}s')
                 new_root = self._calculate_maze_root(new_maze)
                 new_spawn = self._select_spawn(new_maze, (nx, ny, nz), bytes.fromhex(new_params['seed']))
                 new_goal = self._select_open_cell(new_maze, bytes.fromhex(new_params['seed']), exclude=new_spawn)
@@ -493,8 +450,8 @@ class PoSWConsensus:
                 state_info['newspawn'] = new_spawn
                 state_info['new_growthcount'] = new_params['growthcount']
                 state_info['new_movenonce'] = updated['movenonce']
-                maze_update_event = {'maze_id': row.get('maze_id') or miner_id, 'miner_id': miner_id, 'height': self.node.height, 'old_size': size, 'new_size': new_params['size'], 'old_density': int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM)), 'new_density': new_density_ppm, 'old_growthcount': int(row['growthcount']), 'new_growthcount': new_params.get('growthcount', int(row['growthcount'])), 'knowledge': knowledge_val, 'seed': new_params['seed'], 'mazeroot': new_root, 'goal': list(new_goal), 'spawn': list(new_spawn), 'turbulenceppm': new_params.get('turbulenceppm', 0), 'caught_at_nonce': move_nonce, 'caught_by_direction': direction, 'parent_mazeroot': row['mazeroot'], 'parent_size': size, 'parent_pos': [sx, sy, sz], 'parent_goal': [gx, gy, gz], 'parent_seed': row['seed'], 'parent_density': int(row['walldensityppm']), 'parent_turbulence': int(row['turbulenceppm']), 'parent_pos_attested': [int(row['posx']), int(row['posy']), int(row['posz'])], 'parent_movenonce': int(row['movenonce'])}
-                self._pending_maze_updates.append(maze_update_event)
+                maze_update_event = {'maze_id': row.get('maze_id') or miner_id, 'miner_id': miner_id, 'height': self.node.height, 'old_size': size, 'new_size': new_params['size'], 'old_density': int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM)), 'new_density': new_params['walldensityppm'], 'old_growthcount': int(row['growthcount']), 'new_growthcount': new_params.get('growthcount', int(row['growthcount'])), 'knowledge': 0, 'seed': new_params['seed'], 'mazeroot': new_root, 'goal': list(new_goal), 'spawn': list(new_spawn), 'turbulenceppm': new_params.get('turbulenceppm', 0), 'caught_at_nonce': move_nonce, 'caught_by_direction': direction, 'parent_mazeroot': row['mazeroot'], 'parent_size': size, 'parent_pos': [sx, sy, sz], 'parent_goal': [gx, gy, gz], 'parent_seed': row['seed'], 'parent_density': int(row['walldensityppm']), 'parent_turbulence': int(row['turbulenceppm']), 'parent_pos_attested': [int(row['posx']), int(row['posy']), int(row['posz'])], 'parent_movenonce': int(row['movenonce'])}
+                _r30_catch_update = maze_update_event
                 new_maze_id = row.get('maze_id') or miner_id
                 self._maze_visited.pop(new_maze_id, None)
                 self._goal_prev_pos.pop(new_maze_id, None)
@@ -532,67 +489,17 @@ class PoSWConsensus:
                 ghost_pos = self._ghost_tuple(row)
                 if ghost_pos and ghost_pos != (gx, gy, gz):
                     if ghost_pos == (nx, ny, nz):
-                        restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
+                        _r31_rt = self._restart_tasks.get(maze_id)
+                        if _r31_rt is not None and (not _r31_rt.done()):
+                            bootstrap.logger.info(f'[F9] tick restart already in flight for {maze_id[:16]} — skipping duplicate process_move restart')
+                            restart_ev = None
+                        else:
+                            restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
                         if restart_ev:
                             updated.update(restart_ev)
                             state_info['caught'] = True
-                    elif maze_id in self._oscillating_mazes:
-                        if maze_id not in self._ghost_cycle:
-                            cycle_cells = []
-                            for p in self._pos_history.get(maze_id, []):
-                                if p not in cycle_cells:
-                                    cycle_cells.append(p)
-
-                            def _manh(a, b):
-                                return abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
-                            farthest_idx = max(range(len(cycle_cells)), key=lambda i: _manh(ghost_pos, cycle_cells[i]))
-                            self._ghost_cycle[maze_id] = cycle_cells
-                            self._ghost_cycle_idx[maze_id] = farthest_idx
-                            self._ghost_frozen_target[maze_id] = cycle_cells[farthest_idx]
-                        cycle_cells = self._ghost_cycle[maze_id]
-                        idx = self._ghost_cycle_idx[maze_id]
-                        target = cycle_cells[idx]
-                        if ghost_pos == target:
-                            idx = (idx + 1) % len(cycle_cells)
-                            self._ghost_cycle_idx[maze_id] = idx
-                            target = cycle_cells[idx]
-                        moved = False
-                        for _ in range(2):
-                            gdx, gdy, gdz = self._bfs_next_step(maze, size, ghost_pos, target)
-                            if gdx is None:
-                                break
-                            ghost_pos = (ghost_pos[0] + gdx, ghost_pos[1] + gdy, ghost_pos[2] + gdz)
-                            self._set_ghost(updated, ghost_pos)
-                            self._set_ghost(row, ghost_pos)
-                            moved = True
-                            if ghost_pos == (nx, ny, nz):
-                                break
-                        if moved:
-                            state_info['ghost'] = ghost_pos
-                        if ghost_pos == (nx, ny, nz):
-                            restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
-                            if restart_ev:
-                                updated.update(restart_ev)
-                                state_info['caught'] = True
-                                ghost_update = {'maze_id': row.get('maze_id') or miner_id, 'miner_id': miner_id, 'height': self.node.height, 'old_size': size, 'new_size': restart_ev.get('size', size), 'old_density': int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM)), 'new_density': restart_ev.get('walldensityppm', int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM))), 'seed': restart_ev.get('seed', row['seed']), 'mazeroot': restart_ev.get('mazeroot', row.get('mazeroot', '')), 'goal': [restart_ev.get('goalx', row['goalx']), restart_ev.get('goaly', row['goaly']), restart_ev.get('goalz', row['goalz'])], 'spawn': [restart_ev.get('posx', row['posx']), restart_ev.get('posy', row['posy']), restart_ev.get('posz', row['posz'])], 'turbulenceppm': restart_ev.get('turbulenceppm', 0)}
-                                self._pending_maze_updates.append(ghost_update)
-                    else:
-                        self._ghost_frozen_target.pop(maze_id, None)
-                        self._ghost_cycle.pop(maze_id, None)
-                        self._ghost_cycle_idx.pop(maze_id, None)
-                        gdx, gdy, gdz = self._bfs_next_step(maze, size, ghost_pos, (nx, ny, nz))
-                        if gdx is not None:
-                            new_ghost = (ghost_pos[0] + gdx, ghost_pos[1] + gdy, ghost_pos[2] + gdz)
-                            self._set_ghost(updated, new_ghost)
-                            self._set_ghost(row, new_ghost)
-                            state_info['ghost'] = new_ghost
-                            if new_ghost == (nx, ny, nz):
-                                restart_ev = await self._restart_position(dict(row), maze_id, miner_id, size)
-                                if restart_ev:
-                                    updated.update(restart_ev)
-                                    state_info['caught'] = True
-                                    ghost_update = {'maze_id': row.get('maze_id') or miner_id, 'miner_id': miner_id, 'height': self.node.height, 'old_size': size, 'new_size': restart_ev.get('size', size), 'old_density': int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM)), 'new_density': restart_ev.get('walldensityppm', int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM))), 'seed': restart_ev.get('seed', row['seed']), 'mazeroot': restart_ev.get('mazeroot', row.get('mazeroot', '')), 'goal': [restart_ev.get('goalx', row['goalx']), restart_ev.get('goaly', row['goaly']), restart_ev.get('goalz', row['goalz'])], 'spawn': [restart_ev.get('posx', row['posx']), restart_ev.get('posy', row['posy']), restart_ev.get('posz', row['posz'])], 'turbulenceppm': restart_ev.get('turbulenceppm', 0)}
-                                    self._pending_maze_updates.append(ghost_update)
+                            ghost_update = {'maze_id': row.get('maze_id') or miner_id, 'miner_id': miner_id, 'height': self.node.height, 'old_size': size, 'new_size': restart_ev.get('size', size), 'old_density': int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM)), 'new_density': restart_ev.get('walldensityppm', int(row.get('walldensityppm', _maze.MIN_WALL_DENSITY_PPM))), 'seed': restart_ev.get('seed', row['seed']), 'mazeroot': restart_ev.get('mazeroot', row.get('mazeroot', '')), 'goal': [restart_ev.get('goalx', row['goalx']), restart_ev.get('goaly', row['goaly']), restart_ev.get('goalz', row['goalz'])], 'spawn': [restart_ev.get('posx', row['posx']), restart_ev.get('posy', row['posy']), restart_ev.get('posz', row['posz'])], 'turbulenceppm': restart_ev.get('turbulenceppm', 0)}
+                            _r30_ghost_update = ghost_update
                 if size > 6:
                     seal_interval = max(3, size * 2)
                     if move_nonce % seal_interval == 0:
@@ -608,15 +515,13 @@ class PoSWConsensus:
                         sealed = 0
                         temp_blocked = set()
                         dense_maze = _maze.sparse_to_dense(maze)
-                        mutated_maze = [row_layer[:] for row_layer in dense_maze]
-                        _maze.mutate_maze_walls(mutated_maze, int(row['movenonce']), size, {(nx, ny, nz), (gx, gy, gz)})
                         for cx, cy, cz in seal_candidates:
                             if sealed >= 1:
                                 break
                             seal_key = bootstrap.eth_keccak(f'SEALV1{row['seed']}{cx}{cy}{cz}{move_nonce}'.encode()).hex()
                             if int(seal_key[:8], 16) % 100 < 25:
                                 test_blocked = sealed_set | temp_blocked | {(cx, cy, cz)}
-                                if self._path_exists(mutated_maze, size, (nx, ny, nz), (gx, gy, gz), test_blocked):
+                                if self._path_exists(dense_maze, size, (nx, ny, nz), (gx, gy, gz), test_blocked):
                                     sealed_set.add((cx, cy, cz))
                                     temp_blocked.add((cx, cy, cz))
                                     sealed += 1
@@ -640,6 +545,14 @@ class PoSWConsensus:
                                         sealed_set.discard((ox, oy, oz))
                                         state_info.setdefault('opened_walls', []).append([ox, oy, oz])
             await self.maze_repo.upsert(updated)
+            if state_info.get('caught'):
+                _r34_nk = (updated.get('seed', ''), int(updated.get('size', 0)), int(updated.get('walldensityppm', 0)), int(updated.get('turbulenceppm', 0)))
+                if _r34_nk not in self._maze_cache:
+                    bootstrap.asyncio.create_task(self._prewarm_mazes([_r34_nk]))
+            if _r30_catch_update is not None:
+                self._pending_maze_updates.append(_r30_catch_update)
+            if _r30_ghost_update is not None:
+                self._pending_maze_updates.append(_r30_ghost_update)
             return (True, 'Move accepted', state_info)
 
     def _maybe_flee_goal(self, maze, miner_pos, goal_pos, maze_id, size, move_nonce) -> bootstrap.Optional[bootstrap.Tuple[int, int, int]]:
@@ -749,7 +662,7 @@ class PoSWConsensus:
             return None
         shrink_amount = current_size - new_size
         old_density = int(row.get('walldensityppm', maze.MIN_WALL_DENSITY_PPM))
-        new_density = old_density + shrink_amount * 6000
+        new_density = min(900000, old_density + shrink_amount * 6000)
         new_turb = int(row.get('turbulenceppm', 0)) + shrink_amount * 8000
         move_nonce = int(row.get('movenonce', 0))
         seed = bootstrap.eth_keccak(b'SHRINKGHOSTV2' + bytes.fromhex(row['mazeroot']) + move_nonce.to_bytes(8, 'big') + new_size.to_bytes(4, 'big')).hex()
@@ -770,6 +683,169 @@ class PoSWConsensus:
         self._ghost_cycle_idx.pop(maze_id, None)
         bootstrap.logger.info(f'[GHOST SHRINK] Miner {miner_id[:16]} caught → size {current_size}→{new_size}, relocated to {new_spawn}')
         return {'size': new_size, 'seed': seed, 'mazeroot': self._calculate_maze_root(new_maze), 'posx': new_spawn[0], 'posy': new_spawn[1], 'posz': new_spawn[2], 'goalx': new_goal[0], 'goaly': new_goal[1], 'goalz': new_goal[2], 'walldensityppm': new_density, 'turbulenceppm': new_turb, 'ghostx': ghost_start[0] if new_size > 5 else None, 'ghosty': ghost_start[1] if new_size > 5 else None, 'ghostz': ghost_start[2] if new_size > 5 else None}
+
+    def _schedule_tick_restart(self, mid, miner_id, base, base_size):
+        _task = self._restart_tasks.get(mid)
+        if _task is not None and (not _task.done()):
+            bootstrap.logger.info(f'[F9] tick restart already in flight for {mid[:16]} — skipping duplicate')
+            return True
+        self._restart_tasks[mid] = bootstrap.asyncio.create_task(self._tick_restart_task(mid, miner_id, dict(base), int(base_size)))
+        return True
+
+    async def _tick_restart_task(self, mid, miner_id, base, base_size):
+        try:
+            restart_ev = await self._restart_position(base, mid, miner_id, base_size)
+            if not restart_ev:
+                return
+            async with self._lock_for(mid):
+                _fresh2 = await self.maze_repo.get_for_miner(miner_id, mid)
+                if _fresh2 is not None and (_fresh2.get('seed') != base.get('seed') or int(_fresh2.get('size', 0)) != base_size):
+                    bootstrap.logger.info(f'[R30] tick restart stale for {mid[:16]} (maze changed during generation) — skipping')
+                    return
+                await self.maze_repo.upsert({**dict(_fresh2), **restart_ev} if _fresh2 is not None else {**dict(base), **restart_ev})
+                _tick_base = _fresh2 if _fresh2 is not None else base
+                _tick_old_size = int(_fresh2['size']) if _fresh2 is not None else base_size
+                _tick_update = {'maze_id': mid, 'miner_id': miner_id, 'height': self.node.height, 'old_size': _tick_old_size, 'new_size': restart_ev.get('size', _tick_old_size), 'old_density': int(_tick_base.get('walldensityppm', maze.MIN_WALL_DENSITY_PPM)), 'new_density': restart_ev.get('walldensityppm', int(_tick_base.get('walldensityppm', maze.MIN_WALL_DENSITY_PPM))), 'seed': restart_ev.get('seed', _tick_base['seed']), 'mazeroot': restart_ev.get('mazeroot', _tick_base.get('mazeroot', '')), 'goal': [restart_ev.get('goalx', _tick_base['goalx']), restart_ev.get('goaly', _tick_base['goaly']), restart_ev.get('goalz', _tick_base['goalz'])], 'spawn': [restart_ev.get('posx', _tick_base['posx']), restart_ev.get('posy', _tick_base['posy']), restart_ev.get('posz', _tick_base['posz'])], 'turbulenceppm': restart_ev.get('turbulenceppm', 0)}
+                self._pending_maze_updates.append(_tick_update)
+            self._ghost_step_nonce.pop(mid, None)
+        except Exception as _e:
+            bootstrap.logger.error(f'[F9] tick restart task failed for {mid[:16]}: {_e}', exc_info=True)
+        finally:
+            if self._restart_tasks.get(mid) is bootstrap.asyncio.current_task():
+                self._restart_tasks.pop(mid, None)
+
+    def _maze_keys_for_block(self, block: dict) -> set:
+        _keys = set()
+        for _src in (block.get('maze_updates') or [], block.get('attestation_proof') or []):
+            for _entry in _src:
+                if not isinstance(_entry, dict):
+                    continue
+                _seed = _entry.get('seed')
+                _size = _entry.get('new_size')
+                _dens = _entry.get('new_density')
+                _turb = _entry.get('turbulenceppm', 0)
+                if _seed is not None and _size is not None and (_dens is not None):
+                    _keys.add((_seed, int(_size), int(_dens), int(_turb)))
+                if _entry.get('caught_at_nonce') is not None:
+                    _pseed = _entry.get('parent_seed')
+                    _psize = _entry.get('parent_size')
+                    _pdens = _entry.get('parent_density')
+                    _pturb = _entry.get('parent_turbulence', 0)
+                    if _pseed is not None and _psize is not None and (_pdens is not None):
+                        _keys.add((_pseed, int(_psize), int(_pdens), int(_pturb)))
+        return _keys
+
+    def _get_maze_pool(self):
+        if getattr(self, '_maze_pool', None) is None:
+            self._maze_pool = bootstrap.ProcessPoolExecutor(max_workers=4, mp_context=bootstrap.mp.get_context('spawn'))
+        return self._maze_pool
+
+    async def _prewarm_mazes(self, keys):
+        _keys = [k for k in keys or [] if k not in self._maze_cache]
+        if not _keys:
+            return
+        _r35_pool_new = getattr(self, '_maze_pool', None) is None
+        _r35_t0 = bootstrap.time.monotonic()
+        _r35_desc = [(k[1], k[0][:16]) for k in _keys]
+        bootstrap.logger.info(f'[R35] pre-warm start: {len(_keys)} key(s) sizes/seeds={_r35_desc} pool_new={_r35_pool_new}')
+        _r37_loop = bootstrap.asyncio.get_running_loop()
+        _mine = []
+        _futures = []
+        for _k in _keys:
+            _f = self._prewarm_inflight.get(_k)
+            if _f is None:
+                _f = _r37_loop.create_future()
+                self._prewarm_inflight[_k] = _f
+                _mine.append(_k)
+            _futures.append(_f)
+
+        def _r37_resolve_mine():
+            for _k in _mine:
+                _f = self._prewarm_inflight.pop(_k, None)
+                if _f is not None and (not _f.done()):
+                    _f.set_result(None)
+        try:
+            _pool = self._get_maze_pool()
+            _loop = bootstrap.asyncio.get_running_loop()
+            try:
+                _results = await bootstrap.asyncio.gather(*[_loop.run_in_executor(_pool, maze._maze_gen_worker, _k) for _k in _mine], return_exceptions=True)
+            except bootstrap.asyncio.CancelledError:
+                _r37_resolve_mine()
+                raise
+            for _k, _r in zip(_mine, _results):
+                if isinstance(_r, Exception):
+                    bootstrap.logger.warning(f'[Verify] pre-warm failed for {_k}: {_r} — generating sequentially')
+                    try:
+                        _sparse = maze._generate_maze_pure(_k[0], _k[1], _k[2], _k[3])
+                    except Exception as _e2:
+                        bootstrap.logger.warning(f'[Verify] pre-warm sequential fallback failed for {_k}: {_e2}')
+                        continue
+                    if len(self._maze_cache) >= self._maze_cache_max:
+                        self._maze_cache.popitem(last=False)
+                    self._maze_cache[_k] = _sparse
+                    continue
+                _key2, _sparse = _r
+                if len(self._maze_cache) >= self._maze_cache_max:
+                    self._maze_cache.popitem(last=False)
+                self._maze_cache[_key2] = _sparse
+        except Exception as _e:
+            bootstrap.logger.warning(f'[Verify] pre-warm pool failed ({_e}) — generating sequentially')
+            if getattr(self, '_maze_pool', None) is not None:
+                try:
+                    self._maze_pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                self._maze_pool = None
+            for _k in _mine:
+                if _k in self._maze_cache:
+                    continue
+                try:
+                    _sparse = maze._generate_maze_pure(_k[0], _k[1], _k[2], _k[3])
+                except Exception as _e2:
+                    bootstrap.logger.warning(f'[Verify] pre-warm sequential fallback failed for {_k}: {_e2}')
+                    continue
+                if len(self._maze_cache) >= self._maze_cache_max:
+                    self._maze_cache.popitem(last=False)
+                self._maze_cache[_k] = _sparse
+        _r37_resolve_mine()
+        if _futures:
+            await bootstrap.asyncio.gather(*_futures, return_exceptions=True)
+        bootstrap.logger.info(f'[R35] pre-warm done: {len(_keys)} key(s) took {bootstrap.time.monotonic() - _r35_t0:.1f}s')
+
+    def _prewarm_background(self, keys):
+        _task = bootstrap.asyncio.create_task(self._prewarm_mazes(keys))
+        self._prewarm_tasks.add(_task)
+        _task.add_done_callback(self._prewarm_task_done)
+        return _task
+
+    def _prewarm_task_done(self, task):
+        self._prewarm_tasks.discard(task)
+        try:
+            _exc = task.exception()
+        except bootstrap.asyncio.CancelledError:
+            return
+        if _exc is not None:
+            bootstrap.logger.warning(f'[R37] background pre-warm failed ({_exc}) - verify will use the pool single-flight, then in-process')
+
+    async def _ensure_maze_cached(self, seed_hex, size, density_ppm, turb_ppm):
+        _key = (seed_hex, size, density_ppm, turb_ppm)
+        _cached = self._maze_cache.get(_key)
+        if _cached is not None:
+            return _cached
+        _r37_task = bootstrap.asyncio.create_task(self._prewarm_mazes([_key]))
+        self._prewarm_tasks.add(_r37_task)
+        _r37_task.add_done_callback(self._prewarm_task_done)
+        try:
+            await bootstrap.asyncio.wait_for(bootstrap.asyncio.shield(_r37_task), timeout=maze._R37_POOL_WAIT_S)
+        except bootstrap.asyncio.TimeoutError:
+            bootstrap.logger.warning(f'[R37] pool slow for maze size={_key[1]} seed={_key[0][:16]} - waited {maze._R37_POOL_WAIT_S}s, generating in-process (pool keeps running in background)')
+        except Exception as _r37_e:
+            bootstrap.logger.warning(f'[R37] pool wait failed for maze size={_key[1]} seed={_key[0][:16]} ({_r37_e}) - generating in-process')
+        _cached = self._maze_cache.get(_key)
+        if _cached is not None:
+            return _cached
+        _loop = bootstrap.asyncio.get_running_loop()
+        return await _loop.run_in_executor(self._move_executor, self._generate_deterministic_maze, seed_hex, size, density_ppm, turb_ppm, self.node.height)
 
     def get_state(self, miner_id: str) -> bootstrap.Optional[dict]:
         return getattr(self, '_cached_states', {}).get(miner_id)
@@ -806,16 +882,13 @@ class PoSWConsensus:
             maze_id = miner_id
         _owned = await self.maze_repo.get_by_miner_id(miner_id)
         if _owned:
-            maze_id = str(_owned[0].get('maze_id') or maze_id)
-        else:
-            _wallet_row = await self.maze_repo.get_by_maze_id(maze_id)
-            if _wallet_row:
-                _prev = _wallet_row.get('minerid')
-                if _prev and _prev != miner_id:
-                    _prev_ws = self.node.miner_websockets.get(_prev)
-                    if _prev_ws is not None:
-                        maze_id = bootstrap.eth_keccak(b'MCXMAZEV2' + maze_id.encode() + b'|' + miner_id.encode()).hex()
-                        bootstrap.logger.info(f'[MAZE] new maze {maze_id[:16]} for second miner {miner_id[:16]} on shared wallet')
+            _owned_mid = str(_owned[0].get('maze_id') or '')
+            try:
+                _owned_pk = bytes.fromhex(_owned_mid)
+            except (TypeError, ValueError):
+                _owned_pk = b''
+            if len(_owned_pk) == 65 and _owned_pk[0] == 4:
+                maze_id = _owned_mid
         existing = await self.maze_repo.get_by_maze_id(maze_id)
         if existing:
             row = dict(existing)
@@ -852,7 +925,7 @@ class PoSWConsensus:
                     loop_h = bootstrap.asyncio.get_event_loop()
                     _maze_h = await loop_h.run_in_executor(self._move_executor, self._generate_deterministic_maze, row['seed'], _sz, int(row['walldensityppm']), int(row['turbulenceppm']), self.node.height)
                     _seed_b = bytes.fromhex(row['seed'])
-                    _new_spawn = self._select_spawn(_maze_h, (_px, _py, _pz) if _inb(_px) and _inb(_py) and _inb(_pz) else (0, 0, 0), _seed_b)
+                    _new_spawn = self._select_spawn(_maze_h, (_px, _py, _pz) if _inb(_px) and _inb(_py) and _inb(_pz) else None, _seed_b)
                     _new_goal = self._select_open_cell(_maze_h, _seed_b, exclude=_new_spawn)
                     row['posx'], row['posy'], row['posz'] = _new_spawn
                     row['goalx'], row['goaly'], row['goalz'] = _new_goal
@@ -875,7 +948,7 @@ class PoSWConsensus:
         loop = bootstrap.asyncio.get_event_loop()
         maze = await loop.run_in_executor(self._move_executor, self._generate_deterministic_maze, seed, config.MIN_MAZE_SIZE, _maze.MIN_WALL_DENSITY_PPM, 0, self.node.height)
         root = self._calculate_maze_root(maze)
-        spawn = self._select_spawn(maze, (0, 0, 0), bytes.fromhex(seed))
+        spawn = self._select_spawn(maze, None, bytes.fromhex(seed))
         goal = self._select_open_cell(maze, bytes.fromhex(seed), exclude=spawn)
         now = int(bootstrap.time.time())
         row = {'minerid': miner_id, 'maze_id': maze_id, 'size': config.MIN_MAZE_SIZE, 'walldensityppm': _maze.MIN_WALL_DENSITY_PPM, 'seed': seed, 'posx': spawn[0], 'posy': spawn[1], 'posz': spawn[2], 'goalx': goal[0], 'goaly': goal[1], 'goalz': goal[2], 'movenonce': 0, 'consecutivewallhits': 0, 'turbulenceppm': 0, 'growthcount': 0, 'lastgoalheight': 0, 'lastactiveheight': self.node.height, 'mazeroot': root, 'invitedguest': None, 'guestlock': False, 'createdat': now, 'updatedat': now}
@@ -1223,80 +1296,71 @@ class PoSWConsensus:
                 bootstrap.logger.warning(f'[SEAL-SELF-VERIFY-1] block {block_id} local attestation for {str(winner)[:16]} already at {int(_prev_att.get('last_block', -1))} (>= id) — peers reject (ATTEST-CAP-STRICT), skipping')
                 self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
                 return False
-            if _prev_att:
-                _att_cap = int(_prev_att.get('last_size', config.MIN_MAZE_SIZE)) + config.ATTEST_GROWTH_PER_BLOCK * (block_id - int(_prev_att['last_block']))
-            else:
-                _att_cap = config.MIN_MAZE_SIZE + config.ATTEST_FRESH_BUFFER
-            maze_attestation = {'maze_id': winner, 'pubkey': winner, 'size': min(max(int(winner_row['size']), winner_elect_size), _att_cap), 'block': block_id}
-            bootstrap.logger.info(f'[IDEA5-ATTEST] {str(winner)[:16]} size={maze_attestation['size']} cap={_att_cap} prior={('none' if not _prev_att else _prev_att.get('last_block'))}')
+            _seal_sizes = {}
+            try:
+                for _r in await self.maze_repo.get_all() or []:
+                    try:
+                        _seal_sizes[str(_r.get('maze_id', ''))] = int(_r.get('size', 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+            except Exception:
+                _seal_sizes = {}
+            _r29_pos = []
+            for _row in candidate_rows:
+                _rmid = str(_row.get('maze_id', ''))
+                _rsz = _seal_sizes.get(_rmid)
+                if _rsz is None:
+                    try:
+                        _rsz = int(_row.get('size', 0) or 0)
+                    except (TypeError, ValueError):
+                        _rsz = 0
+                _rw = maze._maze_att_weight(_rsz)
+                if _rw > 0:
+                    _r29_row = dict(_row)
+                    _r29_row['size'] = _rsz
+                    _r29_pos.append((_rw, _r29_row))
+            _r29_total_w = sum((_w for _w, _ in _r29_pos))
+            _r29_passing = []
+            if _r29_total_w > 0:
+                _r29_remaining = sorted(_r29_pos, key=lambda p: str(p[1].get('maze_id', '')))
+                _r29_rem_w = _r29_total_w
+                _r29_k = 0
+                while _r29_remaining:
+                    _r29_draw = maze._maze_ticket(prev_hash, block_id, f'__draw__{_r29_k}', _stamped_ts) % _r29_rem_w
+                    _r29_acc = 0
+                    _r29_pick = len(_r29_remaining) - 1
+                    for _r29_i, (_r29_w, _r29_row) in enumerate(_r29_remaining):
+                        _r29_acc += _r29_w
+                        if _r29_draw < _r29_acc:
+                            _r29_pick = _r29_i
+                            break
+                    _r29_w_pick, _r29_row_pick = _r29_remaining.pop(_r29_pick)
+                    _r29_rem_w -= _r29_w_pick
+                    _r29_passing.append((_r29_k, _r29_row_pick))
+                    _r29_k += 1
+            _r29_passing.sort(key=lambda p: p[0])
+            _r29_takeover = str(passing[rank][1].get('maze_id', '')) != str(winner) if 0 <= rank < len(passing) else False
+            _r29_rank_winner = str(_r29_passing[rank][1].get('maze_id', '')) if 0 <= rank < len(_r29_passing) else None
+            _r29_winner_in = any((str(_rr[1].get('maze_id', '')) == str(winner) for _rr in _r29_passing))
+            if not _r29_passing or not _r29_winner_in or (_r29_rank_winner != str(winner) and (not _r29_takeover)):
+                bootstrap.logger.warning(f'[SEAL-STALE-ELECT-1] block {block_id}: re-resolved sizes change the draw (winner {str(winner)[:16]} rank-winner {_r29_rank_winner}) — stale election, skipping round')
+                self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
+                return False
+            _pos = _r29_pos
+            passing = _r29_passing
+            for _t, _rr in passing:
+                if str(_rr.get('maze_id', '')) == str(winner):
+                    winner_row = _rr
+                    break
+            winner = winner_row['maze_id']
+            winner_elect_size = int(winner_row['size'])
+            maze_attestation = {'maze_id': winner, 'pubkey': winner, 'size': int(winner_row['size']), 'block': block_id}
+            bootstrap.logger.info(f'[IDEA5-ATTEST] {str(winner)[:16]} size={maze_attestation['size']} prior={('none' if not _prev_att else _prev_att.get('last_block'))}')
             if int(maze_attestation['size']) < config.MIN_MAZE_SIZE:
                 bootstrap.logger.warning(f'[SEAL-SELF-VERIFY-1] block {block_id} sealed attestation size {maze_attestation['size']} < {config.MIN_MAZE_SIZE} — peers would reject, skipping')
                 self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
                 return False
             _att_proof = []
-            try:
-                _att_sz = int(maze_attestation['size'])
-                if _att_sz > config.MIN_MAZE_SIZE + config.ATTEST_FRESH_BUFFER:
-                    _prov_entry = None
-                    for _u in self._pending_maze_updates or []:
-                        if not isinstance(_u, dict):
-                            continue
-                        _um = str(_u.get('maze_id') or _u.get('miner_id') or '')
-                        if _um == str(winner) and maze._valid_maze_size(_u.get('new_size')) == _att_sz:
-                            _prov_entry = dict(_u)
-                            break
-                    _stored_entry = None
-                    try:
-                        _pr = await self.node.maze_proof_repo.get_for_size(str(winner), _att_sz)
-                        if _pr:
-                            _pj = _pr.get('proof_json', '') if isinstance(_pr, dict) else ''
-                            _stored_entry = bootstrap.json.loads(_pj) if isinstance(_pj, str) and _pj else None
-                    except Exception:
-                        _stored_entry = None
-                    if _prov_entry is None and isinstance(_stored_entry, dict) and (maze._valid_maze_size(_stored_entry.get('new_size')) == _att_sz):
-                        _prov_entry = _stored_entry
-                    _is_reattest = False
-                    if _prov_entry is None:
-                        try:
-                            _pa = await self.maze_attestation_repo.get(str(winner))
-                        except Exception:
-                            _pa = None
-                        if _pa is not None and int(_pa.get('last_size', 0) or 0) >= _att_sz:
-                            _is_reattest = True
-                    if _prov_entry is not None:
-                        _att_proof = [_prov_entry]
-                    elif _is_reattest:
-                        _att_proof = []
-                    else:
-                        _clamp = config.MIN_MAZE_SIZE + config.ATTEST_FRESH_BUFFER
-                        if isinstance(_stored_entry, dict):
-                            _ps = maze._valid_maze_size(_stored_entry.get('new_size'))
-                            if _ps is not None:
-                                _clamp = max(_clamp, int(_ps))
-                        if _att_sz > _clamp:
-                            bootstrap.logger.warning(f'[SEAL-WORK-PROOF-1] block {block_id} clamp attestation size {_att_sz} -> {_clamp} (no proven catch in pending/proof store)')
-                            maze_attestation['size'] = int(_clamp)
-                            _att_sz = int(_clamp)
-                            if isinstance(_stored_entry, dict) and maze._valid_maze_size(_stored_entry.get('new_size')) == _att_sz:
-                                _att_proof = [_stored_entry]
-                            else:
-                                try:
-                                    _cp = await self.node.maze_proof_repo.get_for_size(str(winner), _att_sz)
-                                    if _cp:
-                                        _cpj = _cp.get('proof_json', '') if isinstance(_cp, dict) else ''
-                                        _centry = bootstrap.json.loads(_cpj) if isinstance(_cpj, str) and _cpj else None
-                                        if isinstance(_centry, dict) and maze._valid_maze_size(_centry.get('new_size')) == _att_sz:
-                                            _att_proof = [_centry]
-                                except Exception:
-                                    pass
-                            if int(maze_attestation['size']) < config.MIN_MAZE_SIZE:
-                                bootstrap.logger.warning(f'[SEAL-WORK-PROOF-1] block {block_id} attestation size below floor after clamp — skipping')
-                                self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
-                                return False
-            except Exception as _wp_e:
-                bootstrap.logger.warning(f'[SEAL-WORK-PROOF-1] block {block_id} check failed ({_wp_e}) — skipping seal')
-                self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
-                return False
             try:
                 _mpr2 = getattr(self.node, 'maze_proof_repo', None)
                 for _u in list(self._pending_maze_updates or []):
@@ -1429,6 +1493,38 @@ class PoSWConsensus:
                 await _rollback_producer_credit()
                 self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
                 return False
+            if signed_block and signed_block.get('hash') == block_hash and crypto.verify_signature_bytes(signed_block.get('producer_pub', ''), bytes.fromhex(block_hash), signed_block.get('signature', '')):
+                _compare_fields = ('id', 'phash', 'ts', 'transactions', 'state_root', 'maze_updates', 'maze_attestation', 'reward_wallet', 'reward', 'winner', 'miners', 'slashes')
+                tampered = False
+                for _fk in _compare_fields:
+                    if signed_block.get(_fk) != unsigned_block.get(_fk):
+                        bootstrap.logger.warning(f"[PoSW] Miner returned altered block — rejecting (field '{_fk}' differs)")
+                        tampered = True
+                        break
+                if tampered:
+                    self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
+                    await _rollback_producer_credit()
+                    return False
+                block = signed_block
+                block['finalized'] = False
+                block_signed = True
+                bootstrap.logger.info(f'[PoSW] Received valid signed block from miner {winner_miner_id[:16]}')
+            else:
+                bootstrap.logger.warning(f'[PoSW] Signed block from {winner_miner_id[:16]} failed validation — skipping block {block_id}')
+                self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
+                await _rollback_producer_credit()
+                return False
+            try:
+                if not await self.node.verify_block_proof(block):
+                    bootstrap.logger.warning(f'[SEAL-SELF-VERIFY-1] block {block_id} failed verify_block_proof — not sealing (followers would reject)')
+                    self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
+                    await _rollback_producer_credit()
+                    return False
+            except Exception as _sv_e:
+                bootstrap.logger.error(f'[SEAL-SELF-VERIFY-1] block {block_id} verify raised {type(_sv_e).__name__}: {_sv_e} — not sealing')
+                self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
+                await _rollback_producer_credit()
+                return False
             try:
                 async with await self.node.db.transaction():
                     staged2 = await self._stage_block_candidate(block_id, prev_hash, winner_miner_id, maze_attestation, _att_proof, _stamped_ts, computed_shrink_factor, _seal_wallet, _seal_pre_bal, tx_list=executed_txs, slashes=list(unsigned_block.get('slashes') or []), pending_snap=staged['_pending_snap'], final_rows=staged['_final_rows'], lottery_draw=_lottery_draw)
@@ -1476,42 +1572,6 @@ class PoSWConsensus:
                         await self.db.execute_dml('INSERT OR REPLACE INTO signed_blocks (miner_id, block_id, block_hash, signed_at) VALUES (?,?,?,?)', winner_miner_id, block_id, block_hash, bootstrap.time.time())
                     else:
                         await self.db.execute_dml('INSERT INTO signed_blocks (miner_id, block_id, block_hash, signed_at) VALUES ($1,$2,$3,$4) ON CONFLICT (miner_id, block_id) DO UPDATE SET block_hash=$3, signed_at=$4', winner_miner_id, block_id, block_hash, bootstrap.time.time())
-                    if signed_block and signed_block.get('hash') == block_hash and crypto.verify_signature_bytes(signed_block.get('producer_pub', ''), bytes.fromhex(block_hash), signed_block.get('signature', '')):
-                        _compare_fields = ('id', 'phash', 'ts', 'transactions', 'state_root', 'maze_updates', 'maze_attestation', 'reward_wallet', 'reward', 'winner', 'miners', 'slashes')
-                        tampered = False
-                        for _fk in _compare_fields:
-                            if signed_block.get(_fk) != unsigned_block.get(_fk):
-                                bootstrap.logger.warning(f"[PoSW] Miner returned altered block — rejecting (field '{_fk}' differs)")
-                                tampered = True
-                                break
-                        if tampered:
-                            self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
-                            await self.node.db.rollback()
-                            await _rollback_producer_credit()
-                            return False
-                        block = signed_block
-                        block['finalized'] = False
-                        block_signed = True
-                        bootstrap.logger.info(f'[PoSW] Received valid signed block from miner {winner_miner_id[:16]}')
-                    else:
-                        bootstrap.logger.warning(f'[PoSW] Signed block from {winner_miner_id[:16]} failed validation — skipping block {block_id}')
-                        self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
-                        await self.node.db.rollback()
-                        await _rollback_producer_credit()
-                        return False
-                    try:
-                        if not await self.node.verify_block_proof(block):
-                            bootstrap.logger.warning(f'[SEAL-SELF-VERIFY-1] block {block_id} failed verify_block_proof — not sealing (followers would reject)')
-                            await self.node.db.rollback()
-                            await _rollback_producer_credit()
-                            self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
-                            return False
-                    except Exception as _sv_e:
-                        bootstrap.logger.error(f'[SEAL-SELF-VERIFY-1] block {block_id} verify raised {type(_sv_e).__name__}: {_sv_e} — not sealing')
-                        await self.node.db.rollback()
-                        await _rollback_producer_credit()
-                        self.node._next_block_time = bootstrap.time.time() + config.BLOCK_TIME
-                        return False
                     try:
                         _svf_block_id = int(block.get('id', 0))
                         if svf.svf_active_at(_svf_block_id):
@@ -1696,6 +1756,118 @@ class PoSWConsensus:
         await self.block_repo.mark_finalized(block_id)
         bootstrap.logger.info(f'[PoSW] Finality checkpoint at block {block_id} (epoch {self.epoch})')
 
+    async def _ghost_step_apply(self, mz, maze_arr):
+        mid = mz['maze_id']
+        sz = int(mz['size'])
+        gpos = self._ghost_tuple(mz)
+        mx, my, mz_pos = (int(mz['posx']), int(mz['posy']), int(mz['posz']))
+        miner_pos = (mx, my, mz_pos)
+        if gpos is None or gpos == miner_pos:
+            return True
+        if self._lock_for(mid).locked():
+            _r35_n = self._ghost_step_lock_skips.get(mid, 0) + 1
+            self._ghost_step_lock_skips[mid] = _r35_n
+            bootstrap.logger.info(f'[R35] ghost step skipped: lock held for {mid[:16]} (skips={_r35_n})')
+            return False
+        ghost_moved = False
+        ghost_caught = False
+        if mid in self._oscillating_mazes:
+            if mid not in self._ghost_cycle:
+                cycle_cells = []
+                for p in self._pos_history.get(mid, []):
+                    if p not in cycle_cells:
+                        cycle_cells.append(p)
+                if cycle_cells:
+
+                    def _manh(a, b):
+                        return abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
+                    farthest_idx = max(range(len(cycle_cells)), key=lambda i: _manh(gpos, cycle_cells[i]))
+                    self._ghost_cycle[mid] = cycle_cells
+                    self._ghost_cycle_idx[mid] = farthest_idx
+                    self._ghost_frozen_target[mid] = cycle_cells[farthest_idx]
+            if mid in self._ghost_cycle:
+                cycle_cells = self._ghost_cycle[mid]
+                idx = self._ghost_cycle_idx[mid]
+                target = cycle_cells[idx]
+                if gpos == target:
+                    idx = (idx + 1) % len(cycle_cells)
+                    self._ghost_cycle_idx[mid] = idx
+                    target = cycle_cells[idx]
+                gdx, gdy, gdz = self._bfs_next_step(maze_arr, sz, gpos, target)
+                if gdx is not None:
+                    gpos = (gpos[0] + gdx, gpos[1] + gdy, gpos[2] + gdz)
+                    ghost_moved = True
+                if gpos == miner_pos:
+                    async with self._lock_for(mid):
+                        _fresh_c = await self.maze_repo.get_for_miner(mz['minerid'], mid)
+                    _restart_base = dict(_fresh_c) if _fresh_c is not None else dict(mz)
+                    _restart_size = int(_fresh_c['size']) if _fresh_c is not None else sz
+                    if _fresh_c is not None and (_fresh_c.get('seed') != mz.get('seed') or int(_fresh_c.get('size', 0)) != sz):
+                        bootstrap.logger.info(f'[R30] tick ghost step stale for {mid[:16]} (maze changed since tick read) — skipping')
+                        ghost_caught = False
+                        ghost_moved = False
+                    else:
+                        self._schedule_tick_restart(mid, mz['minerid'], _restart_base, _restart_size)
+                        ghost_caught = True
+                        ghost_moved = False
+        else:
+            gdx, gdy, gdz = self._bfs_next_step(maze_arr, sz, gpos, miner_pos)
+            if gdx is not None:
+                new_gpos = (gpos[0] + gdx, gpos[1] + gdy, gpos[2] + gdz)
+                gpos = new_gpos
+                ghost_moved = True
+                if new_gpos == miner_pos:
+                    async with self._lock_for(mid):
+                        _fresh_c = await self.maze_repo.get_for_miner(mz['minerid'], mid)
+                    _restart_base = dict(_fresh_c) if _fresh_c is not None else dict(mz)
+                    _restart_size = int(_fresh_c['size']) if _fresh_c is not None else sz
+                    if _fresh_c is not None and (_fresh_c.get('seed') != mz.get('seed') or int(_fresh_c.get('size', 0)) != sz):
+                        bootstrap.logger.info(f'[R30] tick ghost step stale for {mid[:16]} (maze changed since tick read) — skipping')
+                        ghost_caught = False
+                        ghost_moved = False
+                    else:
+                        self._schedule_tick_restart(mid, mz['minerid'], _restart_base, _restart_size)
+                        ghost_caught = True
+                        ghost_moved = False
+        if ghost_moved and (not ghost_caught):
+            async with self._lock_for(mid):
+                _fresh = await self.maze_repo.get_for_miner(mz['minerid'], mid)
+                if _fresh is not None:
+                    self._set_ghost(_fresh, gpos)
+                    await self.maze_repo.upsert(_fresh)
+        if self._ghost_step_lock_skips.get(mid, 0):
+            _r35_sk = self._ghost_step_lock_skips.pop(mid)
+            bootstrap.logger.info(f'[R35] ghost step applied for {mid[:16]} after {_r35_sk} lock skip(s)')
+        return True
+
+    def _schedule_ghost_step(self, mid, miner_id, base, base_size, step_nonce):
+        _task = self._ghost_step_tasks.get(mid)
+        if _task is not None and (not _task.done()):
+            return True
+        self._ghost_step_tasks[mid] = bootstrap.asyncio.create_task(self._ghost_step_task(mid, miner_id, dict(base), int(base_size), int(step_nonce)))
+        return True
+
+    async def _ghost_step_task(self, mid, miner_id, base, base_size, step_nonce):
+        try:
+            loop = bootstrap.asyncio.get_event_loop()
+            maze_arr = await loop.run_in_executor(self._move_executor, self._generate_deterministic_maze, base['seed'], base_size, int(base['walldensityppm']), int(base['turbulenceppm']), self.node.height)
+            async with self._lock_for(mid):
+                _fresh = await self.maze_repo.get_for_miner(miner_id, mid)
+            if _fresh is None:
+                return
+            if _fresh.get('seed') != base.get('seed') or int(_fresh.get('size', 0)) != base_size:
+                bootstrap.logger.info(f'[R34] ghost step stale for {mid[:16]} (maze changed during generation) — skipping')
+                return
+            if self._ghost_step_nonce.get(mid, -1) >= step_nonce:
+                return
+            if await self._ghost_step_apply(_fresh, maze_arr):
+                self._ghost_step_nonce[mid] = int(_fresh.get('movenonce', step_nonce))
+        except Exception as _e:
+            bootstrap.logger.error(f'[R34] ghost step task failed for {mid[:16]}: {_e}', exc_info=True)
+        finally:
+            if self._ghost_step_tasks.get(mid) is bootstrap.asyncio.current_task():
+                self._ghost_step_tasks.pop(mid, None)
+
     async def _shrink_and_ghost_chase(self, block_id: int):
         loop = bootstrap.asyncio.get_event_loop()
         all_mazes = [mz for mz in await self.maze_repo.get_eligible(block_id) if mz.get('minerid') in self.node.miner_websockets]
@@ -1705,61 +1877,33 @@ class PoSWConsensus:
             if sz > 5:
                 gpos = self._ghost_tuple(mz)
                 if gpos:
+                    _cur_nonce = int(mz['movenonce'])
+                    _rt = self._restart_tasks.get(mid)
+                    if _rt is not None and (not _rt.done()):
+                        continue
+                    _last_nonce = self._ghost_step_nonce.get(mid)
+                    if _last_nonce is None:
+                        self._ghost_step_nonce[mid] = _cur_nonce
+                        continue
+                    if _cur_nonce == _last_nonce:
+                        continue
                     mx, my, mz_pos = (int(mz['posx']), int(mz['posy']), int(mz['posz']))
                     miner_pos = (mx, my, mz_pos)
                     if gpos != miner_pos:
-                        ghost_moved = False
-                        ghost_caught = False
+                        _r34_key = (mz['seed'], sz, int(mz['walldensityppm']), int(mz['turbulenceppm']))
+                        if _r34_key not in self._maze_cache:
+                            self._schedule_ghost_step(mid, mz['minerid'], dict(mz), sz, _cur_nonce)
+                            continue
+                        _r34_hit = _r34_key in self._maze_cache
+                        _r34_t0 = bootstrap.time.monotonic()
                         maze_arr = await loop.run_in_executor(self._move_executor, self._generate_deterministic_maze, mz['seed'], sz, int(mz['walldensityppm']), int(mz['turbulenceppm']), self.node.height)
-                        if mid in self._oscillating_mazes:
-                            if mid not in self._ghost_cycle:
-                                cycle_cells = []
-                                for p in self._pos_history.get(mid, []):
-                                    if p not in cycle_cells:
-                                        cycle_cells.append(p)
-                                if cycle_cells:
-
-                                    def _manh(a, b):
-                                        return abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
-                                    farthest_idx = max(range(len(cycle_cells)), key=lambda i: _manh(gpos, cycle_cells[i]))
-                                    self._ghost_cycle[mid] = cycle_cells
-                                    self._ghost_cycle_idx[mid] = farthest_idx
-                                    self._ghost_frozen_target[mid] = cycle_cells[farthest_idx]
-                            if mid in self._ghost_cycle:
-                                cycle_cells = self._ghost_cycle[mid]
-                                idx = self._ghost_cycle_idx[mid]
-                                target = cycle_cells[idx]
-                                if gpos == target:
-                                    idx = (idx + 1) % len(cycle_cells)
-                                    self._ghost_cycle_idx[mid] = idx
-                                    target = cycle_cells[idx]
-                                for _ in range(2):
-                                    gdx, gdy, gdz = self._bfs_next_step(maze_arr, sz, gpos, target)
-                                    if gdx is None:
-                                        break
-                                    gpos = (gpos[0] + gdx, gpos[1] + gdy, gpos[2] + gdz)
-                                    ghost_moved = True
-                                    if gpos == miner_pos:
-                                        break
-                                if gpos == miner_pos:
-                                    restart_ev = await self._restart_position(dict(mz), mid, mz['minerid'], sz)
-                                    if restart_ev:
-                                        ghost_caught = True
-                                        await self.maze_repo.upsert({**dict(mz), **restart_ev})
-                        else:
-                            gdx, gdy, gdz = self._bfs_next_step(maze_arr, sz, gpos, miner_pos)
-                            if gdx is not None:
-                                new_gpos = (gpos[0] + gdx, gpos[1] + gdy, gpos[2] + gdz)
-                                gpos = new_gpos
-                                ghost_moved = True
-                                if new_gpos == miner_pos:
-                                    restart_ev = await self._restart_position(dict(mz), mid, mz['minerid'], sz)
-                                    if restart_ev:
-                                        ghost_caught = True
-                                        await self.maze_repo.upsert({**dict(mz), **restart_ev})
-                        if ghost_moved and (not ghost_caught):
-                            self._set_ghost(mz, gpos)
-                            await self.maze_repo.upsert(dict(mz))
+                        _r34_dt = bootstrap.time.monotonic() - _r34_t0
+                        if _r34_dt > 1.0:
+                            bootstrap.logger.info(f'[R34] ghost-step gen size={sz} hit={_r34_hit} took {_r34_dt:.1f}s')
+                        if await self._ghost_step_apply(mz, maze_arr):
+                            self._ghost_step_nonce[mid] = _cur_nonce
+                    else:
+                        self._ghost_step_nonce[mid] = _cur_nonce
             await bootstrap.asyncio.sleep(0)
 
     async def _update_global_shrink_factor(self):
@@ -1791,10 +1935,14 @@ class PoSWConsensus:
                     pass
                 await self._update_global_shrink_factor()
                 await self.produce_block()
+                _r34_pl0 = bootstrap.time.monotonic()
                 try:
                     await self._shrink_and_ghost_chase(self.node.height)
                 except Exception as e:
                     bootstrap.logger.error(f'[PoSW] Shrink/ghost error: {e}')
+                _r34_pl1 = bootstrap.time.monotonic() - _r34_pl0
+                if _r34_pl1 > 1.0:
+                    bootstrap.logger.info(f'[R34] production_loop shrink/ghost took {_r34_pl1:.1f}s (height {self.node.height})')
                 now = bootstrap.time.time()
                 if now - last_height_broadcast >= config.BLOCK_TIME and self.node.miner_websockets:
                     last_height_broadcast = now
