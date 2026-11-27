@@ -14317,8 +14317,9 @@ class P2PNode:
         # TUNNEL-P2P-WS: this node's own tunnel hostname, when it has
         # one. Sources (first wins): p2p.tunnel_host / node.tunnel_host
         # config, MCX_TUNNEL_HOST env, the tunnel helper's
-        # munex_tunnel.json state file (hosts["8080"] /
-        # hostnames["8080"]). Empty = not a tunnel node: no periodic
+        # tunnel_state.json state file (hosts["8080"] /
+        # hostnames["8080"]; munex_tunnel.json is a fallback for
+        # existing setups). Empty = not a tunnel node: no periodic
         # re-register happens. Read once at startup; a tunnel started
         # later is picked up on restart (the tunnel watcher also
         # re-registers on its own).
@@ -15923,16 +15924,23 @@ class P2PNode:
                     return str(_src).strip().lower()
         except Exception:
             pass
-        try:
-            with open(os.path.join(os.getcwd(), "munex_tunnel.json"), "r", encoding="utf-8") as _fh:
-                _st = json.load(_fh)
-            if isinstance(_st, dict):
-                for _key in ("hosts", "hostnames"):
-                    _m = _st.get(_key)
-                    if isinstance(_m, dict) and str(_m.get("8080") or "").strip():
-                        return str(_m.get("8080")).strip().lower()
-        except Exception:
-            pass
+        # R41: the tunnel helper writes tunnel_state.json (tunnel
+        # setup state_path), NOT munex_tunnel.json — nothing anywhere
+        # writes the latter, so reading only it meant a tunnel node
+        # never learned its own host and _maybe_reregister_tunnel
+        # silently no-opped. Read tunnel_state.json first; keep
+        # munex_tunnel.json as a fallback for existing setups.
+        for _fname in ("tunnel_state.json", "munex_tunnel.json"):
+            try:
+                with open(os.path.join(os.getcwd(), _fname), "r", encoding="utf-8") as _fh:
+                    _st = json.load(_fh)
+                if isinstance(_st, dict):
+                    for _key in ("hosts", "hostnames"):
+                        _m = _st.get(_key)
+                        if isinstance(_m, dict) and str(_m.get("8080") or "").strip():
+                            return str(_m.get("8080")).strip().lower()
+            except Exception:
+                pass
         return ""
 
     async def _ws_dial_allowed(self, host: str):
@@ -17484,6 +17492,7 @@ class MicroCoreNode:
         self._next_block_time = 0.0
 
         self.miner_websockets: Dict[str, Any] = {}
+        self._miner_maze_sent = set()
         self._block_sign_futures: Dict[str, asyncio.Future] = {}
 
         self._setup_wallet()
@@ -23409,6 +23418,7 @@ class MicroCoreNode:
                     logger.info(f"[WS] Connection closed: code={ws.close_code}")
                 if miner_id and self.miner_websockets.get(miner_id) is ws:
                     del self.miner_websockets[miner_id]
+                    self._miner_maze_sent.discard(miner_id)
             return ws
 
         async def p2p_ws_handler(request):
@@ -24644,7 +24654,7 @@ class MicroCoreNode:
                     # clear error so the miner retries with a distinct
                     # id. A closed socket is a dead reconnect, allow it.
                     _live = self.miner_websockets.get(miner_id)
-                    if _live is not None and _live is not ws and not _live.closed:
+                    if _live is not None and _live is not ws and not _live.closed and miner_id in self._miner_maze_sent:
                         await ws.send_json({"type": "registration_failed", "error": f"miner_id already connected from another device - use --miner-id {miner_id.rsplit('_', 1)[0] if miner_id.rsplit('_', 1)[-1].isdigit() else miner_id}_2 for a second miner on this wallet"})
                         return
                     challenge = self.memory_mgr.generate_challenge(miner_id)
@@ -24686,7 +24696,7 @@ class MicroCoreNode:
                 # race where two miners pass register while the first is
                 # still doing the memory challenge).
                 _live = self.miner_websockets.get(miner_id)
-                if _live is not None and _live is not ws and not _live.closed:
+                if _live is not None and _live is not ws and not _live.closed and miner_id in self._miner_maze_sent:
                     await ws.send_json({"type": "registration_failed", "error": f"miner_id already connected from another device - use --miner-id {miner_id.rsplit('_', 1)[0] if miner_id.rsplit('_', 1)[-1].isdigit() else miner_id}_2 for a second miner on this wallet"})
                     return
                 session["authenticated"] = True
@@ -24733,6 +24743,7 @@ class MicroCoreNode:
                         "growthcount": int(row["growthcount"]),
                         "movenonce": int(row["movenonce"]),
                     })
+                    self._miner_maze_sent.add(miner_id)
                 except Exception as e:
                     logger.error(f"[WS] MAZE_INIT ERROR for {miner_id}: {e}", exc_info=True)
                     await ws.send_json({"type": "error", "message": f"maze_init: {e}"})

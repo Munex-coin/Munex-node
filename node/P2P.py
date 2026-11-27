@@ -1874,16 +1874,17 @@ class P2PNode:
                     return str(_src).strip().lower()
         except Exception:
             pass
-        try:
-            with open(bootstrap.os.path.join(bootstrap.os.getcwd(), 'munex_tunnel.json'), 'r', encoding='utf-8') as _fh:
-                _st = bootstrap.json.load(_fh)
-            if isinstance(_st, dict):
-                for _key in ('hosts', 'hostnames'):
-                    _m = _st.get(_key)
-                    if isinstance(_m, dict) and str(_m.get('8080') or '').strip():
-                        return str(_m.get('8080')).strip().lower()
-        except Exception:
-            pass
+        for _fname in ('tunnel_state.json', 'munex_tunnel.json'):
+            try:
+                with open(bootstrap.os.path.join(bootstrap.os.getcwd(), _fname), 'r', encoding='utf-8') as _fh:
+                    _st = bootstrap.json.load(_fh)
+                if isinstance(_st, dict):
+                    for _key in ('hosts', 'hostnames'):
+                        _m = _st.get(_key)
+                        if isinstance(_m, dict) and str(_m.get('8080') or '').strip():
+                            return str(_m.get('8080')).strip().lower()
+            except Exception:
+                pass
         return ''
 
     async def _ws_dial_allowed(self, host: str):

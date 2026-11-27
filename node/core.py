@@ -112,6 +112,7 @@ class MicroCoreNode:
         self._producing_enabled = False
         self._next_block_time = 0.0
         self.miner_websockets: bootstrap.Dict[str, bootstrap.Any] = {}
+        self._miner_maze_sent = set()
         self._block_sign_futures: bootstrap.Dict[str, bootstrap.asyncio.Future] = {}
         self._setup_wallet()
         self.node_id = self.wallet
@@ -4430,6 +4431,7 @@ class MicroCoreNode:
                     bootstrap.logger.info(f'[WS] Connection closed: code={ws.close_code}')
                 if miner_id and self.miner_websockets.get(miner_id) is ws:
                     del self.miner_websockets[miner_id]
+                    self._miner_maze_sent.discard(miner_id)
             return ws
 
         async def p2p_ws_handler(request):
@@ -5429,7 +5431,7 @@ class MicroCoreNode:
                 ok = await self.register_miner(miner_id, wallet, pub_key, sig, timestamp, block_signing_pub, takeover_sig)
                 if ok:
                     _live = self.miner_websockets.get(miner_id)
-                    if _live is not None and _live is not ws and (not _live.closed):
+                    if _live is not None and _live is not ws and (not _live.closed) and (miner_id in self._miner_maze_sent):
                         await ws.send_json({'type': 'registration_failed', 'error': f'miner_id already connected from another device - use --miner-id {(miner_id.rsplit('_', 1)[0] if miner_id.rsplit('_', 1)[-1].isdigit() else miner_id)}_2 for a second miner on this wallet'})
                         return
                     challenge = self.memory_mgr.generate_challenge(miner_id)
@@ -5462,7 +5464,7 @@ class MicroCoreNode:
             ok = await loop.run_in_executor(None, self.memory_mgr.verify_commitment, miner_id, seed, commitment)
             if ok:
                 _live = self.miner_websockets.get(miner_id)
-                if _live is not None and _live is not ws and (not _live.closed):
+                if _live is not None and _live is not ws and (not _live.closed) and (miner_id in self._miner_maze_sent):
                     await ws.send_json({'type': 'registration_failed', 'error': f'miner_id already connected from another device - use --miner-id {(miner_id.rsplit('_', 1)[0] if miner_id.rsplit('_', 1)[-1].isdigit() else miner_id)}_2 for a second miner on this wallet'})
                     return
                 session['authenticated'] = True
@@ -5489,6 +5491,7 @@ class MicroCoreNode:
                     ghost = self.consensus._ghost_tuple(row)
                     sealed = self.consensus._sealed_walls.get(maze_id)
                     await ws.send_json({'type': 'maze_init', 'maze': maze, 'size': row['size'], 'start': list(start), 'goal': list(goal), 'maze_root': row['mazeroot'], 'block_id': self.height, 'difficulty': 1.0, 'max_path_length': 10 ** 9, 'step_interval': 0.0, 'required_knowledge': 10, 'ghost': list(ghost) if ghost else None, 'sealed_walls': [list(w) for w in sealed] if sealed else [], 'growthcount': int(row['growthcount']), 'movenonce': int(row['movenonce'])})
+                    self._miner_maze_sent.add(miner_id)
                 except Exception as e:
                     bootstrap.logger.error(f'[WS] MAZE_INIT ERROR for {miner_id}: {e}', exc_info=True)
                     await ws.send_json({'type': 'error', 'message': f'maze_init: {e}'})

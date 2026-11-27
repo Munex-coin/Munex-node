@@ -149,7 +149,8 @@ const HEIGHT_STALE_MS = 600_000; // 10 minutes: a height older than this is serv
 // and redeploy; the registry lists it to miners on the next refresh.
 // The tunnel MUST forward its root to the node's miner-WS port (8080).
 const STATIC_TUNNELS = [
-  "munex-8080.smchuzza.tech", // friend's node (Cloudflare Tunnel, port 8080 WS) — verified live 2026-11-24, /healthz returns mcx-miner-ws
+  // (none) — the friend's old tunnel was removed 2026-11-27 (DNS gone) and
+  // must not come back. Add a tunnel hostname here to list it statically.
 ];
 
 const state = {
